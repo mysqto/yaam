@@ -9,10 +9,11 @@
 //! The types here exist to make the failure modes unrepresentable rather than documented:
 //! a [`Nonce`] can only come from a CSPRNG, and a [`Dek`] can only be derived from a full share set.
 //!
-//! Every seal and unseal therefore needs a [`keystore::KeyStore`] to wrap and unwrap the shares.
-//! Pass it explicitly to [`seal::seal_in`] and [`seal::unseal_in`]; [`seal::seal`] and
-//! [`seal::unseal`], whose signatures have nowhere to put one, take the store installed by
-//! [`keystore::with_store`] and fail with [`Error::NoKeyStore`] when there is none.
+//! Every seal and unseal needs a [`keystore::KeyStore`] to wrap and unwrap the shares, and takes
+//! one as an argument. There is deliberately no ambient store: the consumers are async, so a store
+//! installed in a thread-local would disappear the moment an `.await` moved the task to another
+//! worker thread — and a crypto API whose key custody is invisible at the call site invites the
+//! misuse it should prevent.
 
 #![forbid(unsafe_code)]
 
@@ -22,4 +23,4 @@ pub mod keystore;
 pub mod seal;
 
 pub use error::{Error, Result};
-pub use seal::{Dek, DekShare, Epoch, Nonce, SealedBody};
+pub use seal::{BareShare, Dek, Epoch, Nonce, SealedBody, WrappedShare};

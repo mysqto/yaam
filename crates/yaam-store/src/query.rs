@@ -123,7 +123,10 @@ pub fn correlate(
     let mut pairs = Vec::new();
     for row in rows {
         let (left_id, right_id) = row?;
-        pairs.push((parse_id(left_id)?, parse_id(right_id)?));
+        pairs.push((
+            crate::stored_record_id(left_id)?,
+            crate::stored_record_id(right_id)?,
+        ));
     }
     Ok(pairs)
 }
@@ -224,19 +227,9 @@ fn one_id(row: &Row<'_>) -> rusqlite::Result<String> {
 fn collect(rows: impl Iterator<Item = rusqlite::Result<String>>) -> crate::Result<Vec<RecordId>> {
     let mut ids = Vec::new();
     for row in rows {
-        ids.push(parse_id(row?)?);
+        ids.push(crate::stored_record_id(row?)?);
     }
     Ok(ids)
-}
-
-/// Rebuilds a record id from its stored text.
-///
-/// Goes through the contract's own deserialisation rather than a local constructor, so the index
-/// cannot mint an id shape the contract would reject. A value that fails is drift by definition:
-/// the row no longer matches the tree it was derived from.
-fn parse_id(text: String) -> crate::Result<RecordId> {
-    serde_json::from_value(serde_json::Value::String(text.clone()))
-        .map_err(|_| crate::Error::Drift(text))
 }
 
 #[cfg(test)]

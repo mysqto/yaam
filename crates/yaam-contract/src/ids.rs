@@ -21,7 +21,12 @@ const fn is_lower_hex(b: u8) -> bool {
 }
 
 /// A record's ULID. Doubles as the idempotency key for its write.
+///
+/// Deserialisation goes through [`RecordId::parse`]. A newtype whose invariant held only on the
+/// `parse` path would be decorative: records arrive as JSON and as frontmatter, so the shape has to
+/// be checked wherever one is read, not only where one is minted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct RecordId(String);
 
 impl RecordId {
@@ -47,14 +52,7 @@ impl RecordId {
     ///
     /// [`Registry::canonicalise`]: crate::entity::Registry::canonicalise
     pub fn parse(s: &str) -> crate::Result<Self> {
-        if s.len() == ULID_LEN && s.bytes().all(is_crockford_digit) {
-            Ok(Self(s.to_owned()))
-        } else {
-            Err(crate::Error::NotCanonical {
-                kind: "record".to_owned(),
-                id: s.to_owned(),
-            })
-        }
+        Self::try_from(s.to_owned())
     }
 
     /// The identifier as a string slice.
@@ -69,7 +67,12 @@ impl RecordId {
 /// Never a direct identifier: it is an HMAC over a canonical subject ID, so it is safe in paths,
 /// indexes and tombstones. It is *pseudonymous*, not anonymous — the holder of the key can still
 /// relink it, which is a property callers must reason about rather than forget.
+///
+/// Deserialisation goes through [`SubjectHash::parse`], so a hash read from a file or a sealed
+/// block cannot smuggle in a shape the rest of the system would reject — and a path built from one
+/// cannot climb out of its directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct SubjectHash(String);
 
 impl SubjectHash {
@@ -87,21 +90,46 @@ impl SubjectHash {
     /// assert!(SubjectHash::parse(&hex).is_err()); // the prefix is not optional
     /// ```
     pub fn parse(s: &str) -> crate::Result<Self> {
-        let digits = s.strip_prefix(SUBJECT_PREFIX);
-        if s.len() == SUBJECT_HASH_LEN && digits.is_some_and(|d| d.bytes().all(is_lower_hex)) {
-            Ok(Self(s.to_owned()))
-        } else {
-            Err(crate::Error::NotCanonical {
-                kind: "subject".to_owned(),
-                id: s.to_owned(),
-            })
-        }
+        Self::try_from(s.to_owned())
     }
 
     /// The hash as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for RecordId {
+    type Error = crate::Error;
+
+    /// Takes ownership when the string is already canonical, so no copy is made on the read path.
+    fn try_from(value: String) -> crate::Result<Self> {
+        if value.len() == ULID_LEN && value.bytes().all(is_crockford_digit) {
+            Ok(Self(value))
+        } else {
+            Err(crate::Error::NotCanonical {
+                kind: "record".to_owned(),
+                id: value,
+            })
+        }
+    }
+}
+
+impl TryFrom<String> for SubjectHash {
+    type Error = crate::Error;
+
+    /// As [`RecordId::try_from`]: validate, then keep the caller's allocation.
+    fn try_from(value: String) -> crate::Result<Self> {
+        let digits = value.strip_prefix(SUBJECT_PREFIX);
+        if value.len() == SUBJECT_HASH_LEN && digits.is_some_and(|d| d.bytes().all(is_lower_hex)) {
+            Ok(Self(value))
+        } else {
+            Err(crate::Error::NotCanonical {
+                kind: "subject".to_owned(),
+                id: value,
+            })
+        }
     }
 }
 
@@ -201,6 +229,55 @@ mod tests {
     fn subject_parse_error_names_the_kind() {
         let err = SubjectHash::parse("s_short").expect_err("not a hash");
         assert!(matches!(err, Error::NotCanonical { ref kind, .. } if kind == "subject"));
+    }
+
+    #[test]
+    fn deserialisation_enforces_the_same_rule_as_parse() {
+        // The reason this exists: a record arrives as JSON or as frontmatter far more often than it
+        // is minted, so a check that only guarded `parse` would guard almost nothing.
+        let valid = format!("\"{VALID_ULID}\"");
+        assert_eq!(
+            serde_json::from_str::<RecordId>(&valid).unwrap(),
+            RecordId::parse(VALID_ULID).unwrap()
+        );
+        for bad in ["\"\"", "\"nope\"", "\"01ARZ3NDEKTSV4RRFFQ69G5FAI\""] {
+            assert!(serde_json::from_str::<RecordId>(bad).is_err(), "{bad}");
+        }
+
+        let hash = format!("s_{}", hex64());
+        assert_eq!(
+            serde_json::from_str::<SubjectHash>(&format!("\"{hash}\"")).unwrap(),
+            SubjectHash::parse(&hash).unwrap()
+        );
+        // The shape that mattered: a traversal a filesystem key store would otherwise be handed.
+        for bad in ["\"../../escape\"", "\"s_short\"", "\"\""] {
+            assert!(serde_json::from_str::<SubjectHash>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ids_round_trip_through_json() {
+        let id = RecordId::generate();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{}\"", id.as_str()));
+        assert_eq!(serde_json::from_str::<RecordId>(&json).unwrap(), id);
+
+        let hash = SubjectHash::parse(&format!("s_{}", hex64())).unwrap();
+        let json = serde_json::to_string(&hash).unwrap();
+        assert_eq!(serde_json::from_str::<SubjectHash>(&json).unwrap(), hash);
+    }
+
+    #[test]
+    fn errors_compare_by_value() {
+        // Without `PartialEq` on `Error` this assertion does not compile, and every consumer falls
+        // back to `matches!`.
+        assert_eq!(
+            RecordId::parse("nope"),
+            Err(Error::NotCanonical {
+                kind: "record".to_owned(),
+                id: "nope".to_owned(),
+            })
+        );
     }
 
     #[test]

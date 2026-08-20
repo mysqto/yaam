@@ -98,6 +98,10 @@ pub fn render(record: &ActionRecord) -> String {
 ///
 /// `summary` comes back empty: it is prose and therefore not in frontmatter. [`crate::Document`]
 /// fills it from the body, which is where a lossless round-trip lives.
+///
+/// The parsed record is validated. A hand-edited or half-written file otherwise reads cleanly and
+/// fails much later, at the first join that trips over it — by which point the file it came from is
+/// no longer in the caller's hand.
 pub fn parse(yaml: &str) -> crate::Result<ActionRecord> {
     let docs = Yaml::load_from_str(yaml).map_err(|e| Error::MalformedFrontmatter(e.to_string()))?;
     let Some(Yaml::Mapping(map)) = docs.first() else {
@@ -120,8 +124,10 @@ pub fn parse(yaml: &str) -> crate::Result<ActionRecord> {
     }
     fields.insert("summary".to_owned(), Json::String(String::new()));
 
-    serde_json::from_value(Json::Object(fields))
-        .map_err(|e| Error::MalformedFrontmatter(e.to_string()))
+    let record: ActionRecord = serde_json::from_value(Json::Object(fields))
+        .map_err(|e| Error::MalformedFrontmatter(e.to_string()))?;
+    record.validate()?;
+    Ok(record)
 }
 
 /// Canonical JSON projection, as stored in the index for structured queries.
@@ -529,17 +535,15 @@ pub(crate) mod fixture {
     };
 
     /// Builds a subject hash from its stored form.
-    ///
-    /// Goes through `Deserialize` rather than `SubjectHash::parse`, which is unimplemented on this
-    /// branch.
     pub fn subject_hash(fill: char) -> SubjectHash {
-        let text = format!("s_{}", fill.to_string().repeat(64));
-        serde_json::from_value(serde_json::Value::String(text))
-            .expect("a newtype over String deserialises from a JSON string")
+        SubjectHash::parse(&format!("s_{}", fill.to_string().repeat(64))).expect("a valid hash")
     }
 
-    /// A record touching every field: three entities with mixed roles and confidences, two
-    /// subjects with different roles and canonicalisation versions, and all three attribute types.
+    /// A record touching every field an internal record has: three entities with mixed roles and
+    /// confidences, and all three attribute types.
+    ///
+    /// Internal, and so subjectless — an internal record that named subjects would claim erasability
+    /// its plaintext body cannot deliver, and `validate` refuses it.
     pub fn record() -> ActionRecord {
         ActionRecord {
             record_id: RecordId::generate(),
@@ -580,6 +584,22 @@ pub(crate) mod fixture {
                     confidence: 0.5,
                 },
             ],
+            subjects: Vec::new(),
+            visibility: Visibility::Team,
+            team: Some("team_blue".to_owned()),
+            data_class: DataClass::Internal,
+            redaction_policy: "default".to_owned(),
+            fields_masked: vec!["chat_user".to_owned(), "ticket".to_owned()],
+            tags: vec!["rollout".to_owned(), "needs-review".to_owned()],
+            summary: String::new(),
+        }
+    }
+
+    /// The same record as an erasable one: two subjects with different roles and canonicalisation
+    /// versions, and no prose, because for a sealed record the prose is inside the ciphertext.
+    pub fn subject_derived() -> ActionRecord {
+        ActionRecord {
+            data_class: DataClass::SubjectDerived,
             subjects: vec![
                 SubjectRef {
                     hash: subject_hash('a'),
@@ -592,13 +612,8 @@ pub(crate) mod fixture {
                     canon_ver: CanonVer(2),
                 },
             ],
-            visibility: Visibility::Team,
-            team: Some("team_blue".to_owned()),
-            data_class: DataClass::Internal,
-            redaction_policy: "default".to_owned(),
-            fields_masked: vec!["chat_user".to_owned(), "ticket".to_owned()],
-            tags: vec!["rollout".to_owned(), "needs-review".to_owned()],
             summary: String::new(),
+            ..record()
         }
     }
 
@@ -655,7 +670,7 @@ pub(crate) mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{assert_same_record, record};
+    use super::fixture::{assert_same_record, record, subject_derived};
     use super::{
         AttrValue, DataClass, EntityRef, EntityRole, Error, Json, KEYS, Outcome, Value, Visibility,
         data_class_name, emit, outcome_name, parse, plain_safe, project, render, to_canonical_json,
@@ -672,10 +687,11 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_every_field() {
-        let original = record();
-        let parsed = parse(&render(&original)).expect("rendered frontmatter parses");
-        assert_same_record(&original, &parsed);
-        assert_eq!(original, parsed);
+        for original in [record(), subject_derived()] {
+            let parsed = parse(&render(&original)).expect("rendered frontmatter parses");
+            assert_same_record(&original, &parsed);
+            assert_eq!(original, parsed);
+        }
     }
 
     #[test]
@@ -788,7 +804,12 @@ mod tests {
         for outcome in outcomes {
             for visibility in visibilities {
                 for data_class in [DataClass::Internal, DataClass::SubjectDerived] {
-                    let mut original = record();
+                    // The subject set has to follow the class, or the record is one `validate`
+                    // rejects rather than one this test can round-trip.
+                    let mut original = match data_class {
+                        DataClass::Internal => record(),
+                        DataClass::SubjectDerived => subject_derived(),
+                    };
                     original.outcome = outcome;
                     original.visibility = visibility;
                     original.data_class = data_class;
@@ -907,16 +928,18 @@ mod tests {
 
     #[test]
     fn confidence_round_trips_bit_for_bit() {
+        // Awkward bit patterns from inside the contract's range: a confidence outside it does not
+        // survive a read at all, since `parse` now validates.
         for confidence in [
             0.0_f32,
             -0.0,
             1.0,
+            0.999_999_94,
             0.5,
             0.82,
             0.123_456_79,
             1e-8,
             f32::MIN_POSITIVE,
-            f32::MAX,
         ] {
             let mut original = record();
             original.entities = vec![EntityRef {
@@ -947,6 +970,27 @@ mod tests {
         let text = render(&record()).replace("confidence: 1.0", "confidence: .nan");
         let error = parse(&text).expect_err("rejected");
         assert!(matches!(error, Error::MalformedFrontmatter(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hand_edited_file_that_breaks_the_contract_fails_on_read() {
+        // Each of these parses as YAML and types cleanly; only `validate` catches them, and it must
+        // catch them here rather than at the first query that joins on the row.
+        let internal_with_subjects = render(&subject_derived())
+            .replace("data_class: subject_derived", "data_class: internal");
+        let no_action = render(&record()).replace("action: deploy", r#"action: "  ""#);
+        let impossible_confidence = render(&record()).replace("confidence: 1.0", "confidence: 1.5");
+        let team_without_name = render(&record()).replace("team: team_blue", "team: null");
+
+        for (label, text) in [
+            ("an internal record naming subjects", internal_with_subjects),
+            ("an empty action", no_action),
+            ("a confidence outside 0.0..=1.0", impossible_confidence),
+            ("a team-scoped record with no team", team_without_name),
+        ] {
+            let error = parse(&text).expect_err(label);
+            assert!(matches!(error, Error::Contract(_)), "{label}: {error}");
+        }
     }
 
     #[test]

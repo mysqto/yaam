@@ -17,12 +17,10 @@
 //! Fields appear in that order, one per line, and shares are sorted by subject — a canonical
 //! rendering is what lets two implementations compare blocks by equality.
 
-use serde::Deserialize;
-use serde::de::value::{Error as DeError, SeqDeserializer};
 use yaam_contract::SubjectHash;
 
 use crate::error::Error;
-use crate::seal::{DekShare, Epoch, Nonce};
+use crate::seal::{Epoch, Nonce, WrappedShare};
 use crate::{SealedBody, error};
 
 /// Current block format version.
@@ -42,11 +40,11 @@ const FENCE_CLOSE: &str = "```";
 /// Renders a sealed body as the fenced block stored in a record file.
 #[must_use]
 pub fn render(body: &SealedBody) -> String {
-    let mut shares: Vec<&DekShare> = body.shares.iter().collect();
+    let mut shares: Vec<&WrappedShare> = body.shares.iter().collect();
     shares.sort_by(|a, b| a.subject.as_str().cmp(b.subject.as_str()));
     let shares: Vec<String> = shares
         .iter()
-        .map(|s| format!("{}:{}", s.subject.as_str(), hex::encode(&s.wrapped)))
+        .map(|s| format!("{}:{}", s.subject.as_str(), hex::encode(&s.bytes)))
         .collect();
 
     format!(
@@ -117,7 +115,11 @@ fn decode_hex(line: &str, key: &str) -> error::Result<Vec<u8>> {
 }
 
 /// Parses the comma-separated `subject:wrapped` pairs.
-fn parse_shares(field: &str) -> error::Result<Vec<DekShare>> {
+///
+/// Subject shapes are checked by [`SubjectHash::parse`] rather than re-checked here: a block must
+/// not be able to smuggle in a shape the rest of the system would reject, and one rule in one place
+/// is the only way the two cannot disagree.
+fn parse_shares(field: &str) -> error::Result<Vec<WrappedShare>> {
     if field.is_empty() {
         return Err(malformed(
             "no shares: a body with no shares is unrecoverable",
@@ -129,30 +131,14 @@ fn parse_shares(field: &str) -> error::Result<Vec<DekShare>> {
             let (subject, wrapped) = pair
                 .split_once(':')
                 .ok_or_else(|| malformed(format!("share `{pair}` is not `subject:wrapped`")))?;
-            Ok(DekShare {
-                subject: parse_subject(subject)?,
-                wrapped: hex::decode(wrapped)
+            Ok(WrappedShare {
+                subject: SubjectHash::parse(subject)
+                    .map_err(|e| malformed(format!("share subject: {e}")))?,
+                bytes: hex::decode(wrapped)
                     .map_err(|e| malformed(format!("share for `{subject}`: {e}")))?,
             })
         })
         .collect()
-}
-
-/// Reads a subject hash from a block.
-///
-/// The shape rule — `s_` then 64 lowercase hex digits — is the contract's, checked here because a
-/// block must not be able to smuggle in a subject shape the rest of the system would reject. The
-/// value is then built through `serde`, the only constructor `SubjectHash` exposes today; once
-/// `SubjectHash::parse` is implemented upstream, call it instead so the rule lives in one place.
-pub(crate) fn parse_subject(text: &str) -> error::Result<SubjectHash> {
-    let hex_digits = text.strip_prefix("s_").unwrap_or_default();
-    if hex_digits.len() != 64 || !hex_digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(malformed(format!(
-            "subject `{text}` is not `s_` and 64 hex digits"
-        )));
-    }
-    let de = SeqDeserializer::<_, DeError>::new(std::iter::once(text));
-    SubjectHash::deserialize(de).map_err(|e| malformed(format!("subject `{text}`: {e}")))
 }
 
 /// Shorthand for the one error kind this module produces.
@@ -165,7 +151,7 @@ mod tests {
     use super::*;
 
     fn subject(n: u8) -> SubjectHash {
-        parse_subject(&format!("s_{:064x}", u32::from(n) + 1)).unwrap()
+        SubjectHash::parse(&format!("s_{:064x}", u32::from(n) + 1)).unwrap()
     }
 
     fn body() -> SealedBody {
@@ -173,13 +159,13 @@ mod tests {
             nonce: Nonce::from_stored([7; 12]),
             epoch: Epoch::from_stored("2026-Q3").unwrap(),
             shares: vec![
-                DekShare {
+                WrappedShare {
                     subject: subject(1),
-                    wrapped: vec![0xbb; 40],
+                    bytes: vec![0xbb; 40],
                 },
-                DekShare {
+                WrappedShare {
                     subject: subject(0),
-                    wrapped: vec![0xaa; 40],
+                    bytes: vec![0xaa; 40],
                 },
             ],
             ciphertext: vec![0xcd; 5],
@@ -216,10 +202,7 @@ mod tests {
         // Parsed in canonical order, so compare against the sorted original.
         let mut expected = original.shares;
         expected.sort_by(|a, b| a.subject.as_str().cmp(b.subject.as_str()));
-        for (got, want) in parsed.shares.iter().zip(expected.iter()) {
-            assert_eq!(got.subject, want.subject);
-            assert_eq!(got.wrapped, want.wrapped);
-        }
+        assert_eq!(parsed.shares, expected);
     }
 
     #[test]
@@ -295,16 +278,23 @@ mod tests {
     }
 
     #[test]
-    fn subject_shapes_are_checked() {
-        assert!(parse_subject(&format!("s_{}", "0".repeat(64))).is_ok());
+    fn a_block_cannot_smuggle_in_a_subject_shape_the_contract_rejects() {
+        let good = render(&body());
+        let valid = subject(0).as_str().to_owned();
         for bad in [
-            "",
-            "s_",
-            "s_00",
-            &format!("x_{}", "0".repeat(64)),
-            &"0".repeat(66),
+            "s_".to_owned(),
+            "s_00".to_owned(),
+            format!("x_{}", "0".repeat(64)),
+            "0".repeat(66),
+            // Uppercase hex: one spelling per hash is what lets it serve as a map key and a path
+            // component, so the block format inherits that rule rather than relaxing it.
+            format!("s_{}", "0".repeat(63) + "A"),
         ] {
-            assert!(parse_subject(bad).is_err(), "{bad}");
+            let text = good.replace(&valid, &bad);
+            assert!(
+                matches!(parse(&text), Err(Error::MalformedBlock(_))),
+                "subject `{bad}` must be rejected"
+            );
         }
     }
 }

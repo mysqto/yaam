@@ -7,6 +7,11 @@ use saphyr::{LoadableYamlNode, Mapping, Yaml};
 
 use crate::Error;
 
+/// Every failure in this module is a malformed spec file, so they all take one shape.
+fn spec(detail: String) -> Error {
+    Error::Spec { detail }
+}
+
 /// The only spec version this build implements.
 const SUPPORTED_VERSION: i64 = 1;
 
@@ -15,12 +20,12 @@ const SUPPORTED_VERSION: i64 = 1;
 /// A stream of several documents is rejected rather than having the first silently win: a spec file
 /// that grew a stray `---` would otherwise load with half its content missing.
 pub fn single_document(yaml: &str) -> crate::Result<Yaml<'_>> {
-    let mut docs = Yaml::load_from_str(yaml)
-        .map_err(|e| Error::Invalid(format!("spec is not valid YAML: {e}")))?;
+    let mut docs =
+        Yaml::load_from_str(yaml).map_err(|e| spec(format!("spec is not valid YAML: {e}")))?;
     if docs.len() == 1 {
         Ok(docs.remove(0))
     } else {
-        Err(Error::Invalid(format!(
+        Err(spec(format!(
             "spec must hold exactly one YAML document, found {}",
             docs.len()
         )))
@@ -38,12 +43,10 @@ pub fn check_version(doc: &Yaml<'_>) -> crate::Result<()> {
     };
     match node.as_integer() {
         Some(SUPPORTED_VERSION) => Ok(()),
-        Some(other) => Err(Error::Invalid(format!(
+        Some(other) => Err(spec(format!(
             "spec version {other} is not supported, this build implements {SUPPORTED_VERSION}"
         ))),
-        None => Err(Error::Invalid(
-            "spec `version` must be an integer".to_owned(),
-        )),
+        None => Err(spec("spec `version` must be an integer".to_owned())),
     }
 }
 
@@ -53,27 +56,48 @@ pub fn required_mapping<'a, 'input>(
     field: &str,
 ) -> crate::Result<&'a Mapping<'input>> {
     doc.as_mapping_get(field)
-        .ok_or_else(|| Error::Invalid(format!("spec has no `{field}` section")))?
+        .ok_or_else(|| spec(format!("spec has no `{field}` section")))?
         .as_mapping()
-        .ok_or_else(|| Error::Invalid(format!("spec `{field}` must be a mapping")))
+        .ok_or_else(|| spec(format!("spec `{field}` must be a mapping")))
 }
 
 /// Reads a mapping key as a name. A non-string key is a malformed spec, not a name.
 pub fn key_name<'a>(key: &'a Yaml<'_>, what: &str) -> crate::Result<&'a str> {
     key.as_str()
-        .ok_or_else(|| Error::Invalid(format!("{what} names must be strings")))
+        .ok_or_else(|| spec(format!("{what} names must be strings")))
 }
 
 /// Reads a string field of a mapping node, failing with a message naming its owner.
 pub fn required_str<'a>(node: &'a Yaml<'_>, field: &str, owner: &str) -> crate::Result<&'a str> {
     node.as_mapping_get(field)
         .and_then(Yaml::as_str)
-        .ok_or_else(|| Error::Invalid(format!("`{owner}` has no string `{field}`")))
+        .ok_or_else(|| spec(format!("`{owner}` has no string `{field}`")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_failure_here_reads_as_a_spec_failure() {
+        // The distinction the caller acts on: a misconfigured deployment, not a bad record.
+        assert!(matches!(
+            single_document("a: 1\n---\nb: 2\n"),
+            Err(Error::Spec { .. })
+        ));
+        assert!(matches!(
+            check_version(&single_document("version: 2\n").unwrap()),
+            Err(Error::Spec { .. })
+        ));
+        assert!(matches!(
+            required_mapping(&single_document("kinds: []\n").unwrap(), "kinds"),
+            Err(Error::Spec { .. })
+        ));
+        assert!(matches!(
+            required_str(&single_document("a: 1\n").unwrap(), "a", "owner"),
+            Err(Error::Spec { .. })
+        ));
+    }
 
     #[test]
     fn single_document_rejects_a_stream() {

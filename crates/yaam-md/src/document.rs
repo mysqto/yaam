@@ -132,8 +132,10 @@ fn is_sealed(body: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use yaam_crypto::{Epoch, Nonce, SealedBody, WrappedShare};
+
     use super::{Body, Document, Error, is_sealed};
-    use crate::frontmatter::fixture::{assert_same_record, record};
+    use crate::frontmatter::fixture::{assert_same_record, record, subject_derived, subject_hash};
 
     /// A plaintext document whose body is its summary, which is the shape the pipeline writes.
     fn plain(summary: &str) -> Document {
@@ -235,11 +237,69 @@ mod tests {
         assert!(!is_sealed("prose that mentions ```sealed blocks"));
     }
 
+    /// A sealed body with one share per subject of [`subject_derived`].
+    ///
+    /// Built from stored bytes rather than by sealing: this crate is testing serialisation, and
+    /// wiring a key store in would make the assertion depend on the sealing path too.
+    fn sealed_body() -> SealedBody {
+        SealedBody {
+            nonce: Nonce::from_stored([9; 12]),
+            epoch: Epoch::from_stored("2026-Q3").expect("a stored label"),
+            shares: vec![
+                WrappedShare {
+                    subject: subject_hash('a'),
+                    bytes: vec![0xa1; 40],
+                },
+                WrappedShare {
+                    subject: subject_hash('b'),
+                    bytes: vec![0xb2; 40],
+                },
+            ],
+            ciphertext: vec![0xcd; 48],
+        }
+    }
+
     #[test]
-    #[ignore = "SealedBody is not constructible while yaam-crypto is stubbed; see the crate report"]
     fn a_sealed_document_round_trips_and_is_not_searchable() {
-        // `Epoch` has no constructor other than `Epoch::containing`, which is `todo!()` on this
-        // branch, and `yaam_crypto::block::parse` would panic. Enable once yaam-crypto lands.
-        unimplemented!("blocked on yaam-crypto");
+        let document = Document {
+            record: subject_derived(),
+            body: Body::Sealed(sealed_body()),
+        };
+        let text = document.render();
+        let parsed = Document::parse(&text).expect("renders and parses");
+
+        assert_same_record(&document.record, &parsed.record);
+        assert_eq!(parsed.render(), text, "a re-render must reproduce the file");
+
+        let Body::Sealed(parsed_body) = &parsed.body else {
+            panic!("a sealed body must not come back as prose");
+        };
+        let original = sealed_body();
+        assert_eq!(parsed_body.nonce, original.nonce);
+        assert_eq!(parsed_body.epoch, original.epoch);
+        assert_eq!(parsed_body.shares, original.shares);
+        assert_eq!(parsed_body.ciphertext, original.ciphertext);
+
+        // The point of the whole scheme: nothing here is indexable, and the prose is not on disk
+        // outside the ciphertext.
+        assert_eq!(parsed.searchable_text(), "");
+        assert_eq!(parsed.record.summary, "");
+        assert!(!text.contains("summary"), "{text}");
+    }
+
+    #[test]
+    fn a_sealed_body_is_recognised_after_a_reindex_of_the_same_file() {
+        // Byte stability matters more here than elsewhere: the content checksum decides whether a
+        // reindex thinks the file changed, and a sealed file must not look modified every pass.
+        let document = Document {
+            record: subject_derived(),
+            body: Body::Sealed(sealed_body()),
+        };
+        assert_eq!(document.render(), document.render());
+        let once = Document::parse(&document.render()).expect("parses");
+        assert_eq!(
+            Document::parse(&once.render()).expect("parses").render(),
+            once.render()
+        );
     }
 }

@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
-serde.workspace = true
 hex.workspace = true
 yaam-contract = { path = "../yaam-contract" }
 aes-gcm = "0.11"
@@ -24,5 +23,4 @@ zeroize = "1.9"
 subtle = "2.6"
 
 [dev-dependencies]
-serde_json = "1"
 tempfile = "3"

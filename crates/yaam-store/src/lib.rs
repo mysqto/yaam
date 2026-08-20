@@ -15,4 +15,13 @@ pub mod schema;
 pub mod store;
 
 pub use error::{Error, Result};
-pub use store::{Store, Writer};
+pub use store::{FanoutJob, PublishInput, Store, Writer};
+
+/// Rebuilds a record id from its stored text.
+///
+/// Goes through the contract's own parser rather than a local constructor, so the index cannot mint
+/// an id shape the contract would reject. A value that fails is drift by definition: the row no
+/// longer matches the tree it was derived from.
+pub(crate) fn stored_record_id(text: String) -> Result<yaam_contract::RecordId> {
+    yaam_contract::RecordId::parse(&text).map_err(|_| Error::Drift(text))
+}
