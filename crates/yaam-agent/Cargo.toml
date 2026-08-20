@@ -15,9 +15,24 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal"] }
+hex.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "io-util", "time", "sync"] }
 yaam-contract = { path = "../yaam-contract" }
 yaam-crypto = { path = "../yaam-crypto" }
+# Sealing to the service's public key: X25519 for the key agreement, HKDF-SHA256 to derive, AES-GCM
+# to encrypt. Same suite the store already uses, so there is one set of primitives to review.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+rand = "0.10"
+zeroize = "1.9"
+# HTTP without a TLS stack: the payload is already sealed to the service key, so the transport is
+# not what protects it.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [dev-dependencies]
 tempfile.workspace = true
