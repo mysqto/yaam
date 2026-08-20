@@ -22,11 +22,14 @@ pub struct Window {
 pub struct Filter {
     /// Restrict to one action.
     pub action: Option<String>,
-    /// Restrict to one outcome.
+    /// Restrict to one outcome, spelled as the contract serialises it: `success`, `failure`,
+    /// `partial` or `declined`.
     pub outcome: Option<String>,
     /// Restrict to one agent.
     pub agent: Option<String>,
     /// Require a structural attribute to equal a value.
+    ///
+    /// Compared as text: a whole number matches its decimal form, a truth value `true` or `false`.
     pub attr: Option<(String, String)>,
     /// Restrict to a time window.
     pub window: Option<Window>,
