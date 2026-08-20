@@ -4,12 +4,11 @@
 //! staging file may belong to a write happening right now, and without it the sweeper races the
 //! writer for the same path.
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use yaam_md::Document;
-use yaam_store::query::{self, Filter, Scope};
+use yaam_store::query::{self, Scope};
 
 use crate::fsutil;
 use crate::layout;
@@ -17,6 +16,14 @@ use crate::{Pipeline, Result};
 
 /// Files younger than this are assumed to belong to an in-flight write.
 pub const GRACE_MS: i64 = 60_000;
+
+/// A fan-out claim older than this is assumed to be held by a process that died.
+///
+/// Longer than [`GRACE_MS`] because the cost of being wrong is different. Reclaiming a live claim
+/// gives two drains the same job — every handler is idempotent, so that is survivable but wasteful —
+/// while a claim nobody reclaims is work that never happens. Minutes, therefore: comfortably more
+/// than a drain takes, and comfortably less than an operator's patience.
+pub const CLAIM_GRACE_MS: i64 = 5 * 60_000;
 
 /// How far back a sweep looks for files the index has not caught up with.
 ///
@@ -34,6 +41,8 @@ pub struct SweepReport {
     pub reindexed: usize,
     /// Entity files repaired after an interrupted rollover.
     pub entities_repaired: usize,
+    /// Fan-out jobs whose claim outlived the process holding it.
+    pub fanout_reclaimed: usize,
 }
 
 /// Re-drives incomplete work.
@@ -46,6 +55,7 @@ pub fn sweep(pipeline: &mut Pipeline) -> Result<SweepReport> {
         staged_redriven: redrive_staging(pipeline)?,
         reindexed: index_the_unindexed(pipeline)?,
         entities_repaired: repair_timeline_heads(pipeline)?,
+        fanout_reclaimed: reclaim_fanout(pipeline)?,
     })
 }
 
@@ -72,7 +82,7 @@ fn redrive_staging(pipeline: &mut Pipeline) -> Result<usize> {
         };
 
         let stamp = layout::stamp_of(&document.record)?;
-        let destination = pipeline.published_path(&document.record.record_id, &stamp);
+        let destination = pipeline.published_path(&document.record, &stamp)?;
         if destination.exists() {
             // A completed write: the rename happened and only the index row may be missing. The
             // published file is authoritative, so the row is committed from *it*, not from the copy.
@@ -93,20 +103,10 @@ fn redrive_staging(pipeline: &mut Pipeline) -> Result<usize> {
 /// No grace period here, and deliberately so: committing a row is idempotent, so there is no race to
 /// lose against a writer doing the same thing a moment later.
 fn index_the_unindexed(pipeline: &mut Pipeline) -> Result<usize> {
-    let indexed: HashSet<String> = {
-        let store = pipeline.reader()?;
-        // Unrestricted, because this read is not answering anybody: the sweeper compares the index
-        // against the tree, and a row it could not see is a row it would publish a second time.
-        let everything = Filter {
-            scope: Scope::Unrestricted,
-            ..Filter::default()
-        };
-        query::by_filter(&store, &everything)?
-            .into_iter()
-            .map(|id| id.as_str().to_owned())
-            .collect()
-    };
-
+    // One point lookup per candidate file, rather than reading every indexed identifier to answer
+    // a question about a handful of them: the id set costs the whole table on every sweep, and
+    // grows with the archive while the number of files in the window does not.
+    let store = pipeline.reader()?;
     let cutoff = fsutil::now_ms() - SWEEP_LOOKBACK_MS;
     let mut reindexed = 0;
     for path in fsutil::walk_files(
@@ -118,10 +118,10 @@ fn index_the_unindexed(pipeline: &mut Pipeline) -> Result<usize> {
         if fsutil::mtime_ms(&path)? < cutoff {
             continue;
         }
-        if path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| indexed.contains(stem))
+        // Unrestricted, because this read is not answering anybody: the sweeper compares the index
+        // against the tree, and a row it could not see is a row it would publish a second time.
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+            && query::exists(&store, stem, &Scope::Unrestricted)?
         {
             continue;
         }
@@ -169,6 +169,20 @@ fn repair_timeline_heads(pipeline: &mut Pipeline) -> Result<usize> {
     Ok(repaired)
 }
 
+/// Window four: a fan-out job whose drain died holding the claim.
+///
+/// Nothing renews a claim, so a claimed row is invisible to every later drain until something puts
+/// it back. A rebuild would too, by re-enqueueing from the tree, but a rebuild is not something an
+/// operator should have to run to get one job moving again.
+fn reclaim_fanout(pipeline: &mut Pipeline) -> Result<usize> {
+    let cutoff = fsutil::now_ms() - CLAIM_GRACE_MS;
+    let reclaimed = pipeline.writer_mut().reclaim_stale_fanout(cutoff)?;
+    if reclaimed > 0 {
+        tracing::warn!(reclaimed, "fan-out claims outlived their drain");
+    }
+    Ok(reclaimed)
+}
+
 /// Moves a file the sweeper cannot act on out of the way, under `.dead-letter/`.
 fn set_aside(root: &Path, path: &Path) -> Result<()> {
     let dir = root.join(layout::DEAD_LETTER_DIR);
@@ -184,7 +198,7 @@ fn set_aside(root: &Path, path: &Path) -> Result<()> {
 mod tests {
     use std::fs;
 
-    use super::{GRACE_MS, SWEEP_LOOKBACK_MS, SweepReport, sweep};
+    use super::{CLAIM_GRACE_MS, GRACE_MS, SWEEP_LOOKBACK_MS, SweepReport, sweep};
     use crate::testkit::{self, BODY, Harness};
 
     /// A server time whose directory is the one the harness expects.
@@ -269,6 +283,51 @@ mod tests {
             SweepReport::default()
         );
 
+        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 1);
+        let timeline = harness.root().join("entities/ticket/PROJ-42/timeline.md");
+        assert!(
+            fs::read_to_string(&timeline)
+                .expect("timeline")
+                .contains(record.record_id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_claim_the_drain_holding_it_never_released_is_reclaimed() {
+        let mut harness = Harness::new();
+        let record = testkit::internal(T09);
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+
+        // A drain that claimed the job and died before finishing it. The row is claimed, so no
+        // later drain can see it at all.
+        let now = crate::fsutil::now_ms();
+        let claimed = harness
+            .pipeline
+            .writer_mut()
+            .claim_fanout(10, now)
+            .expect("claimed");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 0);
+
+        // Inside the grace period the claim may still belong to a drain that is running.
+        assert_eq!(
+            sweep(&mut harness.pipeline).expect("swept"),
+            SweepReport::default()
+        );
+
+        harness.age_fanout_claims(CLAIM_GRACE_MS + 1_000);
+        assert_eq!(
+            sweep(&mut harness.pipeline).expect("swept"),
+            SweepReport {
+                fanout_reclaimed: 1,
+                ..SweepReport::default()
+            }
+        );
+
+        // And the work actually happens, rather than waiting for a rebuild to re-enqueue it.
         assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 1);
         let timeline = harness.root().join("entities/ticket/PROJ-42/timeline.md");
         assert!(

@@ -10,7 +10,7 @@
 //! possible to do — and to check. A read that forgets who asked returns everything.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use yaam_contract::{ActionRecord, RecordId, SubjectHash};
 use yaam_core::bundle::{self, Bundle};
@@ -57,6 +57,8 @@ pub struct CoreService {
     /// requests rather than by convention.
     pipeline: Mutex<yaam_core::Pipeline>,
     index: PathBuf,
+    /// The shared read handle, opened by the first read that finds an index.
+    store: OnceLock<Store>,
 }
 
 impl CoreService {
@@ -69,6 +71,7 @@ impl CoreService {
         Ok(Self {
             pipeline: Mutex::new(pipeline),
             index: index.to_path_buf(),
+            store: OnceLock::new(),
         })
     }
 
@@ -81,13 +84,21 @@ impl CoreService {
         self.pipeline.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A read handle for one request.
+    /// The read handle every request shares.
     ///
-    /// Per request rather than shared, because a database connection may move between threads but
-    /// not be used from two at once. Sharing one behind a lock would serialise reads the index is
-    /// built to answer concurrently, and one slow query would then block every other.
-    fn store(&self) -> Result<Store> {
-        Store::open_read(&self.index).map_err(|error| Error::Core(error.into()))
+    /// One handle, not one per request: it is a pool of read-only connections, so concurrent reads
+    /// still each get their own and a request no longer pays to open a database.
+    ///
+    /// Opened on first use rather than in [`CoreService::open`], because a deployment may come up
+    /// before its index has been built: an absent index is a read that fails, not a service that
+    /// refuses to start. A concurrent first read may open a second handle, and the one that loses
+    /// the race is closed rather than kept.
+    fn store(&self) -> Result<&Store> {
+        if let Some(store) = self.store.get() {
+            return Ok(store);
+        }
+        let opened = Store::open_read(&self.index).map_err(|error| Error::Core(error.into()))?;
+        Ok(self.store.get_or_init(|| opened))
     }
 }
 
@@ -101,7 +112,7 @@ impl Service for CoreService {
             scope: caller.scope(),
             ..filter.clone()
         };
-        Ok(query::by_filter(&self.store()?, &scoped).map_err(yaam_core::Error::from)?)
+        Ok(query::by_filter(self.store()?, &scoped).map_err(yaam_core::Error::from)?)
     }
 
     fn entity(
@@ -112,7 +123,7 @@ impl Service for CoreService {
         min_confidence: f32,
     ) -> Result<Vec<RecordId>> {
         Ok(
-            query::by_entity(&self.store()?, kind, id, min_confidence, &caller.scope())
+            query::by_entity(self.store()?, kind, id, min_confidence, &caller.scope())
                 .map_err(yaam_core::Error::from)?,
         )
     }
@@ -122,7 +133,7 @@ impl Service for CoreService {
             scope: caller.scope(),
             ..request.clone()
         };
-        Ok(bundle::compose(&self.store()?, &scoped)?)
+        Ok(bundle::compose(self.store()?, &scoped)?)
     }
 
     fn erase(&self, _caller: &Caller, subject: &SubjectHash) -> Result<EraseReport> {

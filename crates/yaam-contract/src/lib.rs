@@ -17,6 +17,7 @@ pub mod ids;
 pub mod record;
 pub mod request;
 mod spec_yaml;
+pub mod timestamp;
 
 pub use error::{Error, Result};
 pub use ids::{CanonVer, RecordId, SchemaVer, SubjectHash};

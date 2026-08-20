@@ -114,7 +114,9 @@ impl Harness {
     /// Where a record's file belongs.
     pub(crate) fn path_of(&self, record: &ActionRecord) -> std::path::PathBuf {
         let stamp = layout::stamp_of(record).expect("a readable stamp");
-        self.pipeline.published_path(&record.record_id, &stamp)
+        self.pipeline
+            .published_path(record, &stamp)
+            .expect("a derivable path")
     }
 
     /// Opens the index directly, for assertions the query API cannot make.
@@ -126,6 +128,49 @@ impl Harness {
         .expect("open index");
         conn.pragma_update(None, "foreign_keys", "ON")
             .expect("pragma");
+        conn
+    }
+
+    /// Brings every delayed fan-out job's next claim forward, and says how many it moved.
+    ///
+    /// How a test reaches past a backoff without waiting it out, the way [`age`] reaches past the
+    /// sweeper's grace period. A second writing connection is safe here because the pipeline's own
+    /// writer is idle for as long as a test holds it still.
+    pub(crate) fn release_fanout(&self) -> usize {
+        self.writable()
+            .execute(
+                "UPDATE fanout_queue SET not_before_ms = 0 WHERE state = 'pending'",
+                [],
+            )
+            .expect("release")
+    }
+
+    /// Backdates every held fan-out claim, so a sweep sees the drain holding it as gone.
+    pub(crate) fn age_fanout_claims(&self, by_ms: i64) -> usize {
+        self.writable()
+            .execute(
+                "UPDATE fanout_queue SET claimed_ms = claimed_ms - ?1 WHERE state = 'claimed'",
+                [by_ms],
+            )
+            .expect("age claims")
+    }
+
+    /// State and attempt count of the one queued job, for the retry tests.
+    pub(crate) fn fanout_row(&self) -> (String, u32) {
+        self.index()
+            .query_row(
+                "SELECT state, attempts FROM fanout_queue ORDER BY id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("a queued job")
+    }
+
+    /// A connection that may write, for the helpers that stand in for time passing.
+    fn writable(&self) -> Connection {
+        let conn = Connection::open(self.root().join(layout::INDEX_FILE)).expect("open index");
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .expect("busy timeout");
         conn
     }
 
@@ -290,6 +335,24 @@ pub(crate) fn internal(received_at: &str) -> ActionRecord {
         tags: vec!["release".to_owned()],
         summary: String::new(),
     }
+}
+
+/// An owner-visible record: stored apart, readable only by the agent it names.
+pub(crate) fn owner(received_at: &str, agent: &str) -> ActionRecord {
+    let mut record = internal(received_at);
+    record.agent = agent.to_owned();
+    record.visibility = Visibility::Owner;
+    record
+}
+
+/// The permission bits of a path.
+///
+/// Tests assert on these because "tighter filesystem permissions" is a mode or it is nothing: a
+/// record stored apart under the process umask is still a record anybody on the host can read.
+#[cfg(unix)]
+pub(crate) fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).expect("metadata").permissions().mode() & 0o777
 }
 
 /// A subject-derived record: sealed body, one or more named subjects.

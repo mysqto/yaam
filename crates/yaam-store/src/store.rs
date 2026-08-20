@@ -1,7 +1,9 @@
 //! Handles onto the index.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::{Connection, OpenFlags, Transaction, params};
 use yaam_contract::{ActionRecord, DataClass, RecordId, SubjectHash, attrs};
@@ -9,10 +11,85 @@ use yaam_crypto::Epoch;
 
 use crate::schema;
 
-/// A read handle. Cheap to clone across readers.
-#[derive(Debug)]
+/// Idle connections a [`Store`] keeps rather than closes.
+///
+/// Bounded because an idle connection is a file handle and a page cache: a burst of readers is
+/// worth serving, and worth forgetting about once it is over.
+const MAX_IDLE: usize = 8;
+
+/// A read handle. Cheap to clone, and shareable between threads.
+///
+/// A pool rather than one connection, because `rusqlite::Connection` is `Send` but not `Sync`: it
+/// may move between threads and may not be used from two at once. A reader takes a connection out
+/// for the length of a statement and puts it back, so one `Store` behind a `&self` answers reads
+/// concurrently — where a single connection behind a lock would serialise them and let one slow
+/// query block every other.
+///
+/// Read-only throughout. The single-writer invariant is [`Writer`]'s to hold, and nothing reachable
+/// from here can migrate the schema, write a row, or take the write lock away from it.
+#[derive(Debug, Clone)]
 pub struct Store {
-    pub(crate) conn: Connection,
+    /// Shared with every clone: what makes two handles one pool rather than two.
+    pool: Arc<Pool>,
+}
+
+/// The connections one [`Store`] and its clones share.
+#[derive(Debug)]
+struct Pool {
+    /// Where to open another connection when the idle set is empty.
+    path: PathBuf,
+    /// Connections nobody is using.
+    idle: Mutex<Vec<Connection>>,
+}
+
+impl Pool {
+    /// Takes an idle connection, if there is one.
+    ///
+    /// A poisoned lock is recovered rather than propagated: the guarded value is a list of idle
+    /// connections, and a panic while holding it cannot have left one half-used.
+    fn take(&self) -> Option<Connection> {
+        self.idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+    }
+
+    /// Puts a connection back, or drops it when the idle set is already full.
+    fn put(&self, conn: Connection) {
+        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        if idle.len() < MAX_IDLE {
+            idle.push(conn);
+        }
+    }
+}
+
+/// A connection borrowed from a [`Store`] for the length of one read.
+///
+/// Returned to the pool on drop, including when the read failed: a connection a failing statement
+/// left behind is still a usable connection, and losing it on every error would make an erroring
+/// workload open one per read.
+#[derive(Debug)]
+pub(crate) struct Lease<'a> {
+    /// Where the connection goes back to.
+    pool: &'a Pool,
+    /// `None` only while being handed back.
+    conn: Option<Connection>,
+}
+
+impl Deref for Lease<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("a lease holds its connection")
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool.put(conn);
+        }
+    }
 }
 
 /// The single write handle. Owning it is what serialises writes.
@@ -75,14 +152,44 @@ impl Store {
     ///
     /// A reader that migrated would be a second writer. If the file is older than this build, the
     /// caller's job is to run a writer, not to have reads mutate the schema underneath them.
+    ///
+    /// One connection is opened here rather than lazily, so an index that is missing or unreadable
+    /// is reported by the call that opened it instead of by the first query.
     pub fn open_read(path: &Path) -> crate::Result<Self> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        schema::apply_pragmas(&conn)?;
-        Ok(Self { conn })
+        let conn = open_reading(path)?;
+        Ok(Self {
+            pool: Arc::new(Pool {
+                path: path.to_path_buf(),
+                idle: Mutex::new(vec![conn]),
+            }),
+        })
     }
+
+    /// Borrows a connection for one read.
+    pub(crate) fn lease(&self) -> crate::Result<Lease<'_>> {
+        let conn = match self.pool.take() {
+            Some(conn) => conn,
+            None => open_reading(&self.pool.path)?,
+        };
+        Ok(Lease {
+            pool: &self.pool,
+            conn: Some(conn),
+        })
+    }
+}
+
+/// Opens one read-only connection with the pragmas the design depends on.
+///
+/// `NO_MUTEX` is safe here and load-bearing: a connection is used by one thread at a time by
+/// construction — a [`Lease`] is not shareable — so `SQLite`'s own serialisation would be a lock
+/// taken to protect against something that cannot happen.
+fn open_reading(path: &Path) -> crate::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    schema::apply_pragmas(&conn)?;
+    Ok(conn)
 }
 
 impl Writer {
@@ -154,23 +261,43 @@ impl Writer {
         Ok(())
     }
 
-    /// Claims up to `limit` pending jobs, oldest first.
+    /// Forgets that a record is held back.
+    ///
+    /// The counterpart of [`Writer::enqueue_quarantine`], for the record that resolved: its spool
+    /// file is gone, and a row still naming that file is a register entry pointing at nothing until
+    /// the next rebuild derives the register again from the spool directory.
+    ///
+    /// Absence is success. Every caller is settling something that may already have been settled.
+    pub fn dequeue_quarantine(&mut self, id: &str) -> crate::Result<()> {
+        self.conn.execute(
+            "DELETE FROM quarantine_pending WHERE record_id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Claims up to `limit` jobs that are ready at `now_ms`, oldest first.
     ///
     /// The claim and the read are one statement, so a job cannot be handed out twice however often
     /// this is called: a row leaves `pending` in the same atomic step that returns it. `attempts` is
-    /// incremented on the way out, which is what lets a caller dead-letter a job that keeps failing.
-    pub fn claim_fanout(&mut self, limit: u32) -> crate::Result<Vec<FanoutJob>> {
+    /// incremented here and only here — it counts claims, which is the number a caller compares
+    /// against its own limit, and a job whose holder died has still had its attempt.
+    ///
+    /// A job [`Writer::fail_fanout`] pushed into the future is not returned until `now_ms` reaches
+    /// it. "Now" is a parameter rather than a clock read so a caller can drive the queue's sense of
+    /// time — a backoff nothing can advance is a backoff nothing can test.
+    pub fn claim_fanout(&mut self, limit: u32, now_ms: i64) -> crate::Result<Vec<FanoutJob>> {
         let mut stmt = self.conn.prepare_cached(
             "UPDATE fanout_queue
-                SET state = ?1, attempts = attempts + 1
+                SET state = ?1, attempts = attempts + 1, claimed_ms = ?4
               WHERE id IN (SELECT id FROM fanout_queue
-                            WHERE state = ?2
+                            WHERE state = ?2 AND not_before_ms <= ?4
                             ORDER BY enqueued_ms, id
                             LIMIT ?3)
           RETURNING id, record_id, job_kind, attempts",
         )?;
         let rows = stmt.query_map(
-            params![STATE_CLAIMED, STATE_PENDING, i64::from(limit)],
+            params![STATE_CLAIMED, STATE_PENDING, i64::from(limit), now_ms],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -201,10 +328,50 @@ impl Writer {
     /// derived and go away with [`Writer::truncate_derived`].
     pub fn complete_fanout(&mut self, job_id: i64) -> crate::Result<()> {
         self.conn.execute(
-            "UPDATE fanout_queue SET state = ?1 WHERE id = ?2",
+            "UPDATE fanout_queue SET state = ?1, claimed_ms = NULL WHERE id = ?2",
             params![STATE_DONE, job_id],
         )?;
         Ok(())
+    }
+
+    /// Returns a claimed job to the queue, claimable again no earlier than `not_before_ms`.
+    ///
+    /// This is what makes a retry budget span drains rather than being spent inside one. Without it
+    /// a caller could only keep trying immediately or give up, and a drain that died holding a claim
+    /// stranded the job until the next rebuild re-enqueued it.
+    ///
+    /// `attempts` is deliberately *not* incremented here: [`Writer::claim_fanout`] counts every
+    /// hand-out, and counting a failure too would double the number a caller's own limit compares
+    /// against — and would leave a job whose holder crashed uncounted.
+    ///
+    /// Only a claimed job moves. A job that finished in the meantime stays finished, so a late
+    /// failure report cannot resurrect work already done.
+    pub fn fail_fanout(&mut self, job_id: i64, not_before_ms: i64) -> crate::Result<()> {
+        self.conn.execute(
+            "UPDATE fanout_queue
+                SET state = ?1, claimed_ms = NULL, not_before_ms = ?3
+              WHERE id = ?2 AND state = ?4",
+            params![STATE_PENDING, job_id, not_before_ms, STATE_CLAIMED],
+        )?;
+        Ok(())
+    }
+
+    /// Returns every job claimed at or before `claimed_before_ms` to the queue, and says how many.
+    ///
+    /// A claim is only as good as the process holding it. Nothing renews one, so a drain that died
+    /// mid-job leaves a row no later claim can see — this is the only thing that gets it back, and
+    /// [`crate::store`] deliberately does not decide when a claim is old enough: the caller knows
+    /// how long its own drains take, and picking a grace period here would be guessing at it.
+    ///
+    /// `attempts` is left as it stands, so a job whose holder keeps dying still runs out of budget
+    /// rather than being retried for ever.
+    pub fn reclaim_stale_fanout(&mut self, claimed_before_ms: i64) -> crate::Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE fanout_queue
+                SET state = ?1, claimed_ms = NULL
+              WHERE state = ?2 AND claimed_ms <= ?3",
+            params![STATE_PENDING, STATE_CLAIMED, claimed_before_ms],
+        )?)
     }
 
     /// Drops every derived row so the index can be rebuilt from the tree.

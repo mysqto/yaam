@@ -99,9 +99,28 @@ pub fn by_entity(
     }
     sql.push_str(" ORDER BY rec.received_ms DESC, rec.id DESC");
 
-    let mut stmt = store.conn.prepare(&sql)?;
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(binds), one_id)?;
     collect(rows)
+}
+
+/// Whether one record is in the index, as a point lookup.
+///
+/// Here because the alternative is reading every indexed identifier to answer one question about
+/// one of them, which costs the whole table on every sweep. `id` is text rather than a parsed
+/// identifier: the callers hold a filename, and a stem the contract would reject is by definition
+/// not a row.
+pub fn exists(store: &crate::Store, id: &str, scope: &Scope) -> crate::Result<bool> {
+    let mut binds: Vec<SqlValue> = vec![id.to_owned().into()];
+    let mut sql = "SELECT 1 FROM records AS rec WHERE rec.record_id = ?".to_owned();
+    if let Some(predicate) = scope_predicate(scope, "rec", &mut binds) {
+        sql.push_str(" AND ");
+        sql.push_str(&predicate);
+    }
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
+    Ok(stmt.exists(params_from_iter(binds))?)
 }
 
 /// Filtered record query.
@@ -111,7 +130,8 @@ pub fn by_entity(
 /// attribute index instead of testing JSON per row.
 pub fn by_filter(store: &crate::Store, filter: &Filter) -> crate::Result<Vec<RecordId>> {
     let (sql, binds) = filter_sql(filter);
-    let mut stmt = store.conn.prepare(&sql)?;
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(binds), one_id)?;
     collect(rows)
 }
@@ -162,7 +182,8 @@ pub fn correlate(
     within_ms: i64,
 ) -> crate::Result<Vec<(RecordId, RecordId)>> {
     let (sql, binds) = correlate_sql(left, right, within_ms);
-    let mut stmt = store.conn.prepare(&sql)?;
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(binds), |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -228,7 +249,8 @@ pub fn search(
     sql.push_str(" ORDER BY records_fts.rank, rec.received_ms DESC LIMIT ?");
     binds.push(i64::from(limit).into());
 
-    let mut stmt = store.conn.prepare(&sql)?;
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(binds), one_id)?;
     collect(rows)
 }

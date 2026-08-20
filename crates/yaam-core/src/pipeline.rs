@@ -37,14 +37,23 @@ use crate::layout::{self, Stamp};
 use crate::policy::Redaction;
 use crate::{Error, Result};
 
-/// Attempts of one fan-out job before it is set aside.
+/// Claims of one fan-out job before it is set aside.
 ///
-/// The queue hands a job out once and has no way to return it to `pending`, so the retry budget is
-/// spent inside the drain that claimed it: a job left claimed would be invisible to every later
-/// drain, which is worse than one written somewhere an operator will find it. A second immediate
-/// attempt covers the momentary failures; more than that needs backoff, and backoff needs a queue
-/// that can take a job back.
-const FANOUT_ATTEMPTS_PER_DRAIN: u32 = 2;
+/// Counted across drains, not within one: a failed job goes back to the queue with a delay, so the
+/// budget buys five separated attempts rather than five in the same second. Five because the
+/// failures worth waiting out — a directory that is briefly unwritable, a record file a replica has
+/// not caught up with — are gone within the backoff below, and a job that survives all five is not
+/// waiting on a moment.
+const FANOUT_MAX_ATTEMPTS: u32 = 5;
+
+/// Delay before a job's first retry. Doubles per attempt.
+const FANOUT_BACKOFF_MS: i64 = 1_000;
+
+/// How long a job that failed again may be pushed out.
+///
+/// A ceiling rather than unbounded doubling: the point of backoff is to stop hammering something
+/// that is broken, not to park work for so long that nobody sees it fail.
+const FANOUT_BACKOFF_CAP_MS: i64 = 60_000;
 
 /// Fan-out work every published record needs: the entity timelines a bundle reads.
 const JOB_BUNDLE: &str = "bundle";
@@ -135,7 +144,7 @@ impl Pipeline {
         // path. An unreadable timestamp is a permanent fault either way.
         let stamp = layout::stamp_of(&record)?;
 
-        if self.published_path(&id, &stamp).exists() {
+        if self.published_path(&record, &stamp)?.exists() {
             return Ok(Accepted::Duplicate(id));
         }
 
@@ -163,32 +172,56 @@ impl Pipeline {
     /// Drains queued fan-out work: entity timelines and audit records.
     ///
     /// Every handler is idempotent, because a drain that crashed after doing the work and before
-    /// marking it done will run again. A job that keeps failing is written to `.dead-letter/` and
-    /// completed, so it stops blocking the queue and stays visible to an operator.
+    /// marking it done will run again.
+    ///
+    /// A job that fails goes back to the queue with a delay, not into the dead-letter directory: the
+    /// failures worth retrying — an unwritable directory, a record file this process cannot yet see
+    /// — are the ones a delay outlasts, and a retry in the same drain would spend the budget on the
+    /// same instant. Only after [`FANOUT_MAX_ATTEMPTS`] claims is a job written to `.dead-letter/`
+    /// and completed, so it stops holding a place in the queue and stays visible to an operator.
+    ///
+    /// Returns how many jobs it settled — completed or dead-lettered. A job put back for later is
+    /// not one of them: the caller asked what the queue got through, and that work is still owed.
     ///
     /// Fan-out is derived, so nothing here is lost for good: [`crate::reindex::reindex_all`]
-    /// re-enqueues every job from the tree, which is also how a job stranded by a crashed drain is
-    /// recovered.
+    /// re-enqueues every job from the tree.
     pub fn drain_fanout(&mut self, max_jobs: usize) -> Result<usize> {
         let limit = u32::try_from(max_jobs).unwrap_or(u32::MAX);
         if limit == 0 {
             return Ok(0);
         }
-        let jobs = self.writer.claim_fanout(limit)?;
+        let now = fsutil::now_ms();
+        let jobs = self.writer.claim_fanout(limit, now)?;
         if jobs.is_empty() {
             return Ok(0);
         }
 
         let located = self.locate_records()?;
-        let mut done = 0;
+        let mut settled = 0;
         for job in jobs {
-            if let Err(reason) = self.attempt_job(&job, &located) {
+            let Err(reason) = self.run_job(&job, &located) else {
+                self.writer.complete_fanout(job.id)?;
+                settled += 1;
+                continue;
+            };
+            if job.attempts >= FANOUT_MAX_ATTEMPTS {
                 self.dead_letter(&job, &reason.to_string())?;
+                self.writer.complete_fanout(job.id)?;
+                settled += 1;
+                continue;
             }
-            self.writer.complete_fanout(job.id)?;
-            done += 1;
+            let delay = backoff_ms(job.attempts);
+            tracing::warn!(
+                record = job.record.as_str(),
+                kind = %job.kind,
+                attempts = job.attempts,
+                delay,
+                error = %reason,
+                "fan-out failed; queued for a later drain"
+            );
+            self.writer.fail_fanout(job.id, now + delay)?;
         }
-        Ok(done)
+        Ok(settled)
     }
 
     /// Root of the memory tree.
@@ -215,8 +248,11 @@ impl Pipeline {
     }
 
     /// Where a record belongs in the tree.
-    pub(crate) fn published_path(&self, id: &RecordId, stamp: &Stamp) -> PathBuf {
-        self.root.join(layout::record_relative(id, stamp))
+    ///
+    /// Derived from the record, not from its identifier alone: an owner-visible record is stored
+    /// apart, so its visibility and its owner are part of the answer.
+    pub(crate) fn published_path(&self, record: &ActionRecord, stamp: &Stamp) -> Result<PathBuf> {
+        Ok(self.root.join(layout::record_relative(record, stamp)?))
     }
 
     /// Step 1: everything that must hold before any byte is written.
@@ -354,13 +390,16 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Drops the spooled copy of a record that has now been published.
+    /// Drops the spooled copy of a record that has now been published, and its register row.
     ///
     /// The re-presentation that resolves a quarantine is an ordinary [`Pipeline::accept`] — a retry,
     /// a spool replay — so this runs on every publish and is a no-op for the records that were never
-    /// held. The register row goes with it at the next rebuild, which derives what is held back from
-    /// the spool directory itself; the index has no way to retract a row it was told to remember.
-    fn settle_quarantine(&self, id: &RecordId) -> Result<()> {
+    /// held.
+    ///
+    /// The spool file goes first. It is the authority on what is held back, so a crash between the
+    /// two leaves a row a rebuild retracts, where the other order would leave a spool file a rebuild
+    /// registers again.
+    fn settle_quarantine(&mut self, id: &RecordId) -> Result<()> {
         let path = self.root.join(layout::QUARANTINE_DIR).join(format!(
             "{}.{}",
             id.as_str(),
@@ -370,6 +409,7 @@ impl Pipeline {
             fsutil::remove_if_present(&path)?;
             tracing::info!(record = id.as_str(), "quarantine settled by publish");
         }
+        self.writer.dequeue_quarantine(id.as_str())?;
         Ok(())
     }
 
@@ -386,7 +426,13 @@ impl Pipeline {
             document.record.record_id.as_str(),
             layout::RECORD_EXT
         ));
-        fsutil::write_sync(&path, document.render().as_bytes())?;
+        // Staged under the mode it will be published with, because a rename carries the mode it
+        // finds: a copy that spent this window readable was readable, whatever it becomes.
+        fsutil::write_sync_mode(
+            &path,
+            document.render().as_bytes(),
+            layout::record_mode(&document.record),
+        )?;
         fsutil::sync_dir(&dir)?;
         Ok(path)
     }
@@ -402,9 +448,9 @@ impl Pipeline {
         staged: &Path,
         stamp: &Stamp,
     ) -> Result<PathBuf> {
-        let destination = self.published_path(&document.record.record_id, stamp);
+        let destination = self.published_path(&document.record, stamp)?;
         let parent = fsutil::parent_of(&destination)?;
-        fs::create_dir_all(parent)?;
+        self.create_record_dirs(&document.record, parent)?;
         match fs::rename(staged, &destination) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound && destination.exists() => {}
@@ -412,6 +458,30 @@ impl Pipeline {
         }
         fsutil::sync_dir(parent)?;
         Ok(destination)
+    }
+
+    /// Creates the directory chain a record's file goes in.
+    ///
+    /// An owner's subtree is created — and every level of it re-tightened — so only the identity
+    /// running the service can traverse it. Re-tightened because a recursive create leaves an
+    /// existing directory's mode alone, which would keep a tree restored from a loose backup, or
+    /// written by an older build, world-readable for ever.
+    fn create_record_dirs(&self, record: &ActionRecord, parent: &Path) -> Result<()> {
+        let Some(owner_root) = layout::owner_relative(record)? else {
+            fs::create_dir_all(parent)?;
+            return Ok(());
+        };
+        fsutil::create_private_dir_all(parent)?;
+        let owner_root = self.root.join(owner_root);
+        let mut dir = parent;
+        while dir.starts_with(&owner_root) {
+            fsutil::make_private(dir)?;
+            dir = fsutil::parent_of(dir)?;
+        }
+        // The loop stops one level short of `records/owner`, and that level is the one that hides
+        // which identities have records at all. `records/` itself stays traversable.
+        fsutil::make_private(dir)?;
+        Ok(())
     }
 
     /// Step 3b: commit the index row, and the fan-out jobs inside the same transaction.
@@ -440,18 +510,6 @@ impl Pipeline {
             }
         }
         Ok(located)
-    }
-
-    /// Runs one fan-out job, retrying in place before giving up on it.
-    fn attempt_job(&self, job: &FanoutJob, located: &BTreeMap<String, PathBuf>) -> Result<()> {
-        let mut last = None;
-        for _ in 0..FANOUT_ATTEMPTS_PER_DRAIN {
-            match self.run_job(job, located) {
-                Ok(()) => return Ok(()),
-                Err(error) => last = Some(error),
-            }
-        }
-        Err(last.unwrap_or_else(|| invalid("no attempt was made".to_owned())))
     }
 
     /// The work one job stands for.
@@ -563,6 +621,14 @@ impl Pipeline {
         fsutil::sync_dir(&dir)?;
         Ok(())
     }
+}
+
+/// How long a job waits before its next claim, doubling per attempt up to the cap.
+fn backoff_ms(attempts: u32) -> i64 {
+    let doublings = attempts.saturating_sub(1).min(16);
+    FANOUT_BACKOFF_MS
+        .saturating_mul(1i64 << doublings)
+        .min(FANOUT_BACKOFF_CAP_MS)
 }
 
 /// Freezes a full timeline head and starts a fresh one.
@@ -1044,28 +1110,81 @@ mod tests {
     }
 
     #[test]
-    fn fan_out_for_a_record_that_is_not_in_the_tree_is_dead_lettered() {
+    fn a_failed_fan_out_job_waits_out_its_backoff_before_the_next_drain_sees_it() {
         let mut harness = Harness::new();
         let record = testkit::internal(T09);
         harness
             .pipeline
             .accept(record.clone(), BODY)
             .expect("accepted");
-        // The tree is authoritative; without the file the job can never be done.
+        // The tree is authoritative; without the file the job cannot be done.
         fs::remove_file(harness.path_of(&record)).expect("remove");
 
-        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 1);
+        // Nothing settled, and the job is back in the queue rather than left claimed — which is
+        // what it used to be, invisible to every later drain.
+        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 0);
+        assert_eq!(harness.fanout_row(), ("pending".to_owned(), 1));
+
+        // A drain a moment later must not pick it up: the delay is the whole point of putting it
+        // back, and a retry in the same instant would spend the budget on the same failure.
+        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 0);
+        assert_eq!(
+            harness.fanout_row(),
+            ("pending".to_owned(), 1),
+            "the job was claimed before its backoff had passed"
+        );
+
+        // Once the delay has passed it is claimed again, and counts the attempt.
+        assert_eq!(harness.release_fanout(), 1);
+        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 0);
+        assert_eq!(harness.fanout_row(), ("pending".to_owned(), 2));
+    }
+
+    #[test]
+    fn a_fan_out_job_that_fails_every_attempt_is_dead_lettered_and_completed() {
+        let mut harness = Harness::new();
+        let record = testkit::internal(T09);
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+        fs::remove_file(harness.path_of(&record)).expect("remove");
+
         let letter = harness
             .root()
             .join(".dead-letter")
             .join(record.record_id.as_str().to_owned() + ".bundle");
+        for attempt in 1..super::FANOUT_MAX_ATTEMPTS {
+            assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 0);
+            assert_eq!(harness.fanout_row(), ("pending".to_owned(), attempt));
+            assert!(!letter.exists(), "set aside after {attempt} attempt(s)");
+            harness.release_fanout();
+        }
+
+        // The budget is spent: the job stops being retried and starts being visible instead.
+        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 1);
         assert!(
             fs::read_to_string(&letter)
                 .expect("letter")
                 .contains("is not in the tree")
         );
-        // Set aside, not left claimed: a later drain has nothing to pick up.
+        assert_eq!(
+            harness.fanout_row(),
+            ("done".to_owned(), super::FANOUT_MAX_ATTEMPTS)
+        );
+        // Completed, not left pending: a dead-lettered job must not hold a place in the queue.
+        assert_eq!(harness.release_fanout(), 0);
         assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 0);
+    }
+
+    #[test]
+    fn the_backoff_doubles_and_then_stops_growing() {
+        // The delay has to grow — a fixed one retries a broken directory as fast as it can — and it
+        // has to stop growing, or a job ends up parked for longer than anybody is watching.
+        assert_eq!(super::backoff_ms(1), super::FANOUT_BACKOFF_MS);
+        assert_eq!(super::backoff_ms(2), super::FANOUT_BACKOFF_MS * 2);
+        assert_eq!(super::backoff_ms(3), super::FANOUT_BACKOFF_MS * 4);
+        assert_eq!(super::backoff_ms(60), super::FANOUT_BACKOFF_CAP_MS);
     }
 
     #[test]
@@ -1083,7 +1202,7 @@ mod tests {
             attempts: 1,
         };
         let located = harness.pipeline.locate_records().expect("located");
-        assert!(harness.pipeline.attempt_job(&job, &located).is_err());
+        assert!(harness.pipeline.run_job(&job, &located).is_err());
     }
 
     #[test]
@@ -1162,9 +1281,111 @@ mod tests {
             !spooled.exists(),
             "a published record has no business in the spool"
         );
-        // The register is derived from the spool, so the rebuild is what retracts the row.
+        // Retracted by the publish itself. Waiting for a rebuild would leave the register naming a
+        // spool file that is not there, and every reader of it wrong until then.
+        assert_eq!(harness.counts()["quarantine_pending"], 0);
+        // And the rebuild agrees, because it derives the register from the spool directory.
         crate::reindex::reindex_all(&mut harness.pipeline).expect("rebuilt");
         assert_eq!(harness.counts()["quarantine_pending"], 0);
+    }
+
+    #[test]
+    fn an_owner_visible_record_is_stored_apart_and_invisible_to_another_identity() {
+        use yaam_contract::Visibility;
+        use yaam_store::query::{self, Filter, Scope};
+
+        let mut harness = Harness::new();
+        let record = testkit::owner(T09, "agent_a");
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+
+        let path = harness.path_of(&record);
+        assert!(
+            path.to_string_lossy()
+                .contains("records/owner/agent_a/2026/08/20/"),
+            "{}",
+            path.display()
+        );
+        assert!(path.exists(), "{}", path.display());
+
+        // The other half of the promise: the record is out of the shared tree, and a scoped read
+        // by anybody else answers nothing however widely that caller is entitled.
+        let store = harness.pipeline.reader().expect("reader");
+        let seen_by = |agent: &str| {
+            query::by_filter(
+                &store,
+                &Filter {
+                    scope: Scope::Caller {
+                        visibility: vec![Visibility::Owner, Visibility::Org, Visibility::Team],
+                        agent: agent.to_owned(),
+                        teams: vec!["platform".to_owned()],
+                    },
+                    ..Filter::default()
+                },
+            )
+            .expect("query")
+        };
+        assert_eq!(seen_by("agent_a"), vec![record.record_id.clone()]);
+        assert!(seen_by("agent_b").is_empty(), "another identity saw it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_visible_record_admits_no_reader_but_its_own_identity() {
+        let mut harness = Harness::new();
+        let record = testkit::owner(T09, "agent_a");
+
+        // The staged copy first: a rename carries the mode it finds, so a window in which the copy
+        // was group-readable would be a window in which it was read.
+        let document = testkit::plain_document(&record, BODY);
+        let staged = harness.pipeline.stage(&document).expect("staged");
+        assert_eq!(testkit::mode_of(&staged), 0o600);
+        fs::remove_file(&staged).expect("discard");
+
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+        let path = harness.path_of(&record);
+        assert_eq!(testkit::mode_of(&path), 0o600, "{}", path.display());
+
+        // And every directory over it, up to and including `records/owner`: a file nobody can
+        // traverse to is unopenable whatever its own mode says.
+        let stop = harness.root().join("records");
+        let mut dir = path.parent().expect("a parent");
+        while dir != stop {
+            assert_eq!(testkit::mode_of(dir), 0o700, "{}", dir.display());
+            dir = dir.parent().expect("a parent");
+        }
+        // `records/` itself stays traversable: what is private is the owner subtree, not the tree.
+        assert_ne!(testkit::mode_of(&stop) & 0o007, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_subtree_left_loose_by_an_older_write_is_tightened() {
+        let mut harness = Harness::new();
+        // What a tree written before the boundary existed — or restored from a loose backup — looks
+        // like: the directories are there, and anybody on the host can walk them.
+        let loose = harness.root().join("records/owner/agent_a/2026/08/20");
+        fs::create_dir_all(&loose).expect("dirs");
+        crate::fsutil::make_private(&loose).expect("mode");
+        std::fs::set_permissions(
+            harness.root().join("records/owner"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("loosen");
+
+        harness
+            .pipeline
+            .accept(testkit::owner(T09, "agent_a"), BODY)
+            .expect("accepted");
+        assert_eq!(
+            testkit::mode_of(&harness.root().join("records/owner")),
+            0o700
+        );
     }
 
     #[test]

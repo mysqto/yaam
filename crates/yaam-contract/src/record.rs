@@ -28,7 +28,12 @@ pub enum Outcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
-    /// The actor only. Stored apart, with tighter filesystem permissions.
+    /// The actor only.
+    ///
+    /// Stored apart: a subtree of its own per owner, whose directories and files admit no group or
+    /// other access. The two halves cover each other — a scoped read answers nothing to anybody
+    /// else, and a reader on the host cannot go around the query by opening the file unless it is
+    /// the identity the writer runs as.
     Owner,
     /// A named team.
     Team,
@@ -138,6 +143,11 @@ impl ActionRecord {
     /// Notably: a subject-derived record must name at least one subject, and a team-scoped record
     /// must name its team.
     ///
+    /// Both timestamps are checked for *format* here, at the boundary the writer can still act on.
+    /// They are carried as text and converted downstream — by the index, and by the tree deriving a
+    /// record's directory from its date — so an unreadable stamp reaching that far surfaces as a
+    /// `NOT NULL` violation inside a publish, naming a column rather than the field that was sent.
+    ///
     /// The subject rule runs both ways. A subject-derived record with no subjects would be sealed
     /// under a key nobody can destroy — unerasable by construction — and an internal record that
     /// names subjects claims erasability its plaintext body cannot deliver. Either way the record's
@@ -145,6 +155,14 @@ impl ActionRecord {
     pub fn validate(&self) -> crate::Result<()> {
         if self.action.trim().is_empty() {
             return Err(crate::Error::Invalid("action is empty".to_owned()));
+        }
+
+        for (field, text) in [("at", &self.at), ("received_at", &self.received_at)] {
+            if crate::timestamp::parse_ms(text).is_none() {
+                return Err(crate::Error::Invalid(format!(
+                    "{field} `{text}` is not a timestamp this can read"
+                )));
+            }
         }
 
         match self.data_class {
@@ -310,6 +328,21 @@ pub(crate) mod tests {
         r.entities.push(entity_ref(1.0));
         r.entities.push(entity_ref(2.0));
         assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn a_timestamp_the_store_cannot_read_is_rejected_on_the_way_in() {
+        for bad in ["", "2026-08-20", "2026-08-20T09:14:02", "yesterday"] {
+            let mut r = internal_record();
+            r.at = bad.to_owned();
+            let err = r.validate().expect_err("an unreadable `at`");
+            assert!(err.to_string().contains("at `"), "{err}");
+
+            let mut r = internal_record();
+            r.received_at = bad.to_owned();
+            let err = r.validate().expect_err("an unreadable `received_at`");
+            assert!(err.to_string().contains("received_at `"), "{err}");
+        }
     }
 
     #[test]
