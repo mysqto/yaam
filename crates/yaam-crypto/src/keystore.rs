@@ -1,10 +1,8 @@
 //! Where subject keys live, and the rules that keep erasure honest.
 
-use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use yaam_contract::SubjectHash;
 use zeroize::Zeroize;
@@ -41,37 +39,6 @@ pub trait KeyStore {
 
     /// Records a subject as erased. Append-only; never reversed.
     fn tombstone(&self, subject: &SubjectHash) -> crate::Result<()>;
-}
-
-thread_local! {
-    /// A stack rather than a slot, so nesting restores the outer store instead of clearing it.
-    static AMBIENT: RefCell<Vec<Arc<dyn KeyStore>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Restores the previous ambient store even if `f` panics.
-struct AmbientGuard;
-
-impl Drop for AmbientGuard {
-    fn drop(&mut self) {
-        AMBIENT.with_borrow_mut(Vec::pop);
-    }
-}
-
-/// Runs `f` with `store` as the ambient key store for this thread.
-///
-/// [`crate::seal::seal`] and [`crate::seal::unseal`] take no store argument, and a sealing that
-/// skipped wrapping would emit a block anyone could read — so they read the store from here and
-/// fail with [`Error::NoKeyStore`] when none is installed. Callers that can pass a store should use
-/// [`crate::seal::seal_in`] instead.
-pub fn with_store<R>(store: Arc<dyn KeyStore>, f: impl FnOnce() -> R) -> R {
-    AMBIENT.with_borrow_mut(|stack| stack.push(store));
-    let _guard = AmbientGuard;
-    f()
-}
-
-/// The innermost installed store, if any.
-pub(crate) fn ambient() -> Option<Arc<dyn KeyStore>> {
-    AMBIENT.with_borrow(|stack| stack.last().cloned())
 }
 
 /// Filesystem key store.
@@ -263,10 +230,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::block::parse_subject;
 
     fn subject(n: u8) -> SubjectHash {
-        parse_subject(&format!("s_{:064x}", u32::from(n) + 1)).unwrap()
+        SubjectHash::parse(&format!("s_{:064x}", u32::from(n) + 1)).unwrap()
     }
 
     fn epoch() -> Epoch {
@@ -427,15 +393,14 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_subject_string_never_reaches_the_filesystem() {
+    fn a_bad_path_component_never_reaches_the_filesystem() {
         let (_dir, store) = store();
-        // Not reachable through `SubjectHash::parse`, but the store is the last line of defence.
-        let hostile: SubjectHash = serde_json::from_str("\"../../escape\"").unwrap();
-        assert!(store.get(&hostile, &epoch()).is_err());
-        assert!(store.mint(&hostile, &epoch()).is_err());
-        assert!(store.destroy_subject(&hostile).is_err());
-        assert!(store.destroy_epoch(&hostile, &epoch()).is_err());
-        assert!(store.tombstone(&hostile).is_err());
-        assert!(store.is_tombstoned(&hostile).is_err());
+        // A subject hash cannot be built with a traversal in it any more, but an epoch label read
+        // from a stored block is only checked for separators — so the store still checks its own
+        // path components before it touches the disk.
+        let hostile = Epoch::from_stored("2026-Q3\0").unwrap();
+        assert!(store.get(&subject(0), &hostile).is_err());
+        assert!(store.mint(&subject(0), &hostile).is_err());
+        assert!(store.destroy_epoch(&subject(0), &hostile).is_err());
     }
 }

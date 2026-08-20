@@ -73,7 +73,7 @@ impl Normalise {
             "lowercase" => Ok(Self::Lowercase),
             "uppercase_prefix" => Ok(Self::UppercasePrefix),
             "lowercase_path" => Ok(Self::LowercasePath),
-            other => Err(Error::Invalid(format!("unknown normalise step `{other}`"))),
+            other => Err(spec(format!("unknown normalise step `{other}`"))),
         }
     }
 
@@ -124,9 +124,14 @@ struct CompiledKind {
 }
 
 /// The loaded set of entity kinds.
+///
+/// Holds the configured kinds twice over: a map for lookup, and a slice in name order for callers
+/// that need to enumerate them. A slice cannot be borrowed out of a map, and the alternative — a
+/// `Vec<&KindSpec>` — would allocate on every call to describe configuration that never changes.
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     kinds: BTreeMap<String, CompiledKind>,
+    specs: Vec<KindSpec>,
 }
 
 impl Registry {
@@ -156,9 +161,8 @@ impl Registry {
             let normalise = parse_steps(value.as_mapping_get("normalise"), name)?;
             // Anchored so a kind that forgot `^…$` cannot accept junk wrapped around a matching
             // substring. The spec's own anchors make the added assertions inert.
-            let compiled = Regex::new(&format!("^(?:{pattern})$")).map_err(|e| {
-                Error::Invalid(format!("entity kind `{name}` has an unusable pattern: {e}"))
-            })?;
+            let compiled = Regex::new(&format!("^(?:{pattern})$"))
+                .map_err(|e| spec(format!("entity kind `{name}` has an unusable pattern: {e}")))?;
             kinds.insert(
                 name.to_owned(),
                 CompiledKind {
@@ -171,7 +175,19 @@ impl Registry {
                 },
             );
         }
-        Ok(Self { kinds })
+        // The map is already in name order, which is what makes the two views agree.
+        let specs = kinds.values().map(|k| k.spec.clone()).collect();
+        Ok(Self { kinds, specs })
+    }
+
+    /// Every configured kind, in name order.
+    ///
+    /// [`KindSpec`] was public from the start with nothing on the surface handing one out, so a
+    /// caller could not list the kinds a deployment configured — which is what a `yaam kinds`
+    /// listing, or any validation of a kind name before use, needs.
+    #[must_use]
+    pub fn kinds(&self) -> &[KindSpec] {
+        &self.specs
     }
 
     /// Normalises then validates an identifier, returning its canonical form.
@@ -268,19 +284,24 @@ impl Registry {
     }
 }
 
+/// A malformed `entities.yaml`, distinct from a malformed identifier.
+fn spec(detail: String) -> Error {
+    Error::Spec { detail }
+}
+
 /// Reads a kind's `normalise` list. Absent means the identifier is taken as given.
 fn parse_steps(node: Option<&Yaml<'_>>, kind: &str) -> crate::Result<Vec<Normalise>> {
     let Some(node) = node else {
         return Ok(Vec::new());
     };
-    let steps = node.as_vec().ok_or_else(|| {
-        Error::Invalid(format!("entity kind `{kind}` has a non-list `normalise`"))
-    })?;
+    let steps = node
+        .as_vec()
+        .ok_or_else(|| spec(format!("entity kind `{kind}` has a non-list `normalise`")))?;
     steps
         .iter()
         .map(|step| {
             let name = step.as_str().ok_or_else(|| {
-                Error::Invalid(format!(
+                spec(format!(
                     "entity kind `{kind}` has a non-string normalise step"
                 ))
             })?;
@@ -467,10 +488,54 @@ mod tests {
     fn from_yaml_keeps_the_configured_kind_verbatim() {
         let r = Registry::from_yaml("kinds:\n  k:\n    pattern: '^a$'\n    normalise: [trim]\n")
             .unwrap();
-        let spec = &r.kinds["k"].spec;
+        let [spec] = r.kinds() else {
+            panic!("one kind was configured");
+        };
         assert_eq!(spec.name, "k");
         assert_eq!(spec.pattern, "^a$");
         assert_eq!(spec.normalise, vec![Normalise::Trim]);
+    }
+
+    #[test]
+    fn kinds_lists_every_configured_kind_in_name_order() {
+        let r = shipped();
+        let names: Vec<&str> = r.kinds().iter().map(|k| k.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "the listing must be stable");
+        assert!(names.contains(&"ticket") && names.contains(&"subject"));
+        // The listing and the matcher are two views of one thing, so every listed name resolves.
+        for spec in r.kinds() {
+            assert!(
+                !matches!(
+                    r.canonicalise(&spec.name, "x"),
+                    Err(Error::UnknownEntityKind(_))
+                ),
+                "kind `{}` is listed but unknown to the matcher",
+                spec.name
+            );
+        }
+        assert!(Registry::default().kinds().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_registry_is_a_spec_failure() {
+        for yaml in [
+            "kinds:\n  k:\n    pattern: '['\n",
+            "kinds:\n  k:\n    pattern: '^a$'\n    normalise: [squash]\n",
+            "kinds:\n  k:\n    pattern: '^a$'\n    normalise: trim\n",
+            "kinds:\n  k:\n    pattern: '^a$'\n    normalise: [1]\n",
+        ] {
+            assert!(
+                matches!(Registry::from_yaml(yaml), Err(Error::Spec { .. })),
+                "{yaml} must read as a spec failure"
+            );
+        }
+        // A path segment, by contrast, is data rather than configuration.
+        assert!(matches!(
+            Registry::from_path_segment("a~"),
+            Err(Error::Invalid(_))
+        ));
     }
 
     /// The alphabet that can possibly collide: the escape, every special, every escape code, and

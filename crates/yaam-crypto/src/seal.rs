@@ -2,9 +2,9 @@
 //!
 //! Layering, because the type names alone do not say it: a record is encrypted under a key that
 //! exists nowhere on disk. What is stored is one *wrapped share* per subject, and the key is
-//! re-derived from all of them. [`Dek::split`] and [`Dek::derive`] speak in bare shares;
-//! [`SealedBody`] only ever holds wrapped ones. [`seal`] and [`unseal`] are the sole crossings
-//! between the two, which is why they are the only functions here that need a key store.
+//! re-derived from all of them. [`Dek::split`] and [`Dek::derive`] speak in [`BareShare`]s;
+//! [`SealedBody`] only ever holds [`WrappedShare`]s. [`seal`] and [`unseal`] are the sole crossings
+//! between the two, which is why they are the only functions here that take a key store.
 
 use aes_gcm::{
     Aes256Gcm,
@@ -16,7 +16,7 @@ use rand::CryptoRng;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use yaam_contract::{RecordId, SubjectHash};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::block::FORMAT_VERSION;
 use crate::error::Error;
@@ -127,17 +127,46 @@ fn civil_from_millis(ms: i64) -> (i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month)
 }
 
-/// One subject's share of a record's data key. Useless alone.
+/// One subject's bare share of a record's data key. Useless alone, and secret while held.
 ///
-/// The `wrapped` field is key material in a public `Vec`, so it is not zeroized on drop — a `Drop`
-/// impl would stop callers moving the field out. Treat a share as secret for as long as you hold it.
-#[derive(Debug, Clone)]
-pub struct DekShare {
+/// Separate from [`WrappedShare`] because the two are interchangeable only by accident: a bare
+/// share handed to a key store, or a wrapped one fed to [`Dek::derive`], is a silently wrong key
+/// rather than an error. Two types make that unrepresentable instead of length-checked.
+///
+/// Zeroized on drop through the field's own type rather than a `Drop` impl on the struct, so moving
+/// the share — into a collection, out of a function — still works and stays protected.
+pub struct BareShare {
+    /// Whose share this is.
+    subject: SubjectHash,
+    /// The share itself. Exactly one data key's worth, so a wrong length cannot be built.
+    bytes: Zeroizing<[u8; KEY_LEN]>,
+}
+
+impl std::fmt::Debug for BareShare {
+    /// Redacted: n-1 shares carry no information, but the last one completes the set.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BareShare({}, <redacted>)", self.subject.as_str())
+    }
+}
+
+impl BareShare {
+    /// Whose share this is.
+    #[must_use]
+    pub fn subject(&self) -> &SubjectHash {
+        &self.subject
+    }
+}
+
+/// One subject's share as it is stored: wrapped under that subject's key for an epoch.
+///
+/// Safe to write to disk — destroying the subject's key makes it undecipherable — and therefore the
+/// only share shape [`SealedBody`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedShare {
     /// Whose share this is.
     pub subject: SubjectHash,
-    /// The share, wrapped when it came from a [`SealedBody`] and bare when it came from
-    /// [`Dek::split`]. Only [`seal`] and [`unseal`] convert between the two.
-    pub wrapped: Vec<u8>,
+    /// The wrapped bytes, as the key store returned them.
+    pub bytes: Vec<u8>,
 }
 
 /// A record's data key. Only obtainable from a complete share set.
@@ -182,22 +211,15 @@ impl Dek {
     /// this function one share where it needs all of them, and gets an unrelated key rather than a
     /// working one.
     ///
-    /// Shares must be bare. A wrapped one is longer, so feeding a [`SealedBody`]'s shares straight
-    /// in is an error rather than a silently wrong key.
-    pub fn derive(record: &RecordId, shares: &[DekShare]) -> crate::Result<Self> {
+    /// Takes [`BareShare`]s only: a [`SealedBody`]'s shares are still wrapped, and the type system
+    /// refuses them rather than deriving an unrelated key from them.
+    pub fn derive(record: &RecordId, shares: &[BareShare]) -> crate::Result<Self> {
         let owned: Vec<SubjectHash> = shares.iter().map(|s| s.subject.clone()).collect();
         let subjects = canonical_subjects(&owned)?;
 
         let mut combined = Zeroizing::new([0u8; KEY_LEN]);
         for share in shares {
-            if share.wrapped.len() != KEY_LEN {
-                return Err(Error::MalformedBlock(format!(
-                    "share for `{}` is {} bytes, expected {KEY_LEN}",
-                    share.subject.as_str(),
-                    share.wrapped.len()
-                )));
-            }
-            for (acc, byte) in combined.iter_mut().zip(share.wrapped.iter()) {
+            for (acc, byte) in combined.iter_mut().zip(share.bytes.iter()) {
                 *acc ^= byte;
             }
         }
@@ -212,7 +234,7 @@ impl Dek {
     /// Splits into one share per subject.
     ///
     /// n-of-n: the shares XOR to this key, so n-1 of them carry no information about it.
-    pub fn split(&self, subjects: &[SubjectHash]) -> crate::Result<Vec<DekShare>> {
+    pub fn split(&self, subjects: &[SubjectHash]) -> crate::Result<Vec<BareShare>> {
         let subjects = canonical_subjects(subjects)?;
         let (last_subject, leading) = subjects.split_last().ok_or(Error::ShareCount {
             expected: 1,
@@ -220,24 +242,23 @@ impl Dek {
         })?;
 
         let mut shares = Vec::with_capacity(subjects.len());
-        let mut remainder = *self.0;
+        // The running remainder is the key itself until the last share carries what is left of it.
+        let mut remainder = Zeroizing::new(*self.0);
         for subject in leading {
-            let mut share = [0u8; KEY_LEN];
-            fill_random(&mut share);
+            let mut share = Zeroizing::new([0u8; KEY_LEN]);
+            fill_random(share.as_mut());
             for (rem, byte) in remainder.iter_mut().zip(share.iter()) {
                 *rem ^= byte;
             }
-            shares.push(DekShare {
+            shares.push(BareShare {
                 subject: subject.clone(),
-                wrapped: share.to_vec(),
+                bytes: share,
             });
-            share.zeroize();
         }
-        shares.push(DekShare {
+        shares.push(BareShare {
             subject: last_subject.clone(),
-            wrapped: remainder.to_vec(),
+            bytes: remainder,
         });
-        remainder.zeroize();
         Ok(shares)
     }
 }
@@ -250,42 +271,21 @@ pub struct SealedBody {
     /// Epoch whose subject keys wrap the shares.
     pub epoch: Epoch,
     /// Wrapped shares, one per subject.
-    pub shares: Vec<DekShare>,
+    pub shares: Vec<WrappedShare>,
     /// Ciphertext with its authentication tag.
     pub ciphertext: Vec<u8>,
 }
 
-/// Seals a body for a record's subjects.
-///
-/// Uses the key store installed by [`crate::keystore::with_store`]. Prefer [`seal_in`], which takes
-/// the store explicitly; this signature has nowhere to put one, and a sealing that silently skipped
-/// wrapping would produce a self-decrypting block.
-pub fn seal(
-    record: &RecordId,
-    subjects: &[SubjectHash],
-    epoch: &Epoch,
-    plaintext: &[u8],
-) -> crate::Result<SealedBody> {
-    let store = crate::keystore::ambient().ok_or(Error::NoKeyStore)?;
-    seal_in(store.as_ref(), record, subjects, epoch, plaintext)
-}
-
-/// Unseals a body, given every share.
-///
-/// Associated data is recomputed from the record's own identity and subject set — never read from
-/// the stored block, since a stored copy travels with a swapped body and would authenticate it.
-///
-/// Uses the key store installed by [`crate::keystore::with_store`]; see [`unseal_in`].
-pub fn unseal(record: &RecordId, body: &SealedBody) -> crate::Result<Vec<u8>> {
-    let store = crate::keystore::ambient().ok_or(Error::NoKeyStore)?;
-    unseal_in(store.as_ref(), record, body)
-}
-
 /// Seals a body, wrapping each share under the subject's key for `epoch`.
+///
+/// The store is a parameter rather than something ambient. It has to be: the callers are async, and
+/// a store installed in a thread-local by a synchronous closure is invisible after an `.await`
+/// moves the task to another worker — so the dependency would vanish exactly where it is needed.
+/// An invisible dependency in a sealing API is also a misuse waiting to happen.
 ///
 /// Minting is lazy and goes through the store, so a tombstoned subject fails the whole sealing
 /// rather than quietly getting a fresh key.
-pub fn seal_in(
+pub fn seal(
     store: &dyn KeyStore,
     record: &RecordId,
     subjects: &[SubjectHash],
@@ -303,9 +303,9 @@ pub fn seal_in(
     let mut shares = Vec::with_capacity(bare.len());
     for share in &bare {
         let kek = Zeroizing::new(store.mint(&share.subject, epoch)?);
-        shares.push(DekShare {
+        shares.push(WrappedShare {
             subject: share.subject.clone(),
-            wrapped: wrap_share(&kek, &share.wrapped)?,
+            bytes: wrap_share(&kek, share.bytes.as_ref())?,
         });
     }
 
@@ -319,10 +319,13 @@ pub fn seal_in(
 
 /// Unseals a body, unwrapping every share from the store.
 ///
+/// Associated data is recomputed from the record's own identity and subject set — never read from
+/// the stored block, since a stored copy travels with a swapped body and would authenticate it.
+///
 /// A destroyed subject key surfaces as [`Error::KeyAbsent`], which is the erasure working. The
 /// epoch needs no place in the associated data: it selects the wrapping key, so a block whose epoch
 /// was edited fails the wrap's own integrity check.
-pub fn unseal_in(
+pub fn unseal(
     store: &dyn KeyStore,
     record: &RecordId,
     body: &SealedBody,
@@ -335,9 +338,19 @@ pub fn unseal_in(
                 body.epoch.as_str().to_owned(),
             )
         })?;
-        bare.push(DekShare {
+        let unwrapped = unwrap_share(&Zeroizing::new(kek), &share.bytes)?;
+        // A share that unwraps cleanly but is not a key's worth of bytes came from a block this
+        // build did not write. Refused, rather than XORed in at whatever length it happens to be.
+        let bytes: [u8; KEY_LEN] = unwrapped.as_slice().try_into().map_err(|_| {
+            Error::MalformedBlock(format!(
+                "share for `{}` unwrapped to {} bytes, expected {KEY_LEN}",
+                share.subject.as_str(),
+                unwrapped.len()
+            ))
+        })?;
+        bare.push(BareShare {
             subject: share.subject.clone(),
-            wrapped: unwrap_share(&Zeroizing::new(kek), &share.wrapped)?,
+            bytes: Zeroizing::new(bytes),
         });
     }
 
@@ -471,19 +484,16 @@ fn unwrap_share(kek: &[u8], wrapped: &[u8]) -> crate::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use tempfile::TempDir;
 
     use super::*;
-    use crate::block::parse_subject;
-    use crate::keystore::{FsKeyStore, with_store};
+    use crate::keystore::FsKeyStore;
 
     const BODY: &[u8] = b"the record body, which is the part that must become unreadable";
 
     /// A distinct, well-formed subject hash per index.
     fn subject(n: u8) -> SubjectHash {
-        parse_subject(&format!("s_{:064x}", u32::from(n) + 1)).unwrap()
+        SubjectHash::parse(&format!("s_{:064x}", u32::from(n) + 1)).unwrap()
     }
 
     fn store() -> (TempDir, FsKeyStore) {
@@ -496,16 +506,24 @@ mod tests {
         Epoch::containing(1_770_000_000_000)
     }
 
+    /// A bare share of no value, for the paths that only care about the subject association.
+    fn bare_share(subject: SubjectHash) -> BareShare {
+        BareShare {
+            subject,
+            bytes: Zeroizing::new([0u8; KEY_LEN]),
+        }
+    }
+
     #[test]
     fn round_trip_with_one_subject() {
         let (_dir, store) = store();
         let record = RecordId::generate();
         let subjects = [subject(0)];
 
-        let body = seal_in(&store, &record, &subjects, &epoch(), BODY).unwrap();
+        let body = seal(&store, &record, &subjects, &epoch(), BODY).unwrap();
         assert_eq!(body.shares.len(), 1);
         assert_ne!(body.ciphertext, BODY);
-        assert_eq!(unseal_in(&store, &record, &body).unwrap(), BODY);
+        assert_eq!(unseal(&store, &record, &body).unwrap(), BODY);
     }
 
     #[test]
@@ -514,9 +532,9 @@ mod tests {
         let record = RecordId::generate();
         let subjects = [subject(2), subject(0), subject(1)];
 
-        let body = seal_in(&store, &record, &subjects, &epoch(), BODY).unwrap();
+        let body = seal(&store, &record, &subjects, &epoch(), BODY).unwrap();
         assert_eq!(body.shares.len(), 3);
-        assert_eq!(unseal_in(&store, &record, &body).unwrap(), BODY);
+        assert_eq!(unseal(&store, &record, &body).unwrap(), BODY);
     }
 
     #[test]
@@ -525,9 +543,9 @@ mod tests {
         let record = RecordId::generate();
         let subjects = [subject(0), subject(1), subject(2)];
 
-        let mut body = seal_in(&store, &record, &subjects, &epoch(), BODY).unwrap();
+        let mut body = seal(&store, &record, &subjects, &epoch(), BODY).unwrap();
         body.shares.reverse();
-        assert_eq!(unseal_in(&store, &record, &body).unwrap(), BODY);
+        assert_eq!(unseal(&store, &record, &body).unwrap(), BODY);
     }
 
     #[test]
@@ -535,16 +553,13 @@ mod tests {
         let (_dir, store) = store();
         let record = RecordId::generate();
         let subjects = [subject(0), subject(1), subject(2)];
-        let body = seal_in(&store, &record, &subjects, &epoch(), BODY).unwrap();
+        let body = seal(&store, &record, &subjects, &epoch(), BODY).unwrap();
 
         for drop_index in 0..body.shares.len() {
             let mut short = body.clone();
             short.shares.remove(drop_index);
             assert!(
-                matches!(
-                    unseal_in(&store, &record, &short),
-                    Err(Error::Authentication)
-                ),
+                matches!(unseal(&store, &record, &short), Err(Error::Authentication)),
                 "n-1 shares unsealed the body"
             );
         }
@@ -567,9 +582,9 @@ mod tests {
             let ciphertext = encrypt(&key, &nonce, &aad, BODY).unwrap();
             let shares = subjects
                 .iter()
-                .map(|s| DekShare {
+                .map(|s| WrappedShare {
                     subject: s.clone(),
-                    wrapped: wrap_share(&store.mint(s, &epoch).unwrap(), key.0.as_ref()).unwrap(),
+                    bytes: wrap_share(&store.mint(s, &epoch).unwrap(), key.0.as_ref()).unwrap(),
                 })
                 .collect();
 
@@ -580,10 +595,7 @@ mod tests {
                 ciphertext,
             };
             assert!(
-                matches!(
-                    unseal_in(&store, &record, &body),
-                    Err(Error::Authentication)
-                ),
+                matches!(unseal(&store, &record, &body), Err(Error::Authentication)),
                 "an any-one-suffices block decrypted with {count} subject(s)"
             );
         }
@@ -596,10 +608,10 @@ mod tests {
         let record = RecordId::generate();
         let subjects = [subject(0)];
         let epoch = epoch();
-        let body = seal_in(&store, &record, &subjects, &epoch, BODY).unwrap();
+        let body = seal(&store, &record, &subjects, &epoch, BODY).unwrap();
 
         let kek = store.get(&subjects[0], &epoch).unwrap().unwrap();
-        let bare = unwrap_share(&kek, &body.shares[0].wrapped).unwrap();
+        let bare = unwrap_share(&kek, &body.shares[0].bytes).unwrap();
         let misread = Dek(Zeroizing::new(bare.try_into().unwrap()));
         let aad = associated_data(&record, &subjects);
         assert!(decrypt(&misread, &body.nonce, &aad, &body.ciphertext).is_err());
@@ -612,7 +624,7 @@ mod tests {
         let shares = root.split(&[subject(0)]).unwrap();
         // One subject means one share equal to the root, so raw-XOR reconstruction would hand back
         // the root itself.
-        assert_eq!(shares[0].wrapped, root.0.as_slice());
+        assert_eq!(shares[0].bytes.as_slice(), root.0.as_slice());
         assert_ne!(Dek::derive(&record, &shares).unwrap(), root);
     }
 
@@ -630,8 +642,8 @@ mod tests {
         let record = RecordId::generate();
         let subjects = [subject(0)];
 
-        let first = seal_in(&store, &record, &subjects, &epoch(), BODY).unwrap();
-        let second = seal_in(&store, &record, &subjects, &epoch(), BODY).unwrap();
+        let first = seal(&store, &record, &subjects, &epoch(), BODY).unwrap();
+        let second = seal(&store, &record, &subjects, &epoch(), BODY).unwrap();
 
         assert_ne!(first.nonce, second.nonce);
         assert_ne!(first.ciphertext, second.ciphertext);
@@ -650,8 +662,8 @@ mod tests {
         let left = RecordId::generate();
         let right = RecordId::generate();
 
-        let mut left_body = seal_in(&store, &left, &subjects, &epoch, b"left").unwrap();
-        let mut right_body = seal_in(&store, &right, &subjects, &epoch, b"right").unwrap();
+        let mut left_body = seal(&store, &left, &subjects, &epoch, b"left").unwrap();
+        let mut right_body = seal(&store, &right, &subjects, &epoch, b"right").unwrap();
 
         // Swap ciphertext and nonce, leaving each record's own shares in place: the substitution a
         // stored copy of the associated data would have authenticated.
@@ -659,11 +671,11 @@ mod tests {
         std::mem::swap(&mut left_body.nonce, &mut right_body.nonce);
 
         assert!(matches!(
-            unseal_in(&store, &left, &left_body),
+            unseal(&store, &left, &left_body),
             Err(Error::Authentication)
         ));
         assert!(matches!(
-            unseal_in(&store, &right, &right_body),
+            unseal(&store, &right, &right_body),
             Err(Error::Authentication)
         ));
     }
@@ -672,10 +684,10 @@ mod tests {
     fn tampered_ciphertext_fails() {
         let (_dir, store) = store();
         let record = RecordId::generate();
-        let mut body = seal_in(&store, &record, &[subject(0)], &epoch(), BODY).unwrap();
+        let mut body = seal(&store, &record, &[subject(0)], &epoch(), BODY).unwrap();
         body.ciphertext[0] ^= 0x01;
         assert!(matches!(
-            unseal_in(&store, &record, &body),
+            unseal(&store, &record, &body),
             Err(Error::Authentication)
         ));
     }
@@ -684,10 +696,10 @@ mod tests {
     fn tampered_share_fails_the_wrap_check() {
         let (_dir, store) = store();
         let record = RecordId::generate();
-        let mut body = seal_in(&store, &record, &[subject(0)], &epoch(), BODY).unwrap();
-        body.shares[0].wrapped[0] ^= 0x01;
+        let mut body = seal(&store, &record, &[subject(0)], &epoch(), BODY).unwrap();
+        body.shares[0].bytes[0] ^= 0x01;
         assert!(matches!(
-            unseal_in(&store, &record, &body),
+            unseal(&store, &record, &body),
             Err(Error::Authentication)
         ));
     }
@@ -697,13 +709,13 @@ mod tests {
         let (_dir, store) = store();
         let record = RecordId::generate();
         let subjects = [subject(0), subject(1)];
-        let body = seal_in(&store, &record, &subjects, &epoch(), BODY).unwrap();
-        assert_eq!(unseal_in(&store, &record, &body).unwrap(), BODY);
+        let body = seal(&store, &record, &subjects, &epoch(), BODY).unwrap();
+        assert_eq!(unseal(&store, &record, &body).unwrap(), BODY);
 
         store.destroy_subject(&subjects[1]).unwrap();
 
         assert!(matches!(
-            unseal_in(&store, &record, &body),
+            unseal(&store, &record, &body),
             Err(Error::KeyAbsent(_, _))
         ));
     }
@@ -717,13 +729,13 @@ mod tests {
         let kept = RecordId::generate();
         let doomed = RecordId::generate();
 
-        let kept_body = seal_in(&store, &kept, &subjects, &new, BODY).unwrap();
-        let doomed_body = seal_in(&store, &doomed, &subjects, &old, BODY).unwrap();
+        let kept_body = seal(&store, &kept, &subjects, &new, BODY).unwrap();
+        let doomed_body = seal(&store, &doomed, &subjects, &old, BODY).unwrap();
 
         store.destroy_epoch(&subjects[0], &old).unwrap();
 
-        assert_eq!(unseal_in(&store, &kept, &kept_body).unwrap(), BODY);
-        assert!(unseal_in(&store, &doomed, &doomed_body).is_err());
+        assert_eq!(unseal(&store, &kept, &kept_body).unwrap(), BODY);
+        assert!(unseal(&store, &doomed, &doomed_body).is_err());
     }
 
     #[test]
@@ -734,7 +746,7 @@ mod tests {
         store.tombstone(&subjects[0]).unwrap();
 
         assert!(matches!(
-            seal_in(&store, &record, &subjects, &epoch(), BODY),
+            seal(&store, &record, &subjects, &epoch(), BODY),
             Err(Error::Tombstoned(_))
         ));
     }
@@ -763,26 +775,36 @@ mod tests {
                 got: 2
             })
         ));
-        let repeated = vec![
-            DekShare {
-                subject: subject(0),
-                wrapped: vec![0; KEY_LEN],
-            };
-            2
-        ];
+        let repeated = [bare_share(subject(0)), bare_share(subject(0))];
         assert!(Dek::derive(&record, &repeated).is_err());
     }
 
     #[test]
-    fn a_share_of_the_wrong_length_is_refused() {
-        let bad = [DekShare {
-            subject: subject(0),
-            wrapped: vec![0; 7],
-        }];
+    fn a_share_that_unwraps_to_the_wrong_length_is_refused() {
+        // Reachable only from a block this build did not write: the wrap protects the length, so
+        // the check is about a foreign block rather than a tampered one.
+        let (_dir, store) = store();
+        let record = RecordId::generate();
+        let subjects = [subject(0)];
+        let epoch = epoch();
+        let mut body = seal(&store, &record, &subjects, &epoch, BODY).unwrap();
+
+        let kek = store.get(&subjects[0], &epoch).unwrap().unwrap();
+        body.shares[0].bytes = wrap_share(&kek, &[0u8; 2 * KEY_LEN]).unwrap();
+
         assert!(matches!(
-            Dek::derive(&RecordId::generate(), &bad),
+            unseal(&store, &record, &body),
             Err(Error::MalformedBlock(_))
         ));
+    }
+
+    #[test]
+    fn a_bare_share_redacts_its_bytes_but_names_its_subject() {
+        let share = bare_share(subject(0));
+        let rendered = format!("{share:?}");
+        assert!(rendered.contains(subject(0).as_str()), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert_eq!(share.subject(), &subject(0));
     }
 
     #[test]
@@ -851,47 +873,30 @@ mod tests {
     }
 
     #[test]
-    fn the_ambient_store_is_scoped_and_nests() {
+    fn a_body_is_readable_only_where_its_keys_are() {
+        // The store is a parameter, so which keys a body needs is visible at the call site: the
+        // same block handed a different store is unreadable, and says so.
         let record = RecordId::generate();
         let subjects = [subject(0)];
+        let (_here_dir, here) = store();
+        let (_elsewhere_dir, elsewhere) = store();
 
+        let body = seal(&here, &record, &subjects, &epoch(), BODY).unwrap();
+        assert_eq!(unseal(&here, &record, &body).unwrap(), BODY);
         assert!(matches!(
-            seal(&record, &subjects, &epoch(), BODY),
-            Err(Error::NoKeyStore)
+            unseal(&elsewhere, &record, &body),
+            Err(Error::KeyAbsent(_, _))
         ));
-        assert!(matches!(
-            unseal(
-                &record,
-                &SealedBody {
-                    nonce: Nonce::generate(),
-                    epoch: epoch(),
-                    shares: Vec::new(),
-                    ciphertext: Vec::new(),
-                }
-            ),
-            Err(Error::NoKeyStore)
-        ));
+    }
 
-        let outer_dir = TempDir::new().unwrap();
-        let outer = Arc::new(FsKeyStore::open(outer_dir.path()).unwrap());
-        let body = with_store(outer.clone(), || {
-            let body = seal(&record, &subjects, &epoch(), BODY).unwrap();
-            assert_eq!(unseal(&record, &body).unwrap(), BODY);
-
-            // An inner store holds none of the outer store's keys, so the same body is unreadable
-            // there — and readable again once the inner scope ends.
-            let inner_dir = TempDir::new().unwrap();
-            let inner = Arc::new(FsKeyStore::open(inner_dir.path()).unwrap());
-            with_store(inner, || {
-                assert!(matches!(
-                    unseal(&record, &body),
-                    Err(Error::KeyAbsent(_, _))
-                ));
-            });
-            assert_eq!(unseal(&record, &body).unwrap(), BODY);
-            body
-        });
-
-        assert!(matches!(unseal(&record, &body), Err(Error::NoKeyStore)));
+    #[test]
+    fn any_key_store_will_do() {
+        // Taken as `&dyn KeyStore`, so a deployment can hold keys in an HSM or a remote service
+        // without this module knowing. The test doubles as proof the trait is object-safe.
+        let (_dir, store) = store();
+        let by_ref: &dyn crate::keystore::KeyStore = &store;
+        let record = RecordId::generate();
+        let body = seal(by_ref, &record, &[subject(0)], &epoch(), BODY).unwrap();
+        assert_eq!(unseal(by_ref, &record, &body).unwrap(), BODY);
     }
 }

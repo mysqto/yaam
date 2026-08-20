@@ -1,9 +1,11 @@
 //! Handles onto the index.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags, Transaction, params};
-use yaam_contract::{ActionRecord, DataClass, attrs};
+use yaam_contract::{ActionRecord, DataClass, RecordId, SubjectHash, attrs};
+use yaam_crypto::Epoch;
 
 use crate::schema;
 
@@ -23,6 +25,50 @@ pub struct Writer {
 const JOB_BUNDLE: &str = "bundle";
 /// Fan-out work only records naming subjects need.
 const JOB_SUBJECT_LINK: &str = "subject_link";
+
+/// Queue state of a job nobody has taken yet.
+const STATE_PENDING: &str = "pending";
+/// Queue state of a job handed to a worker.
+const STATE_CLAIMED: &str = "claimed";
+/// Queue state of a job that finished.
+///
+/// Kept rather than deleted: the row is what makes a replayed publish a no-op instead of
+/// re-enqueueing work that has already been done.
+const STATE_DONE: &str = "done";
+
+/// Everything a publish needs that the record itself cannot carry.
+///
+/// `Writer::publish` used to take the record alone, which left it unable to fill the two columns
+/// that do not live in frontmatter: the searchable body, and the wrapped key share and epoch per
+/// subject. Both come from the sealing step, so they arrive alongside the record rather than in it.
+///
+/// Borrows throughout, and so `Copy`: a publish reads its input and owns none of it.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishInput<'a> {
+    /// The record to index.
+    pub record: &'a ActionRecord,
+    /// Text full-text search may index. `""` for a sealed record, which is what keeps search from
+    /// becoming a way around sealing.
+    pub searchable_body: &'a str,
+    /// One wrapped share per subject, with the epoch whose key wraps it.
+    ///
+    /// May be empty: a record with no subjects needs none, and a reindex that has only the tree
+    /// leaves the existing wrap in place rather than blanking it.
+    pub subject_keys: &'a [(SubjectHash, Epoch, Vec<u8>)],
+}
+
+/// One claimed unit of fan-out work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanoutJob {
+    /// Queue row id, and the handle [`Writer::complete_fanout`] takes.
+    pub id: i64,
+    /// Record the work is about.
+    pub record: RecordId,
+    /// What kind of work: `bundle`, `subject_link`.
+    pub kind: String,
+    /// How many times this job has been claimed, this claim included.
+    pub attempts: u32,
+}
 
 impl Store {
     /// Opens the index read-only, migrating nothing.
@@ -55,20 +101,24 @@ impl Writer {
     ///
     /// Replayable. The record insert turns on its unique id, every derived row is keyed, and the
     /// entity counters are recomputed, so publishing the same record twice is a no-op.
-    pub fn publish(&mut self, doc: &ActionRecord) -> crate::Result<()> {
+    pub fn publish(&mut self, input: PublishInput<'_>) -> crate::Result<()> {
+        let doc = input.record;
+        // Checked here as well as by the table's own CHECK, so a caller that passes the prose of a
+        // sealed record gets told what it did wrong rather than a constraint violation.
+        if doc.data_class == DataClass::SubjectDerived && !input.searchable_body.is_empty() {
+            return Err(bad_input(
+                doc,
+                "a sealed record has no searchable body; pass \"\"",
+            ));
+        }
         let frontmatter = frontmatter_json(doc)?;
-        // Sealed bodies never reach the index in plaintext, so nothing can search around sealing.
-        let body = match doc.data_class {
-            DataClass::SubjectDerived => "",
-            DataClass::Internal => doc.summary.as_str(),
-        };
 
         // IMMEDIATE, not DEFERRED: the write lock is taken up front, so a busy index fails here
         // rather than half way through the derived rows.
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let record_pk = insert_record(&tx, doc, &frontmatter, body)?;
+        let record_pk = insert_record(&tx, doc, &frontmatter, input.searchable_body)?;
         let received_ms = tx.query_row(
             "SELECT received_ms FROM records WHERE id = ?1",
             params![record_pk],
@@ -76,9 +126,84 @@ impl Writer {
         )?;
         insert_attrs(&tx, record_pk, doc)?;
         insert_entities(&tx, record_pk, doc)?;
-        insert_subjects(&tx, record_pk, doc)?;
+        insert_subjects(&tx, record_pk, &input)?;
         enqueue_fanout(&tx, doc, received_ms)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Records that a record is held back, unpublished, in a spool file.
+    ///
+    /// Idempotent, and deliberately keeps the *first* sighting: resetting the stamp on every retry
+    /// would make a row that ages out never age out.
+    ///
+    /// This is the one write that reads the clock. It has to: the record is not in the tree yet, so
+    /// there is no server-stamped time to derive the sighting from.
+    pub fn enqueue_quarantine(
+        &mut self,
+        id: &str,
+        qkek_date: &str,
+        spool_path: &str,
+    ) -> crate::Result<()> {
+        self.conn.execute(
+            "INSERT INTO quarantine_pending (record_id, qkek_date, staging_path, first_seen_ms)
+             VALUES (?1, ?2, ?3, CAST(ROUND(unixepoch('now', 'subsec') * 1000) AS INTEGER))
+             ON CONFLICT (record_id) DO NOTHING",
+            params![id, qkek_date, spool_path],
+        )?;
+        Ok(())
+    }
+
+    /// Claims up to `limit` pending jobs, oldest first.
+    ///
+    /// The claim and the read are one statement, so a job cannot be handed out twice however often
+    /// this is called: a row leaves `pending` in the same atomic step that returns it. `attempts` is
+    /// incremented on the way out, which is what lets a caller dead-letter a job that keeps failing.
+    pub fn claim_fanout(&mut self, limit: u32) -> crate::Result<Vec<FanoutJob>> {
+        let mut stmt = self.conn.prepare_cached(
+            "UPDATE fanout_queue
+                SET state = ?1, attempts = attempts + 1
+              WHERE id IN (SELECT id FROM fanout_queue
+                            WHERE state = ?2
+                            ORDER BY enqueued_ms, id
+                            LIMIT ?3)
+          RETURNING id, record_id, job_kind, attempts",
+        )?;
+        let rows = stmt.query_map(
+            params![STATE_CLAIMED, STATE_PENDING, i64::from(limit)],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                ))
+            },
+        )?;
+
+        let mut jobs = Vec::new();
+        for row in rows {
+            let (id, record_id, kind, attempts) = row?;
+            jobs.push(FanoutJob {
+                id,
+                record: crate::stored_record_id(record_id)?,
+                kind,
+                attempts,
+            });
+        }
+        Ok(jobs)
+    }
+
+    /// Marks a claimed job finished.
+    ///
+    /// The row stays, in state `done`. Deleting it would let a replayed publish enqueue the same
+    /// work again, which is the duplication the queue's unique key exists to prevent; the rows are
+    /// derived and go away with [`Writer::truncate_derived`].
+    pub fn complete_fanout(&mut self, job_id: i64) -> crate::Result<()> {
+        self.conn.execute(
+            "UPDATE fanout_queue SET state = ?1 WHERE id = ?2",
+            params![STATE_DONE, job_id],
+        )?;
         Ok(())
     }
 
@@ -211,23 +336,67 @@ fn insert_entities(tx: &Transaction<'_>, record_pk: i64, doc: &ActionRecord) -> 
     Ok(())
 }
 
-/// Writes one row per named subject. Key shares stay NULL until the key store wraps them.
-fn insert_subjects(tx: &Transaction<'_>, record_pk: i64, doc: &ActionRecord) -> crate::Result<()> {
+/// Writes one row per named subject, with its wrapped share when the caller has one.
+///
+/// A share for a subject the record does not name is refused rather than dropped: the row it would
+/// belong to cannot be built, and a silently discarded key share is a body nothing can unseal.
+fn insert_subjects(
+    tx: &Transaction<'_>,
+    record_pk: i64,
+    input: &PublishInput<'_>,
+) -> crate::Result<()> {
+    let doc = input.record;
+    let mut keys: BTreeMap<&str, (&Epoch, &[u8])> = BTreeMap::new();
+    for (hash, epoch, wrapped) in input.subject_keys {
+        if keys
+            .insert(hash.as_str(), (epoch, wrapped.as_slice()))
+            .is_some()
+        {
+            return Err(bad_input(
+                doc,
+                &format!("subject `{}` was keyed twice", hash.as_str()),
+            ));
+        }
+    }
+
     let mut insert = tx.prepare_cached(
-        "INSERT INTO record_subjects (record_pk, subject_hash, role, canon_ver)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO record_subjects
+             (record_pk, subject_hash, role, canon_ver, epoch, wrapped_key_share)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT (record_pk, subject_hash) DO UPDATE SET
-             role = excluded.role, canon_ver = excluded.canon_ver",
+             role      = excluded.role,
+             canon_ver = excluded.canon_ver,
+             -- A publish carrying no share is a reindex from the tree, and must not drop a wrap
+             -- the tree still holds: the row would then name a subject whose share is nowhere.
+             epoch     = CASE WHEN excluded.wrapped_key_share IS NULL
+                              THEN record_subjects.epoch ELSE excluded.epoch END,
+             wrapped_key_share =
+                 COALESCE(excluded.wrapped_key_share, record_subjects.wrapped_key_share)",
     )?;
     for subject in &doc.subjects {
+        let keyed = keys.remove(subject.hash.as_str());
         insert.execute(params![
             record_pk,
             subject.hash.as_str(),
             subject_role_text(subject.role),
             subject.canon_ver.0,
+            keyed.map_or("", |(epoch, _)| epoch.as_str()),
+            keyed.map(|(_, wrapped)| wrapped),
         ])?;
     }
+
+    if let Some(unnamed) = keys.keys().next() {
+        return Err(bad_input(doc, &format!("no subject `{unnamed}` to key")));
+    }
     Ok(())
+}
+
+/// Reports publish input the record cannot accept.
+fn bad_input(doc: &ActionRecord, detail: &str) -> crate::Error {
+    crate::Error::BadPublishInput {
+        record: doc.record_id.as_str().to_owned(),
+        detail: detail.to_owned(),
+    }
 }
 
 /// Enqueues the derived work this record implies.

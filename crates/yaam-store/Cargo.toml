@@ -16,6 +16,9 @@ serde.workspace = true
 serde_json.workspace = true
 rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 yaam-contract = { path = "../yaam-contract" }
+# For `Epoch`: the wrapped share and the epoch that selects its key arrive together, and a
+# store-local copy of the epoch type would be a second spelling of the same label.
+yaam-crypto = { path = "../yaam-crypto" }
 
 [dev-dependencies]
 tempfile.workspace = true

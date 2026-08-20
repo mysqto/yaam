@@ -65,8 +65,10 @@ pub fn migrate(conn: &mut Connection) -> crate::Result<()> {
 
 /// One statement batch per schema version, in order.
 ///
-/// Append only. Note for later steps: `SQLite` rejects `ALTER TABLE ADD COLUMN ... STORED`, so a
-/// generated column added after the fact has to be `VIRTUAL` plus its own index.
+/// Append only once a version has shipped: `V1` is still being edited because no release has
+/// written a file under it, and rewriting a table is a worse trade than correcting the definition.
+/// Note for later steps: `SQLite` rejects `ALTER TABLE ADD COLUMN ... STORED`, so a generated column
+/// added after the fact has to be `VIRTUAL` plus its own index.
 const MIGRATIONS: &[&str] = &[V1];
 
 /// Version 1: records and everything derived from them.
@@ -138,8 +140,9 @@ CREATE TABLE record_subjects (
     subject_hash      TEXT    NOT NULL,
     role              TEXT    NOT NULL,
     canon_ver         INTEGER NOT NULL,
-    -- Key epoch, bumped when a record is re-sealed under a fresh key.
-    epoch             INTEGER NOT NULL DEFAULT 0,
+    -- Key epoch, as the key store labels it (`2026-Q3`). Empty until the share is wrapped, the
+    -- same not-yet that a NULL wrapped_key_share records.
+    epoch             TEXT    NOT NULL DEFAULT '',
     -- NULL until the key store wraps the share. The plaintext key is never stored here.
     wrapped_key_share BLOB,
     PRIMARY KEY (record_pk, subject_hash)
@@ -181,7 +184,9 @@ CREATE INDEX fanout_queue_claim ON fanout_queue (state, enqueued_ms);
 CREATE TABLE quarantine_pending (
     record_id     TEXT    PRIMARY KEY,
     staging_path  TEXT    NOT NULL,
-    reason        TEXT    NOT NULL,
+    -- Date of the quarantine key the spooled copy was sealed under. Without it the spool file
+    -- cannot be opened again, so it is the one field the row cannot do without.
+    qkek_date     TEXT    NOT NULL,
     first_seen_ms INTEGER NOT NULL,
     attempts      INTEGER NOT NULL DEFAULT 0
 ) STRICT;

@@ -14,11 +14,6 @@ pub enum Error {
     /// A subject's key is absent — usually because it was destroyed, which is the intended outcome.
     #[error("no key for subject `{0}` in epoch `{1}`")]
     KeyAbsent(String, String),
-    /// No key store is in scope, so shares can be neither wrapped nor unwrapped.
-    ///
-    /// Sealing fails loudly rather than emitting a block whose shares nothing protects.
-    #[error("no key store installed for this scope")]
-    NoKeyStore,
     /// Refusing to mint a key for a subject that has been erased.
     #[error("subject `{0}` is tombstoned; minting a key would un-erase it")]
     Tombstoned(String),
