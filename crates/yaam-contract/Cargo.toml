@@ -1,0 +1,19 @@
+[package]
+name = "yaam-contract"
+description = "Wire types, canonical entity IDs and schema validation for yaam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]

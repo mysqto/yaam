@@ -1,0 +1,21 @@
+[package]
+name = "yaam-store"
+description = "SQLite index and queries for yaam. Derived, disposable, rebuildable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
+yaam-contract = { path = "../yaam-contract" }
+
+[dev-dependencies]
+tempfile.workspace = true

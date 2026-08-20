@@ -1,0 +1,23 @@
+[package]
+name = "yaam-core"
+description = "Write pipeline, sweeper, reindex, erasure and bundle composition for yaam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+tracing.workspace = true
+yaam-contract = { path = "../yaam-contract" }
+yaam-crypto = { path = "../yaam-crypto" }
+yaam-md = { path = "../yaam-md" }
+yaam-store = { path = "../yaam-store" }
+
+[dev-dependencies]
+tempfile.workspace = true

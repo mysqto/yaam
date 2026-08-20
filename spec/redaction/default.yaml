@@ -1,0 +1,23 @@
+# Redaction applied server-side before a record is written, and again to any rendered output.
+# Policies are versioned; the version is stored per record so a faulty policy's blast radius is
+# one query.
+version: 1
+policy: default-v1
+
+patterns:
+  - name: private_key_block
+    regex: '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+    action: mask
+  - name: bearer_token
+    regex: '(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}'
+    action: mask
+  - name: generic_api_key
+    regex: '(?i)\b(?:api[_-]?key|secret|passwd|password)\s*[:=]\s*\S{8,}'
+    action: mask
+  - name: email
+    regex: '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
+    action: mask
+  - name: card_like
+    regex: '\b(?:\d[ -]?){13,19}\b'
+    action: mask
+    note: Luhn-checked before masking to limit false positives.

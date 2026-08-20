@@ -1,0 +1,51 @@
+# Entity kinds and their canonical ID forms.
+#
+# Entities are the join keys across records. This file is configuration: deployments define the
+# kinds their domain needs. The forms below are neutral examples, not a fixed vocabulary.
+version: 1
+
+kinds:
+  order_ref:
+    pattern: '^[a-z0-9]{8,24}$'
+    normalise: [trim, lowercase]
+    description: An opaque business reference. Pseudonymous, not a direct identifier.
+
+  ticket:
+    pattern: '^[A-Z][A-Z0-9]+-[0-9]+$'
+    normalise: [trim, uppercase_prefix]
+    description: An issue-tracker key.
+
+  pull_request:
+    pattern: '^[a-z0-9._-]+/[a-z0-9._-]+#[0-9]+$'
+    normalise: [trim, lowercase_path]
+    description: owner/repo#number.
+
+  commit:
+    pattern: '^[a-z0-9._-]+/[a-z0-9._-]+@[0-9a-f]{7,40}$'
+    normalise: [trim, lowercase]
+
+  chat_user:
+    pattern: '^[A-Za-z0-9._:-]{1,64}$'
+    normalise: [trim]
+
+  chat_channel:
+    pattern: '^[A-Za-z0-9._:-]{1,64}$'
+    normalise: [trim]
+
+  chat_thread:
+    pattern: '^[A-Za-z0-9._:-]{1,64}/[0-9.]{1,32}$'
+    normalise: [trim]
+    description: channel/timestamp. Never stands alone.
+
+  deploy:
+    pattern: '^[a-z0-9._-]+/[a-z0-9._-]+#[0-9]+$'
+    normalise: [trim, lowercase]
+    description: service/environment#build.
+
+  subject:
+    pattern: '^s_[0-9a-f]{64}$'
+    description: A keyed pseudonym for an erasable data subject. Never a direct identifier.
+
+  record:
+    pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+    description: A ULID naming another record.

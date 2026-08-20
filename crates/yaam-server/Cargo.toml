@@ -1,0 +1,25 @@
+[package]
+name = "yaam-server"
+description = "HTTP service exposing the yaam memory contract."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.8"
+yaam-contract = { path = "../yaam-contract" }
+yaam-core = { path = "../yaam-core" }
+yaam-store = { path = "../yaam-store" }
+
+[dev-dependencies]
+tempfile.workspace = true

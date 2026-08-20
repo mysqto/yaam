@@ -1,0 +1,36 @@
+# Permitted `attrs` keys per action, with a classification.
+#
+# `structural` keys may sit in plaintext frontmatter and are queryable and retained.
+# `sensitive` keys must live in the record body, which is sealed for erasable records.
+# An undeclared key is rejected. This is the invariant that keeps unerasable data out of copies
+# that key destruction cannot reach.
+version: 1
+
+actions:
+  lookup:
+    outcome: [success, failure, partial, declined]
+    attrs:
+      target_kind: { type: string, class: structural }
+
+  reply:
+    outcome: [success, failure]
+    attrs:
+      channel_kind: { type: string, class: structural }
+      chunks: { type: integer, class: structural }
+
+  deploy:
+    outcome: [success, failure, partial]
+    attrs:
+      service: { type: string, class: structural }
+      environment: { type: string, class: structural }
+      build: { type: string, class: structural }
+      duration_ms: { type: integer, class: structural }
+
+  transact:
+    outcome: [success, failure, partial, declined]
+    attrs:
+      provider: { type: string, class: structural }
+      decline_code: { type: string, class: structural }
+      decline_reason: { type: string, class: sensitive }
+      amount_minor: { type: integer, class: sensitive }
+      currency: { type: string, class: structural }
