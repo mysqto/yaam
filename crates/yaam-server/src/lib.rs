@@ -9,5 +9,9 @@
 pub mod auth;
 pub mod error;
 pub mod routes;
+pub mod service;
+
+#[cfg(test)]
+mod testing;
 
 pub use error::{Error, Result};

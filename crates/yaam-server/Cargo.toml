@@ -17,9 +17,16 @@ serde_json.workspace = true
 tracing.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 axum = "0.8"
+hex.workspace = true
+# HMAC-SHA256 over the request, compared in constant time.
+hmac = "0.13"
+sha2 = "0.11"
+subtle = "2.6"
 yaam-contract = { path = "../yaam-contract" }
 yaam-core = { path = "../yaam-core" }
 yaam-store = { path = "../yaam-store" }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Drives the router directly, so handler tests need no listening socket.
+tower = { version = "0.5", features = ["util"] }

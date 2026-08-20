@@ -1,5 +1,9 @@
 //! Service failures and their status mapping.
 
+use axum::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
 use thiserror::Error;
 
 /// Result alias for service operations.
@@ -26,4 +30,111 @@ pub enum Error {
     /// Everything else.
     #[error(transparent)]
     Core(#[from] yaam_core::Error),
+}
+
+impl Error {
+    /// The status this failure is reported as.
+    ///
+    /// The pair worth getting right is `422` against `503`. `422` says the record will never be
+    /// accepted, so a caller that retries it burns its queue on a record that cannot land; `503`
+    /// says the record was fine and the service was not, so a caller that discards it loses audit
+    /// history. Swapping them breaks a caller in one direction or the other, and neither failure is
+    /// visible from here.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Core(inner) => core_status(inner),
+        }
+    }
+}
+
+/// Maps a core failure onto the same permanent/transient split.
+///
+/// A contract violation is the caller's to fix and an unresolved subject is not: quarantine and
+/// retry is the documented handling, so it must not reach the caller as a rejection. Everything
+/// else is this service's own fault and says so, because a `500` tells a caller to stop retrying
+/// its own record and raise the failure instead.
+fn core_status(error: &yaam_core::Error) -> StatusCode {
+    match error {
+        yaam_core::Error::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        yaam_core::Error::SubjectUnresolved => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        // Logged here rather than at each call site: this is the one place every failure passes
+        // through, so nothing can return an error without leaving a trace.
+        tracing::warn!(%status, error = %self, "request failed");
+        // Reported as the display form, which names the failure without naming internals: an
+        // unauthenticated caller learns that its signature did not verify and nothing else.
+        (status, Json(json!({ "error": self.to_string() }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole table, in one place. A caller's retry policy is written against these numbers, so a
+    /// change here is a change to every caller's behaviour.
+    #[test]
+    fn every_failure_maps_to_its_documented_status() {
+        let cases = [
+            (Error::Unauthenticated, StatusCode::UNAUTHORIZED),
+            (
+                Error::Forbidden("not yours".to_owned()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Error::Unprocessable("no action".to_owned()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Error::Unavailable("index reopening".to_owned()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.status(), expected, "{error}");
+        }
+    }
+
+    /// The pair that costs data when it is swapped: a contract violation must not be retried, and
+    /// an unresolved subject must not be reported as a rejection.
+    #[test]
+    fn a_core_failure_keeps_the_permanent_transient_split() {
+        let invalid =
+            Error::Core(yaam_contract::Error::Invalid("action is empty".to_owned()).into());
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let unresolved = Error::Core(yaam_core::Error::SubjectUnresolved);
+        assert_eq!(unresolved.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Our own fault, not the caller's: a `500` stops the caller retrying its own record forever
+    /// over something only this service can fix.
+    #[test]
+    fn an_infrastructure_failure_is_ours_to_own() {
+        let store = Error::Core(yaam_store::Error::Drift("not-a-record-id".to_owned()).into());
+        assert_eq!(store.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_failure_answers_with_its_status_and_a_reason() {
+        let response = Error::Forbidden("not your history".to_owned()).into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "forbidden: not your history");
+    }
 }
