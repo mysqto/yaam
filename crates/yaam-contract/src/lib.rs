@@ -12,6 +12,7 @@ pub mod entity;
 pub mod error;
 pub mod ids;
 pub mod record;
+mod spec_yaml;
 
 pub use error::{Error, Result};
 pub use ids::{CanonVer, RecordId, SchemaVer, SubjectHash};

@@ -121,7 +121,222 @@ impl ActionRecord {
     ///
     /// Notably: a subject-derived record must name at least one subject, and a team-scoped record
     /// must name its team.
+    ///
+    /// The subject rule runs both ways. A subject-derived record with no subjects would be sealed
+    /// under a key nobody can destroy — unerasable by construction — and an internal record that
+    /// names subjects claims erasability its plaintext body cannot deliver. Either way the record's
+    /// class and its contents disagree, and only the writer can say which was meant.
     pub fn validate(&self) -> crate::Result<()> {
-        todo!("cross-field invariants")
+        if self.action.trim().is_empty() {
+            return Err(crate::Error::Invalid("action is empty".to_owned()));
+        }
+
+        match self.data_class {
+            DataClass::SubjectDerived if self.subjects.is_empty() => {
+                return Err(crate::Error::Invalid(
+                    "subject-derived record names no subject".to_owned(),
+                ));
+            }
+            DataClass::Internal if !self.subjects.is_empty() => {
+                return Err(crate::Error::Invalid(format!(
+                    "internal record names {} subject(s)",
+                    self.subjects.len()
+                )));
+            }
+            _ => {}
+        }
+
+        if self.visibility == Visibility::Team
+            && self.team.as_ref().is_none_or(|t| t.trim().is_empty())
+        {
+            return Err(crate::Error::Invalid(
+                "team-scoped record names no team".to_owned(),
+            ));
+        }
+
+        for entity in &self.entities {
+            // NaN belongs to no range, so `contains` rejects it without a special case.
+            if !(0.0..=1.0).contains(&entity.confidence) {
+                return Err(crate::Error::Invalid(format!(
+                    "entity `{}` of kind `{}` has confidence {} outside 0.0..=1.0",
+                    entity.id, entity.kind, entity.confidence
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::{self, EntityRef};
+
+    /// A minimal valid record: internal, org-visible, no subjects and no entities.
+    fn internal() -> ActionRecord {
+        ActionRecord {
+            record_id: RecordId::generate(),
+            schema_ver: SchemaVer(1),
+            at: "2026-01-01T00:00:00Z".to_owned(),
+            received_at: "2026-01-01T00:00:01Z".to_owned(),
+            backfilled: false,
+            agent: "test-agent".to_owned(),
+            agent_ver: None,
+            correlation_id: None,
+            action: "deploy".to_owned(),
+            outcome: Outcome::Success,
+            attrs: BTreeMap::new(),
+            entities: Vec::new(),
+            subjects: Vec::new(),
+            visibility: Visibility::Org,
+            team: None,
+            data_class: DataClass::Internal,
+            redaction_policy: "default-v1".to_owned(),
+            fields_masked: Vec::new(),
+            tags: Vec::new(),
+            summary: "deployed the service".to_owned(),
+        }
+    }
+
+    fn subject() -> SubjectRef {
+        SubjectRef {
+            hash: SubjectHash::parse(&format!("s_{}", "ab".repeat(32))).expect("valid hash"),
+            role: Role::Principal,
+            canon_ver: CanonVer(1),
+        }
+    }
+
+    fn entity_ref(confidence: f32) -> EntityRef {
+        EntityRef {
+            kind: "ticket".to_owned(),
+            id: "PROJ-42".to_owned(),
+            role: entity::Role::Primary,
+            confidence,
+        }
+    }
+
+    #[test]
+    fn a_minimal_internal_record_is_valid() {
+        internal().validate().unwrap();
+    }
+
+    #[test]
+    fn a_subject_derived_record_must_name_a_subject() {
+        let mut r = internal();
+        r.data_class = DataClass::SubjectDerived;
+        assert!(r.validate().is_err());
+
+        r.subjects.push(subject());
+        r.validate().unwrap();
+    }
+
+    #[test]
+    fn an_internal_record_must_name_none() {
+        let mut r = internal();
+        r.subjects.push(subject());
+        let err = r
+            .validate()
+            .expect_err("internal records carry no subjects");
+        assert!(err.to_string().contains("names 1 subject"), "{err}");
+    }
+
+    #[test]
+    fn team_visibility_requires_a_team() {
+        let mut r = internal();
+        r.visibility = Visibility::Team;
+        assert!(r.validate().is_err());
+
+        // Whitespace is not a team name.
+        r.team = Some("   ".to_owned());
+        assert!(r.validate().is_err());
+
+        r.team = Some("platform".to_owned());
+        r.validate().unwrap();
+    }
+
+    #[test]
+    fn other_visibilities_need_no_team() {
+        for visibility in [Visibility::Owner, Visibility::Org, Visibility::Operator] {
+            let mut r = internal();
+            r.visibility = visibility;
+            r.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn action_must_not_be_empty() {
+        for action in ["", "   "] {
+            let mut r = internal();
+            r.action = action.to_owned();
+            assert!(r.validate().is_err(), "{action:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn confidence_must_be_a_probability() {
+        for good in [0.0, 0.5, 1.0] {
+            let mut r = internal();
+            r.entities.push(entity_ref(good));
+            r.validate().unwrap();
+        }
+        for bad in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+            let mut r = internal();
+            r.entities.push(entity_ref(bad));
+            let err = r.validate().expect_err("confidence out of range");
+            assert!(err.to_string().contains("PROJ-42"), "{err}");
+        }
+    }
+
+    #[test]
+    fn every_entity_is_checked_not_just_the_first() {
+        let mut r = internal();
+        r.entities.push(entity_ref(1.0));
+        r.entities.push(entity_ref(2.0));
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn a_record_survives_json() {
+        let mut r = internal();
+        r.data_class = DataClass::SubjectDerived;
+        r.subjects.push(subject());
+        r.subjects.push(SubjectRef {
+            hash: SubjectHash::parse(&format!("s_{}", "cd".repeat(32))).unwrap(),
+            role: Role::Party,
+            canon_ver: CanonVer(2),
+        });
+        r.entities.push(entity_ref(0.75));
+        r.visibility = Visibility::Team;
+        r.team = Some("platform".to_owned());
+        r.outcome = Outcome::Partial;
+        r.agent_ver = Some("1.2.3".to_owned());
+        r.correlation_id = Some("c-1".to_owned());
+        r.backfilled = true;
+        r.attrs
+            .insert("service".to_owned(), attrs::Value::Text("api".to_owned()));
+        r.fields_masked.push("summary".to_owned());
+        r.tags.push("release".to_owned());
+
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<ActionRecord>(&json).unwrap(), r);
+        // Enum spellings are part of the wire contract, not an implementation detail.
+        assert!(json.contains(r#""outcome":"partial""#), "{json}");
+        assert!(json.contains(r#""data_class":"subject_derived""#), "{json}");
+        assert!(json.contains(r#""visibility":"team""#), "{json}");
+        assert!(json.contains(r#""role":"principal""#), "{json}");
+    }
+
+    #[test]
+    fn every_outcome_round_trips() {
+        for outcome in [
+            Outcome::Success,
+            Outcome::Failure,
+            Outcome::Partial,
+            Outcome::Declined,
+        ] {
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert_eq!(serde_json::from_str::<Outcome>(&json).unwrap(), outcome);
+        }
     }
 }
