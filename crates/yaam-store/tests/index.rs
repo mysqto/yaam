@@ -20,6 +20,10 @@ const T10: &str = "2026-08-20T10:00:00Z";
 const T11: &str = "2026-08-20T11:00:00Z";
 const T12: &str = "2026-08-20T12:00:00Z";
 
+/// The clock a queue test hands to a claim. Fixed, because a backoff measured against a real clock
+/// is a test that passes at a speed rather than for a reason.
+const NOW: i64 = 1_787_220_000_000;
+
 /// A minimal internal record. Tests adjust only the field under test.
 fn record(action: &str, outcome: Outcome, received_at: &str) -> ActionRecord {
     ActionRecord {
@@ -1107,7 +1111,7 @@ fn a_claimed_fanout_job_is_never_handed_out_twice() {
     doc.subjects = vec![subject("ab")];
     publish(&mut writer, &doc).expect("publish");
 
-    let claimed = writer.claim_fanout(10).expect("claim");
+    let claimed = writer.claim_fanout(10, NOW).expect("claim");
     let mut kinds: Vec<&str> = claimed.iter().map(|job| job.kind.as_str()).collect();
     kinds.sort_unstable();
     assert_eq!(kinds, ["bundle", "subject_link"]);
@@ -1118,7 +1122,10 @@ fn a_claimed_fanout_job_is_never_handed_out_twice() {
 
     // Repeated calls are safe because a claim removes the row from the pending set atomically.
     assert!(
-        writer.claim_fanout(10).expect("second claim").is_empty(),
+        writer
+            .claim_fanout(10, NOW)
+            .expect("second claim")
+            .is_empty(),
         "a claimed job was handed out twice"
     );
 
@@ -1127,7 +1134,7 @@ fn a_claimed_fanout_job_is_never_handed_out_twice() {
         writer.complete_fanout(job.id).expect("complete");
     }
     publish(&mut writer, &doc).expect("replay");
-    assert!(writer.claim_fanout(10).expect("claim").is_empty());
+    assert!(writer.claim_fanout(10, NOW).expect("claim").is_empty());
     assert_eq!(count(&raw(&path), "fanout_queue"), 2);
 }
 
@@ -1142,24 +1149,211 @@ fn fanout_claims_are_oldest_first_and_capped() {
     let newer = record("deploy", Outcome::Success, T12);
     publish(&mut writer, &newer).expect("publish");
 
-    let first = writer.claim_fanout(1).expect("claim");
+    let first = writer.claim_fanout(1, NOW).expect("claim");
     assert_eq!(first.len(), 1, "the cap must be honoured");
     assert_eq!(first[0].record, older.record_id);
 
-    let second = writer.claim_fanout(1).expect("claim");
+    let second = writer.claim_fanout(1, NOW).expect("claim");
     assert_eq!(second[0].record, newer.record_id);
 
     // A job claimed twice — a re-drive after a crash — counts its attempts, which is what lets a
     // caller dead-letter one that never finishes.
     writer.complete_fanout(first[0].id).expect("complete");
-    raw(&path)
-        .execute(
-            "UPDATE fanout_queue SET state = 'pending' WHERE id = ?1",
-            [second[0].id],
-        )
-        .expect("release");
-    let reclaimed = writer.claim_fanout(1).expect("claim");
+    writer.fail_fanout(second[0].id, NOW).expect("release");
+    let reclaimed = writer.claim_fanout(1, NOW).expect("claim");
     assert_eq!(reclaimed[0].attempts, 2);
+}
+
+#[test]
+fn a_failed_job_is_claimable_again_only_once_its_delay_has_passed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    publish(&mut writer, &record("deploy", Outcome::Success, T10)).expect("publish");
+
+    let job = writer.claim_fanout(1, NOW).expect("claim").remove(0);
+    assert_eq!(job.attempts, 1);
+    writer.fail_fanout(job.id, NOW + 5_000).expect("fail");
+
+    // Pending, and still nobody's: the delay is what makes a retry a later attempt rather than the
+    // same one again.
+    assert!(writer.claim_fanout(1, NOW).expect("claim").is_empty());
+    assert!(
+        writer
+            .claim_fanout(1, NOW + 4_999)
+            .expect("claim")
+            .is_empty()
+    );
+
+    let again = writer.claim_fanout(1, NOW + 5_000).expect("claim");
+    assert_eq!(again.len(), 1);
+    // Claims are what `attempts` counts. Counting the failure as well would double the number a
+    // caller's own limit is compared against.
+    assert_eq!(again[0].attempts, 2);
+
+    // A job that finished stays finished: a failure report arriving late must not resurrect it.
+    writer.complete_fanout(again[0].id).expect("complete");
+    writer.fail_fanout(again[0].id, NOW).expect("late failure");
+    assert!(
+        writer
+            .claim_fanout(1, NOW + 10_000)
+            .expect("claim")
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_claim_older_than_the_caller_tolerates_is_reclaimed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    publish(&mut writer, &record("deploy", Outcome::Success, T10)).expect("publish");
+
+    let job = writer.claim_fanout(1, NOW).expect("claim").remove(0);
+    // Nothing renews a claim, so a drain that died holding this one hides the job for ever.
+    assert!(
+        writer
+            .claim_fanout(1, NOW + 60_000)
+            .expect("claim")
+            .is_empty()
+    );
+
+    assert_eq!(writer.reclaim_stale_fanout(NOW - 1).expect("reclaim"), 0);
+    assert_eq!(writer.reclaim_stale_fanout(NOW).expect("reclaim"), 1);
+
+    let again = writer.claim_fanout(1, NOW).expect("claim");
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].id, job.id);
+    // The attempt still counts, so a job whose holder keeps dying still runs out of budget.
+    assert_eq!(again[0].attempts, 2);
+
+    // A completed job is not a stale claim, however long ago it was claimed.
+    writer.complete_fanout(again[0].id).expect("complete");
+    assert_eq!(
+        writer.reclaim_stale_fanout(NOW + 60_000).expect("reclaim"),
+        0
+    );
+}
+
+#[test]
+fn a_non_finite_confidence_cannot_be_indexed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    // `SQLite` stores a non-finite float as NULL, so NOT NULL is what stands between a confidence
+    // nothing can compare and an entity edge that matches every threshold and no threshold.
+    let mut doc = record("deploy", Outcome::Success, T10);
+    doc.entities = vec![entity_ref("ticket", "PROJ-42", f32::NAN)];
+    let error = publish(&mut writer, &doc).expect_err("must refuse");
+    assert!(
+        matches!(error, yaam_store::Error::Sqlite(_)),
+        "unexpected error: {error}"
+    );
+    assert_eq!(count(&raw(&path), "records"), 0);
+}
+
+#[test]
+fn a_write_against_an_index_that_lost_its_table_is_reported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    publish(&mut writer, &record("deploy", Outcome::Success, T10)).expect("publish");
+
+    // Something outside this library rewrote the index. Every write here is a single statement, and
+    // a statement with nowhere to land has to come back as an error: a writer that reported success
+    // for work the index never recorded would be the one failure nothing downstream could notice.
+    raw(&path)
+        .execute_batch("DROP TABLE fanout_queue; DROP TABLE quarantine_pending;")
+        .expect("tamper");
+
+    assert!(writer.fail_fanout(1, NOW).is_err());
+    assert!(writer.reclaim_stale_fanout(NOW).is_err());
+    assert!(writer.dequeue_quarantine("01HELD").is_err());
+}
+
+#[test]
+fn a_settled_quarantine_row_goes_when_it_is_settled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    writer
+        .enqueue_quarantine("01HELD", "2026-08-20", "spool/01HELD.md")
+        .expect("enqueue");
+    assert_eq!(count(&raw(&path), "quarantine_pending"), 1);
+
+    writer.dequeue_quarantine("01HELD").expect("dequeue");
+    assert_eq!(count(&raw(&path), "quarantine_pending"), 0);
+    // Absence is success: every caller is settling something that may already be settled.
+    writer.dequeue_quarantine("01HELD").expect("again");
+}
+
+#[test]
+fn an_existence_check_is_a_point_lookup_and_carries_the_scope() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    let mut doc = record("deploy", Outcome::Success, T10);
+    doc.visibility = Visibility::Owner;
+    publish(&mut writer, &doc).expect("publish");
+
+    let store = Store::open_read(&path).expect("open read");
+    assert!(query::exists(&store, doc.record_id.as_str(), &ALL).expect("exists"));
+    assert!(!query::exists(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAV", &ALL).expect("exists"));
+    // A stem no identifier could be is simply not a row, rather than an error.
+    assert!(!query::exists(&store, "timeline", &ALL).expect("exists"));
+
+    // Scoped like any other read: an existence check that ignored the scope would answer questions
+    // about records the caller may not see.
+    let owner = Scope::Caller {
+        visibility: vec![Visibility::Owner],
+        agent: doc.agent.clone(),
+        teams: Vec::new(),
+    };
+    let other = Scope::Caller {
+        visibility: vec![Visibility::Owner],
+        agent: "somebody_else".to_owned(),
+        teams: Vec::new(),
+    };
+    assert!(query::exists(&store, doc.record_id.as_str(), &owner).expect("exists"));
+    assert!(!query::exists(&store, doc.record_id.as_str(), &other).expect("exists"));
+}
+
+#[test]
+fn a_read_handle_answers_from_several_threads_at_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    let doc = record("deploy", Outcome::Success, T10);
+    publish(&mut writer, &doc).expect("publish");
+
+    // The point of the pool: one handle, shared by reference, read concurrently. A single
+    // connection is `Send` and not `Sync`, so this would not compile against one.
+    let store = Store::open_read(&path).expect("open read");
+    let expected = doc.record_id.as_str().to_owned();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let (store, expected) = (&store, expected.as_str());
+            scope.spawn(move || {
+                for _ in 0..20 {
+                    assert_eq!(
+                        ids(&query::by_filter(store, &unfiltered()).expect("query")),
+                        vec![expected]
+                    );
+                }
+            });
+        }
+    });
+
+    // And a clone is the same pool, not a second one.
+    let clone = store.clone();
+    assert_eq!(
+        query::by_filter(&clone, &unfiltered())
+            .expect("query")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -1186,7 +1380,7 @@ fn a_stored_id_the_contract_would_reject_reads_as_drift() {
         Err(yaam_store::Error::Drift(_))
     ));
     assert!(matches!(
-        writer.claim_fanout(10),
+        writer.claim_fanout(10, NOW),
         Err(yaam_store::Error::Drift(_))
     ));
 }

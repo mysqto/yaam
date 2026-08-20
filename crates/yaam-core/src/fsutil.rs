@@ -15,9 +15,60 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The directory entry is *not* synced here: the callers that need it also create the directory, and
 /// pairing the two calls at the call site keeps it visible that both are required.
 pub(crate) fn write_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
+    write_sync_mode(path, bytes, None)
+}
+
+/// As [`write_sync`], with a mode to create the file under where the platform has modes.
+///
+/// The mode is applied to an existing file too. A record that has to be owner-only has to be
+/// owner-only on the second write as well, and a replaced file keeps the mode it already had.
+pub(crate) fn write_sync_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+/// Creates a directory and its parents, traversable only by the owner.
+///
+/// Every level is created private, because a dated directory inside an owner's subtree is as much
+/// part of the boundary as the subtree itself.
+pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Restricts an existing directory to its owner.
+///
+/// Separate from creating one because a recursive create leaves an existing directory's mode alone,
+/// which is exactly the case that would keep a restored or older tree readable.
+#[cfg(unix)]
+pub(crate) fn make_private(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+}
+
+/// Nothing to restrict where directories carry no mode.
+#[cfg(not(unix))]
+pub(crate) fn make_private(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Fsyncs a directory, so a rename or creation inside it survives a crash.
@@ -30,12 +81,31 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
 /// A reader therefore sees either the old bytes or the new ones, never a half-written file. The
 /// temporary lives beside the target rather than in a temp directory, because a rename across
 /// filesystems is a copy and stops being atomic.
+/// The replacement inherits the target's mode: a fresh temporary file would otherwise publish a
+/// restricted record under the process umask, silently widening who can read it.
 pub(crate) fn replace_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = parent_of(path)?;
     let temp = path.with_extension("tmp");
-    write_sync(&temp, bytes)?;
+    write_sync_mode(&temp, bytes, existing_mode(path)?)?;
     fs::rename(&temp, path)?;
     sync_dir(parent)
+}
+
+/// The mode a file already carries, or `None` when there is no file yet.
+#[cfg(unix)]
+fn existing_mode(path: &Path) -> io::Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::metadata(path) {
+        Ok(meta) => Ok(Some(meta.permissions().mode() & 0o777)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Nothing to preserve where files carry no mode.
+#[cfg(not(unix))]
+fn existing_mode(_path: &Path) -> io::Result<Option<u32>> {
+    Ok(None)
 }
 
 /// Appends one line to a file, creating it if absent, and fsyncs before returning.
@@ -181,6 +251,26 @@ mod tests {
         );
         // The temporary must not survive as a second copy of the record.
         assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_keeps_the_mode_it_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("restricted.md");
+        super::write_sync_mode(&path, b"one", Some(0o600)).expect("write");
+
+        // A fresh temporary file would arrive under the umask, publishing a restricted record wide
+        // open — and every erasure rewrites a record file this way.
+        replace_atomically(&path, b"two").expect("replace");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

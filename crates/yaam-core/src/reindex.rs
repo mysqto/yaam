@@ -172,6 +172,13 @@ mod tests {
             )
             .expect("accepted");
 
+        // Owner-visible, and so stored apart under `records/owner/`: a rebuild that walked only
+        // the dated tree would silently drop it, and the index would answer without it.
+        harness
+            .pipeline
+            .accept(testkit::owner("2026-08-22T11:30:00Z", "agent_b"), BODY)
+            .expect("accepted");
+
         let erased = testkit::subject('f');
         yaam_crypto::keystore::KeyStore::tombstone(harness.pipeline.keys(), &erased)
             .expect("tombstone");
@@ -192,7 +199,7 @@ mod tests {
         let harness = populated();
         let before = harness.snapshot();
         let counts = harness.counts();
-        assert_eq!(counts["records"], 3);
+        assert_eq!(counts["records"], 4);
         assert_eq!(counts["quarantine_pending"], 1);
 
         // The index is disposable: this deletes the file, not just its contents.
@@ -200,7 +207,7 @@ mod tests {
         assert_eq!(harness.counts()["records"], 0);
 
         let report = reindex_all(&mut harness.pipeline).expect("rebuilt");
-        assert_eq!(report.from_tree, 3);
+        assert_eq!(report.from_tree, 4);
         assert_eq!(report.skipped, 0);
         assert_eq!(report.from_manifests, 0);
         assert_eq!(report.tombstones_replayed, 0);
@@ -233,7 +240,7 @@ mod tests {
 
         let report = reindex_all(&mut harness.pipeline).expect("rebuilt");
         assert_eq!(report.skipped, 1, "one bad file must not abort the rebuild");
-        assert_eq!(report.from_tree, 3);
+        assert_eq!(report.from_tree, 4);
     }
 
     #[test]

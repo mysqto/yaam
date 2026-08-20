@@ -174,16 +174,24 @@ CREATE INDEX entities_recent ON entities (kind, last_seen_ms);
 -- Fan-out work, enqueued in the same transaction as the record. UNIQUE(record_id, job_kind)
 -- makes enqueue idempotent, so a re-drive cannot multiply the work.
 CREATE TABLE fanout_queue (
-    id          INTEGER PRIMARY KEY,
-    record_id   TEXT    NOT NULL REFERENCES records(record_id) ON DELETE CASCADE,
-    job_kind    TEXT    NOT NULL,
-    state       TEXT    NOT NULL DEFAULT 'pending',
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    enqueued_ms INTEGER NOT NULL,
+    id            INTEGER PRIMARY KEY,
+    record_id     TEXT    NOT NULL REFERENCES records(record_id) ON DELETE CASCADE,
+    job_kind      TEXT    NOT NULL,
+    state         TEXT    NOT NULL DEFAULT 'pending',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    enqueued_ms   INTEGER NOT NULL,
+    -- Earliest time a claim may take this job again. 0 until an attempt fails and asks for a
+    -- delay: without it a retry budget can only be spent in a tight loop inside one drain.
+    not_before_ms INTEGER NOT NULL DEFAULT 0,
+    -- When the claim being held was taken, NULL when nobody holds one. A claim whose holder died
+    -- is invisible to every later drain, and this is what dates it for reclamation.
+    claimed_ms    INTEGER,
     UNIQUE (record_id, job_kind)
 ) STRICT;
 
-CREATE INDEX fanout_queue_claim ON fanout_queue (state, enqueued_ms);
+-- Rows are kept in state 'done' for ever, so a claim must never scan them: state leads, then the
+-- readiness test, then the order jobs are handed out in.
+CREATE INDEX fanout_queue_claim ON fanout_queue (state, not_before_ms, enqueued_ms);
 
 -- Records held back until their subjects resolve. Pointers only: a body here would be an
 -- unsealed copy in a table the erasure path does not own. No foreign key, because the whole point

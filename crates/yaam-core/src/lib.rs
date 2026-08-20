@@ -12,6 +12,7 @@
 //! ```text
 //! spec/                        configuration: entity kinds, attribute schema, redaction policy
 //! records/YYYY/MM/DD/<id>.md   the authoritative record tree
+//! records/owner/<agent>/...    owner-visible records, one private subtree per owner
 //! entities/<kind>/<id>/        entity timelines, materialised by fan-out
 //! audit/subjects/<id>.md       which records name which subjects
 //! cold/*.jsonl                 manifests of archived records, still indexable
