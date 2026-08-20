@@ -13,7 +13,12 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
+hex.workspace = true
+saphyr.workspace = true
+# Redaction patterns are configuration, so the matcher has to take arbitrary regexes.
+regex = "1"
 yaam-contract = { path = "../yaam-contract" }
 yaam-crypto = { path = "../yaam-crypto" }
 yaam-md = { path = "../yaam-md" }
@@ -21,3 +26,6 @@ yaam-store = { path = "../yaam-store" }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Tests assert on the derived rows table by table: "the index is reproducible from the tree" is a
+# claim about every table, and only the database itself can be asked whether it holds.
+rusqlite = { version = "0.37", features = ["bundled"] }
