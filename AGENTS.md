@@ -48,5 +48,6 @@ recomputed counters rather than incremented ones.
 ci/check.sh      # hygiene, fmt, clippy, tests, coverage — the same set CI runs
 ```
 
-`ci/github-actions-ci.yml` is the workflow definition. It is not yet installed at
-`.github/workflows/` because that needs a token with `workflow` scope; move it there once available.
+CI runs the same set on every push and pull request (`.github/workflows/ci.yml`). Keep the two in
+lockstep: a gate that exists only in CI is discovered late, and one that exists only locally is
+bypassed.
