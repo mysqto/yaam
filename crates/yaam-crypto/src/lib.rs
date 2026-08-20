@@ -9,6 +9,11 @@
 //! The types here exist to make the failure modes unrepresentable rather than documented:
 //! a [`Nonce`] can only come from a CSPRNG, and a [`Dek`] can only be derived from a full share set.
 //!
+//! [`envelope`] is the other direction of the same idea, one hop earlier: a sidecar seals a record
+//! to the service's public key before the record touches the sidecar's disk or the network, and only
+//! the service can open it. It lives here, with the primitives, because the sealing and the opening
+//! sides are two crates and one format.
+//!
 //! Every seal and unseal needs a [`keystore::KeyStore`] to wrap and unwrap the shares, and takes
 //! one as an argument. There is deliberately no ambient store: the consumers are async, so a store
 //! installed in a thread-local would disappear the moment an `.await` moved the task to another
@@ -18,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod block;
+pub mod envelope;
 pub mod error;
 pub mod keystore;
 pub mod seal;

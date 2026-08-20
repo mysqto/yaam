@@ -5,12 +5,12 @@
 //! a tree and a database on disk. And it is the one place a deployment can put a different
 //! implementation: a read-only replica, or a service that reaches a remote pipeline.
 //!
-//! Every method takes the [`Caller`], because visibility is decided per caller. Passing it in one
-//! argument at a time would let a handler forget, and a read that forgets who asked returns
-//! everything.
+//! Every method takes the [`Caller`], because visibility is decided per caller: an implementation
+//! must narrow every read to [`Caller::scope`], and passing the caller in is what makes that
+//! possible to do — and to check. A read that forgets who asked returns everything.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
+use std::sync::{Mutex, PoisonError};
 
 use yaam_contract::{ActionRecord, RecordId, SubjectHash};
 use yaam_core::bundle::{self, Bundle};
@@ -48,10 +48,9 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
 
 /// The service backed by the write pipeline and the derived index.
 ///
-/// Reads are **not** narrowed to the caller's visibility here, and saying so is more useful than
-/// implying otherwise: the index offers no visibility or team predicate, so there is no query that
-/// would narrow them. The caller is threaded through every method so that the filtering lands here
-/// once there is one, and until then a deployment must not describe a non-operator read as scoped.
+/// Every read here is narrowed to [`Caller::scope`], and the scope replaces whatever the request
+/// carried rather than intersecting with it: what a caller may see comes from the credential its
+/// signature proved, and nothing a request can say may widen it.
 #[derive(Debug)]
 pub struct CoreService {
     /// The pipeline is the single writer, and the lock is what makes that true under concurrent
@@ -97,23 +96,33 @@ impl Service for CoreService {
         Ok(self.pipeline().accept(record, body)?)
     }
 
-    fn query(&self, _caller: &Caller, filter: &Filter) -> Result<Vec<RecordId>> {
-        Ok(query::by_filter(&self.store()?, filter).map_err(yaam_core::Error::from)?)
+    fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordId>> {
+        let scoped = Filter {
+            scope: caller.scope(),
+            ..filter.clone()
+        };
+        Ok(query::by_filter(&self.store()?, &scoped).map_err(yaam_core::Error::from)?)
     }
 
     fn entity(
         &self,
-        _caller: &Caller,
+        caller: &Caller,
         kind: &str,
         id: &str,
         min_confidence: f32,
     ) -> Result<Vec<RecordId>> {
-        Ok(query::by_entity(&self.store()?, kind, id, min_confidence)
-            .map_err(yaam_core::Error::from)?)
+        Ok(
+            query::by_entity(&self.store()?, kind, id, min_confidence, &caller.scope())
+                .map_err(yaam_core::Error::from)?,
+        )
     }
 
-    fn bundle(&self, _caller: &Caller, request: &bundle::Request) -> Result<Bundle> {
-        Ok(bundle::compose(&self.store()?, request)?)
+    fn bundle(&self, caller: &Caller, request: &bundle::Request) -> Result<Bundle> {
+        let scoped = bundle::Request {
+            scope: caller.scope(),
+            ..request.clone()
+        };
+        Ok(bundle::compose(&self.store()?, &scoped)?)
     }
 
     fn erase(&self, _caller: &Caller, subject: &SubjectHash) -> Result<EraseReport> {
@@ -124,103 +133,33 @@ impl Service for CoreService {
     }
 }
 
-/// The service [`crate::routes::router`] resolves against.
-///
-/// Starts out refusing every request as unavailable: a process that has not been given a tree yet is
-/// temporarily wrong, not permanently, so `503` keeps callers holding their records where `422`
-/// would make them discard records that were never at fault.
-static INSTALLED: LazyLock<RwLock<Arc<dyn Service>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(Unconfigured)));
-
-/// Installs the service the ambient router serves from, replacing whatever was there.
-pub fn install(service: Arc<dyn Service>) {
-    let mut slot = INSTALLED.write().unwrap_or_else(PoisonError::into_inner);
-    *slot = service;
-}
-
-/// The installed service.
-#[must_use]
-pub fn installed() -> Arc<dyn Service> {
-    INSTALLED
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-}
-
-/// Stands in until a service is installed.
-#[derive(Debug)]
-struct Unconfigured;
-
-impl Unconfigured {
-    /// The one answer this service has.
-    fn unavailable<T>() -> Result<T> {
-        Err(Error::Unavailable("no memory tree configured".to_owned()))
-    }
-}
-
-impl Service for Unconfigured {
-    fn write(&self, _caller: &Caller, _record: ActionRecord, _body: &str) -> Result<Accepted> {
-        Self::unavailable()
-    }
-
-    fn query(&self, _caller: &Caller, _filter: &Filter) -> Result<Vec<RecordId>> {
-        Self::unavailable()
-    }
-
-    fn entity(
-        &self,
-        _caller: &Caller,
-        _kind: &str,
-        _id: &str,
-        _min_confidence: f32,
-    ) -> Result<Vec<RecordId>> {
-        Self::unavailable()
-    }
-
-    fn bundle(&self, _caller: &Caller, _request: &bundle::Request) -> Result<Bundle> {
-        Self::unavailable()
-    }
-
-    fn erase(&self, _caller: &Caller, _subject: &SubjectHash) -> Result<EraseReport> {
-        Self::unavailable()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
-
     use super::*;
     use crate::auth::Role;
-    use crate::testing;
 
-    fn caller() -> Caller {
-        Caller {
-            agent: "agent-writer".to_owned(),
-            role: Role::Operator,
-        }
-    }
-
-    /// Every unconfigured answer must be the retryable one, since nothing about the request is
-    /// wrong and a caller that gives up loses the record.
+    /// A read against an index that is not there must be reported, not panicked through.
+    ///
+    /// `500` rather than `503`: an absent index is not a moment's unavailability, it is a deployment
+    /// that needs a rebuild, and a caller that kept retrying would be waiting for something no
+    /// amount of patience fixes.
     #[test]
-    fn an_unconfigured_service_is_unavailable_not_unprocessable() {
-        let caller = caller();
-        let subject = testing::subject();
-        let answers = [
-            Unconfigured
-                .write(&caller, testing::record("agent-writer"), "body")
-                .err(),
-            Unconfigured.query(&caller, &Filter::default()).err(),
-            Unconfigured.entity(&caller, "ticket", "T-1", 0.0).err(),
-            Unconfigured
-                .bundle(&caller, &bundle::Request::default())
-                .err(),
-            Unconfigured.erase(&caller, &subject).err(),
-        ];
-        for answer in answers {
-            let error = answer.expect("an unconfigured service answers nothing");
-            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
-        }
+    fn a_read_against_a_missing_index_is_reported_not_panicked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = CoreService::open(dir.path(), &dir.path().join("nowhere/index.sqlite"))
+            .expect("a pipeline over an empty tree");
+        let caller = Caller {
+            agent: "agent-reader".to_owned(),
+            role: Role::Reader,
+            teams: Vec::new(),
+        };
+
+        let error = service
+            .query(&caller, &Filter::default())
+            .expect_err("an index that is not there answers nothing");
+        assert_eq!(
+            error.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

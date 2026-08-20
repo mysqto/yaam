@@ -13,7 +13,7 @@ use yaam_contract::{
     Visibility, attrs, entity,
 };
 use yaam_crypto::Epoch;
-use yaam_store::query::{self, Filter, Window};
+use yaam_store::query::{self, Filter, Scope, Window};
 use yaam_store::{PublishInput, Store, Writer, schema};
 
 const T10: &str = "2026-08-20T10:00:00Z";
@@ -99,6 +99,20 @@ fn count(conn: &Connection, table: &str) -> i64 {
 
 fn ids(records: &[RecordId]) -> Vec<&str> {
     records.iter().map(RecordId::as_str).collect()
+}
+
+/// The scope a maintenance read uses: everything, whatever its visibility.
+///
+/// Most tests here are about a predicate or a plan rather than about entitlements, and reading as
+/// nobody in particular would hide the rows they are asserting on.
+const ALL: Scope = Scope::Unrestricted;
+
+/// A filter that hides nothing, for the tests whose subject is not visibility.
+fn unfiltered() -> Filter {
+    Filter {
+        scope: ALL,
+        ..Filter::default()
+    }
 }
 
 #[test]
@@ -218,11 +232,11 @@ fn full_text_finds_a_plaintext_body_and_never_a_sealed_one() {
 
     let store = Store::open_read(&path).expect("open read");
     assert_eq!(
-        ids(&query::search(&store, "rollback", 10).expect("search")),
+        ids(&query::search(&store, "rollback", 10, &ALL).expect("search")),
         vec![plain.record_id.as_str()]
     );
     assert!(
-        query::search(&store, "distinctivetoken", 10)
+        query::search(&store, "distinctivetoken", 10, &ALL)
             .expect("search")
             .is_empty(),
         "a sealed body must not be searchable"
@@ -269,13 +283,13 @@ fn full_text_stays_consistent_across_insert_update_and_delete() {
 
     let store = Store::open_read(&path).expect("open read");
     assert!(
-        query::search(&store, "rollback", 10)
+        query::search(&store, "rollback", 10, &ALL)
             .expect("search")
             .is_empty(),
         "the update trigger did not unindex the old body"
     );
     assert_eq!(
-        ids(&query::search(&store, "promotion", 10).expect("search")),
+        ids(&query::search(&store, "promotion", 10, &ALL).expect("search")),
         vec![first.record_id.as_str()]
     );
 
@@ -335,10 +349,223 @@ fn timestamps_are_integer_milliseconds_and_ordering_follows_the_server_clock() {
     assert_eq!(received_ms, 1_787_227_200_000);
 
     let store = Store::open_read(&path).expect("open read");
-    let newest_first = query::by_filter(&store, &Filter::default()).expect("filter");
+    let newest_first = query::by_filter(&store, &unfiltered()).expect("filter");
     assert_eq!(
         ids(&newest_first),
         vec![skewed.record_id.as_str(), later_source.record_id.as_str()]
+    );
+}
+
+/// A record at `visibility`, owned by `agent`, optionally in `team`.
+fn scoped(
+    visibility: Visibility,
+    agent: &str,
+    team: Option<&str>,
+    received_at: &str,
+) -> ActionRecord {
+    let mut doc = record("deploy", Outcome::Success, received_at);
+    doc.visibility = visibility;
+    agent.clone_into(&mut doc.agent);
+    doc.team = team.map(str::to_owned);
+    // The team is in the prose as well as the column, so a full-text read can be caught returning
+    // a record the scope should have hidden.
+    doc.summary = format!(
+        "{} record of {agent}, team {}",
+        visibility.as_str(),
+        team.unwrap_or("none")
+    );
+    doc.entities = vec![entity_ref("ticket", "TCK-1", 1.0)];
+    doc
+}
+
+/// One reader's entitlements: org-wide, its own team, and its own owner-visible records.
+fn reader(agent: &str, teams: &[&str]) -> Scope {
+    Scope::Caller {
+        visibility: vec![Visibility::Org, Visibility::Team, Visibility::Owner],
+        agent: agent.to_owned(),
+        teams: teams.iter().map(|team| (*team).to_owned()).collect(),
+    }
+}
+
+/// A tree holding one record at each visibility, and the reader/operator scopes to try on it.
+///
+/// One fixture for every scoped test, so a rule that leaks through *any* of the four read paths is
+/// visible as one failing assertion rather than a missing test.
+fn visibility_fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<ActionRecord>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    let docs = vec![
+        scoped(Visibility::Org, "deploy_bot", None, T10),
+        scoped(Visibility::Team, "deploy_bot", Some("platform"), T10),
+        scoped(Visibility::Team, "deploy_bot", Some("support"), T11),
+        scoped(Visibility::Owner, "deploy_bot", None, T11),
+        scoped(Visibility::Operator, "audit_bot", None, T12),
+    ];
+    for doc in &docs {
+        publish(&mut writer, doc).expect("publish");
+    }
+    (dir, path, docs)
+}
+
+#[test]
+fn a_reader_sees_its_own_team_and_no_other() {
+    let (_dir, path, docs) = visibility_fixture();
+    let store = Store::open_read(&path).expect("open read");
+
+    let filter = Filter {
+        scope: reader("deploy_bot", &["platform"]),
+        ..Filter::default()
+    };
+    let visible = query::by_filter(&store, &filter).expect("filter");
+    assert_eq!(
+        ids(&visible),
+        vec![
+            docs[3].record_id.as_str(),
+            docs[1].record_id.as_str(),
+            docs[0].record_id.as_str(),
+        ],
+        "another team's record, and the audit record, must not be in here"
+    );
+
+    // A reader in no team keeps the org-wide record and loses both team ones.
+    let teamless = Filter {
+        scope: reader("deploy_bot", &[]),
+        ..Filter::default()
+    };
+    assert_eq!(
+        ids(&query::by_filter(&store, &teamless).expect("filter")),
+        vec![docs[3].record_id.as_str(), docs[0].record_id.as_str()]
+    );
+}
+
+#[test]
+fn an_owner_visible_record_is_invisible_to_another_caller() {
+    let (_dir, path, docs) = visibility_fixture();
+    let store = Store::open_read(&path).expect("open read");
+
+    let other = Filter {
+        scope: reader("audit_bot", &["platform"]),
+        ..Filter::default()
+    };
+    let rows = query::by_filter(&store, &other).expect("filter");
+    let visible = ids(&rows);
+    assert!(
+        !visible.contains(&docs[3].record_id.as_str()),
+        "another agent's owner-visible record reached {visible:?}"
+    );
+
+    // The same entitlement under its own identity does see it.
+    let owner = Filter {
+        scope: reader("deploy_bot", &[]),
+        ..Filter::default()
+    };
+    let rows = query::by_filter(&store, &owner).expect("filter");
+    assert!(ids(&rows).contains(&docs[3].record_id.as_str()));
+}
+
+#[test]
+fn only_an_operator_scope_sees_an_audit_record() {
+    let (_dir, path, docs) = visibility_fixture();
+    let store = Store::open_read(&path).expect("open read");
+    let audit = docs[4].record_id.as_str();
+
+    let rows = query::by_filter(
+        &store,
+        &Filter {
+            scope: reader("audit_bot", &["platform"]),
+            ..Filter::default()
+        },
+    )
+    .expect("filter");
+    let reader_sees = ids(&rows);
+    assert!(!reader_sees.contains(&audit), "{reader_sees:?}");
+
+    let operator = Scope::Caller {
+        visibility: vec![
+            Visibility::Org,
+            Visibility::Team,
+            Visibility::Owner,
+            Visibility::Operator,
+        ],
+        agent: "audit_bot".to_owned(),
+        teams: vec!["platform".to_owned()],
+    };
+    let rows = query::by_filter(
+        &store,
+        &Filter {
+            scope: operator,
+            ..Filter::default()
+        },
+    )
+    .expect("filter");
+    let operator_sees = ids(&rows);
+    assert!(operator_sees.contains(&audit), "{operator_sees:?}");
+}
+
+#[test]
+fn every_read_path_applies_the_scope() {
+    let (_dir, path, docs) = visibility_fixture();
+    let store = Store::open_read(&path).expect("open read");
+    let scope = reader("deploy_bot", &["platform"]);
+    let hidden = docs[2].record_id.as_str();
+
+    // Entity history: every record here names the same ticket, so only the scope can narrow it.
+    let rows = query::by_entity(&store, "ticket", "TCK-1", 1.0, &scope).expect("by_entity");
+    let history = ids(&rows);
+    assert!(!history.contains(&hidden), "{history:?}");
+    assert!(history.contains(&docs[1].record_id.as_str()));
+
+    // Full text: the other team's summary is in the index, and must not be reachable.
+    let hidden_text = query::search(&store, "support", 10, &scope).expect("search");
+    assert!(hidden_text.is_empty(), "{:?}", ids(&hidden_text));
+    assert!(
+        !query::search(&store, "platform", 10, &scope)
+            .expect("search")
+            .is_empty(),
+        "the caller's own team must still be searchable"
+    );
+
+    // Correlation: each side carries its own scope, so a pair needs both ends visible.
+    let left = Filter {
+        scope: scope.clone(),
+        ..Filter::default()
+    };
+    let pairs = query::correlate(&store, &left, &left, 7_200_000).expect("correlate");
+    assert!(
+        pairs
+            .iter()
+            .all(|(a, b)| a.as_str() != hidden && b.as_str() != hidden),
+        "{pairs:?}"
+    );
+}
+
+#[test]
+fn a_read_with_no_scope_returns_nothing_rather_than_everything() {
+    let (_dir, path, _docs) = visibility_fixture();
+    let store = Store::open_read(&path).expect("open read");
+
+    // The default scope is what a caller whose entitlements could not be established gets.
+    assert!(
+        query::by_filter(&store, &Filter::default())
+            .expect("filter")
+            .is_empty()
+    );
+    assert!(
+        query::by_entity(&store, "ticket", "TCK-1", 1.0, &Scope::default())
+            .expect("by_entity")
+            .is_empty()
+    );
+    assert!(
+        query::search(&store, "visible", 10, &Scope::default())
+            .expect("search")
+            .is_empty()
+    );
+    assert!(
+        query::correlate(&store, &Filter::default(), &Filter::default(), 7_200_000)
+            .expect("correlate")
+            .is_empty()
     );
 }
 
@@ -435,16 +662,16 @@ fn by_entity_is_newest_first_and_honours_confidence() {
     publish(&mut writer, &inferred).expect("publish");
 
     let store = Store::open_read(&path).expect("open read");
-    let all = query::by_entity(&store, "ticket", "TCK-77", 0.0).expect("by_entity");
+    let all = query::by_entity(&store, "ticket", "TCK-77", 0.0, &ALL).expect("by_entity");
     assert_eq!(
         ids(&all),
         vec![inferred.record_id.as_str(), certain.record_id.as_str()]
     );
 
-    let confident = query::by_entity(&store, "ticket", "TCK-77", 0.9).expect("by_entity");
+    let confident = query::by_entity(&store, "ticket", "TCK-77", 0.9, &ALL).expect("by_entity");
     assert_eq!(ids(&confident), vec![certain.record_id.as_str()]);
     assert!(
-        query::by_entity(&store, "ticket", "TCK-99", 0.0)
+        query::by_entity(&store, "ticket", "TCK-99", 0.0, &ALL)
             .expect("by_entity")
             .is_empty()
     );
@@ -475,7 +702,7 @@ fn by_filter_matches_on_every_predicate() {
     let by_outcome = Filter {
         action: Some("deploy".to_owned()),
         outcome: Some("failure".to_owned()),
-        ..Filter::default()
+        ..unfiltered()
     };
     assert_eq!(
         ids(&query::by_filter(&store, &by_outcome).expect("q")),
@@ -485,7 +712,7 @@ fn by_filter_matches_on_every_predicate() {
     let by_attr = Filter {
         attr: Some(("region".to_owned(), "north".to_owned())),
         agent: Some("deploy_bot".to_owned()),
-        ..Filter::default()
+        ..unfiltered()
     };
     assert_eq!(
         ids(&query::by_filter(&store, &by_attr).expect("q")),
@@ -497,7 +724,7 @@ fn by_filter_matches_on_every_predicate() {
             from_ms: 1_787_223_600_000,
             to_ms: 1_787_227_200_000,
         }),
-        ..Filter::default()
+        ..unfiltered()
     };
     assert_eq!(
         ids(&query::by_filter(&store, &by_window).expect("q")),
@@ -506,7 +733,7 @@ fn by_filter_matches_on_every_predicate() {
 
     let capped = Filter {
         limit: Some(1),
-        ..Filter::default()
+        ..unfiltered()
     };
     assert_eq!(query::by_filter(&store, &capped).expect("q").len(), 1);
 }
@@ -528,11 +755,11 @@ fn correlate_finds_the_pair_inside_the_window_and_nothing_outside_it() {
     let left = Filter {
         action: Some("deploy".to_owned()),
         outcome: Some("failure".to_owned()),
-        ..Filter::default()
+        ..unfiltered()
     };
     let right = Filter {
         action: Some("ticket".to_owned()),
-        ..Filter::default()
+        ..unfiltered()
     };
 
     let pairs = query::correlate(&store, &left, &right, 60_000).expect("correlate");
@@ -613,7 +840,7 @@ fn truncate_derived_empties_every_table_and_keeps_the_schema() {
     publish(&mut writer, &doc).expect("republish");
     let store = Store::open_read(&path).expect("open read");
     assert_eq!(
-        ids(&query::search(&store, "rollback", 10).expect("search")),
+        ids(&query::search(&store, "rollback", 10, &ALL).expect("search")),
         vec![doc.record_id.as_str()]
     );
 }
@@ -625,7 +852,7 @@ fn a_malformed_full_text_query_is_reported() {
     Writer::open(&path).expect("open writer");
     let store = Store::open_read(&path).expect("open read");
 
-    let error = query::search(&store, "unbalanced \" quote", 5).expect_err("must fail");
+    let error = query::search(&store, "unbalanced \" quote", 5, &ALL).expect_err("must fail");
     assert!(matches!(error, yaam_store::Error::Sqlite(_)));
 }
 
@@ -955,7 +1182,7 @@ fn a_stored_id_the_contract_would_reject_reads_as_drift() {
 
     let store = Store::open_read(&path).expect("open read");
     assert!(matches!(
-        query::by_filter(&store, &Filter::default()),
+        query::by_filter(&store, &unfiltered()),
         Err(yaam_store::Error::Drift(_))
     ));
     assert!(matches!(

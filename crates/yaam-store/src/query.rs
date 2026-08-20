@@ -1,12 +1,19 @@
 //! The queries the system exists to answer.
 //!
-//! Two rules hold everywhere here. Ordering, windowing and joins use the server-stamped time, so
-//! a skewed or replayed source clock cannot reorder history. And no query calls a `SQLite` time
+//! Three rules hold everywhere here. Ordering, windowing and joins use the server-stamped time, so
+//! a skewed or replayed source clock cannot reorder history. No query calls a `SQLite` time
 //! function: "now" arrives as a bound parameter, which keeps a query reproducible under test and
-//! keeps its plan free of a non-deterministic term.
+//! keeps its plan free of a non-deterministic term. And every read carries a [`Scope`] — what a
+//! caller may see is a predicate, not a convention, and the one it defaults to is *nothing*.
 
-use rusqlite::{Row, params, params_from_iter, types::Value as SqlValue};
-use yaam_contract::RecordId;
+use rusqlite::{Row, params_from_iter, types::Value as SqlValue};
+use yaam_contract::{RecordId, Visibility};
+
+/// The predicate for a read that may return nothing.
+///
+/// A predicate rather than an early return, so a scope that admits no record takes the same path as
+/// one that admits some — there is no branch that could forget to apply it.
+const MATCHES_NOTHING: &str = "1 = 0";
 
 /// A time window, in server-stamped milliseconds.
 #[derive(Debug, Clone, Copy)]
@@ -15,6 +22,32 @@ pub struct Window {
     pub from_ms: i64,
     /// Exclusive end.
     pub to_ms: i64,
+}
+
+/// Which records a read may return.
+///
+/// The default is [`Scope::Nothing`] on purpose: a read whose entitlements could not be established
+/// must come back empty rather than complete. Widening is then something a caller had to write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// No record at all.
+    #[default]
+    Nothing,
+    /// Every record, whatever its visibility.
+    ///
+    /// What a sweep, a rebuild or an erasure reads with: those walk the index on the tree's behalf
+    /// and are not answering a caller. A request-driven read must never use it.
+    Unrestricted,
+    /// One caller's entitlements.
+    Caller {
+        /// Visibility levels this caller may read at all.
+        visibility: Vec<Visibility>,
+        /// The caller's own identity. An owner-visible record matches only its own agent.
+        agent: String,
+        /// Teams whose team-visible records this caller may read. Empty matches no team-visible
+        /// record, which is what a caller in no team should see.
+        teams: Vec<String>,
+    },
 }
 
 /// Filters for a record query.
@@ -35,6 +68,8 @@ pub struct Filter {
     pub window: Option<Window>,
     /// Page size.
     pub limit: Option<u32>,
+    /// What the reader is entitled to see.
+    pub scope: Scope,
 }
 
 /// Everything touching one entity, newest first.
@@ -46,15 +81,26 @@ pub fn by_entity(
     kind: &str,
     id: &str,
     min_confidence: f32,
+    scope: &Scope,
 ) -> crate::Result<Vec<RecordId>> {
-    let mut stmt = store.conn.prepare(
-        "SELECT rec.record_id
+    let mut binds: Vec<SqlValue> = vec![
+        kind.to_owned().into(),
+        id.to_owned().into(),
+        f64::from(min_confidence).into(),
+    ];
+    let mut sql = "SELECT rec.record_id
          FROM entity_refs AS er
          JOIN records AS rec ON rec.id = er.record_pk
-         WHERE er.kind = ?1 AND er.entity_id = ?2 AND er.confidence >= ?3
-         ORDER BY rec.received_ms DESC, rec.id DESC",
-    )?;
-    let rows = stmt.query_map(params![kind, id, f64::from(min_confidence)], one_id)?;
+         WHERE er.kind = ? AND er.entity_id = ? AND er.confidence >= ?"
+        .to_owned();
+    if let Some(predicate) = scope_predicate(scope, "rec", &mut binds) {
+        sql.push_str(" AND ");
+        sql.push_str(&predicate);
+    }
+    sql.push_str(" ORDER BY rec.received_ms DESC, rec.id DESC");
+
+    let mut stmt = store.conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds), one_id)?;
     collect(rows)
 }
 
@@ -163,16 +209,27 @@ fn correlate_sql(left: &Filter, right: &Filter, within_ms: i64) -> (String, Vec<
 /// one is reported rather than silently matching nothing. Sealed records hold an empty body and so
 /// index no text; the explicit predicate says so at the query too, because "it cannot happen" is
 /// not the same as "it is refused".
-pub fn search(store: &crate::Store, needle: &str, limit: u32) -> crate::Result<Vec<RecordId>> {
-    let mut stmt = store.conn.prepare(
-        "SELECT rec.record_id
+pub fn search(
+    store: &crate::Store,
+    needle: &str,
+    limit: u32,
+    scope: &Scope,
+) -> crate::Result<Vec<RecordId>> {
+    let mut binds: Vec<SqlValue> = vec![needle.to_owned().into()];
+    let mut sql = "SELECT rec.record_id
          FROM records_fts
          JOIN records AS rec ON rec.id = records_fts.rowid
-         WHERE records_fts MATCH ?1 AND rec.sealed = 0
-         ORDER BY records_fts.rank, rec.received_ms DESC
-         LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![needle, i64::from(limit)], one_id)?;
+         WHERE records_fts MATCH ? AND rec.sealed = 0"
+        .to_owned();
+    if let Some(predicate) = scope_predicate(scope, "rec", &mut binds) {
+        sql.push_str(" AND ");
+        sql.push_str(&predicate);
+    }
+    sql.push_str(" ORDER BY records_fts.rank, rec.received_ms DESC LIMIT ?");
+    binds.push(i64::from(limit).into());
+
+    let mut stmt = store.conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds), one_id)?;
     collect(rows)
 }
 
@@ -198,7 +255,59 @@ fn record_predicates(filter: &Filter, alias: &str, binds: &mut Vec<SqlValue>) ->
         binds.push(window.from_ms.into());
         binds.push(window.to_ms.into());
     }
+    // Last, so that the columns a query is *selected* by still lead the predicate list, and so
+    // every path that builds record predicates gets the scope test whether or not it remembers to.
+    predicates.extend(scope_predicate(&filter.scope, alias, binds));
     predicates
+}
+
+/// The scope test over a record alias, as one predicate, or `None` when nothing is excluded.
+///
+/// The rules, in one place because they are the whole of "who may read what": org-visible records
+/// are readable by any caller the service authenticated; a team-visible record only by a caller in
+/// that team; an owner-visible record only by the agent it is attributed to; an operator-visible
+/// record only by a caller whose entitlements name that level. A level the caller cannot satisfy
+/// contributes no clause at all, so an entitlement without the identity to use it widens nothing.
+fn scope_predicate(scope: &Scope, alias: &str, binds: &mut Vec<SqlValue>) -> Option<String> {
+    let (visibility, agent, teams) = match scope {
+        Scope::Unrestricted => return None,
+        Scope::Nothing => return Some(MATCHES_NOTHING.to_owned()),
+        Scope::Caller {
+            visibility,
+            agent,
+            teams,
+        } => (visibility, agent, teams),
+    };
+
+    let mut allowed: Vec<String> = Vec::new();
+    for level in visibility {
+        match level {
+            Visibility::Owner => {
+                allowed.push(format!("({alias}.visibility = ? AND {alias}.agent = ?)"));
+                binds.push(level.as_str().to_owned().into());
+                binds.push(agent.clone().into());
+            }
+            Visibility::Team if !teams.is_empty() => {
+                let holes = vec!["?"; teams.len()].join(", ");
+                allowed.push(format!(
+                    "({alias}.visibility = ? AND {alias}.team IN ({holes}))"
+                ));
+                binds.push(level.as_str().to_owned().into());
+                binds.extend(teams.iter().map(|team| SqlValue::from(team.clone())));
+            }
+            Visibility::Team => {}
+            Visibility::Org | Visibility::Operator => {
+                allowed.push(format!("{alias}.visibility = ?"));
+                binds.push(level.as_str().to_owned().into());
+            }
+        }
+    }
+
+    Some(if allowed.is_empty() {
+        MATCHES_NOTHING.to_owned()
+    } else {
+        format!("({})", allowed.join(" OR "))
+    })
 }
 
 /// As [`record_predicates`], plus the attribute test as a semi-join.
@@ -234,7 +343,18 @@ fn collect(rows: impl Iterator<Item = rusqlite::Result<String>>) -> crate::Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{Filter, SqlValue, Window, correlate_sql, filter_sql};
+    use yaam_contract::Visibility;
+
+    use super::{Filter, Scope, SqlValue, Window, correlate_sql, filter_sql, scope_predicate};
+
+    /// What a reader on one team is entitled to.
+    fn reader() -> Scope {
+        Scope::Caller {
+            visibility: vec![Visibility::Org, Visibility::Team, Visibility::Owner],
+            agent: "agent_a".to_owned(),
+            teams: vec!["platform".to_owned()],
+        }
+    }
 
     /// A migrated but empty database: the planner picks its indexes from the schema, so an empty
     /// table is enough to see whether a predicate can be served by a seek.
@@ -271,6 +391,9 @@ mod tests {
                 to_ms: 9_000,
             }),
             limit: Some(10),
+            // Scoped as a real read is: the scope narrows the rows a seek returned, so it must not
+            // be what the query is driven from.
+            scope: reader(),
             ..Filter::default()
         };
         let (sql, binds) = filter_sql(&filter);
@@ -286,6 +409,7 @@ mod tests {
     fn attribute_filter_seeks_the_attribute_index() {
         let filter = Filter {
             attr: Some(("order_ref".to_owned(), "ORD-1001".to_owned())),
+            scope: reader(),
             ..Filter::default()
         };
         let (sql, binds) = filter_sql(&filter);
@@ -301,11 +425,13 @@ mod tests {
         let left = Filter {
             action: Some("deploy".to_owned()),
             outcome: Some("failure".to_owned()),
+            scope: reader(),
             ..Filter::default()
         };
         let right = Filter {
             action: Some("ticket".to_owned()),
             attr: Some(("severity".to_owned(), "high".to_owned())),
+            scope: reader(),
             ..Filter::default()
         };
         let (sql, binds) = correlate_sql(&left, &right, 60_000);
@@ -320,6 +446,60 @@ mod tests {
             2,
             "both sides should use the covering index:\n{plan}"
         );
+    }
+
+    #[test]
+    fn the_default_scope_matches_nothing() {
+        // A filter nobody scoped is a read whose entitlements are unknown, and the only safe answer
+        // to that is no rows.
+        let (sql, _) = filter_sql(&Filter::default());
+        assert!(sql.contains("1 = 0"), "{sql}");
+    }
+
+    #[test]
+    fn an_unrestricted_scope_adds_no_predicate() {
+        let (sql, binds) = filter_sql(&Filter {
+            scope: Scope::Unrestricted,
+            ..Filter::default()
+        });
+        assert!(!sql.contains("visibility"), "{sql}");
+        assert!(binds.is_empty(), "{binds:?}");
+    }
+
+    #[test]
+    fn a_caller_scope_binds_every_level_it_claims() {
+        let mut binds: Vec<SqlValue> = Vec::new();
+        let predicate = scope_predicate(&reader(), "rec", &mut binds).expect("a predicate");
+
+        assert!(predicate.contains("rec.agent = ?"), "{predicate}");
+        assert!(predicate.contains("rec.team IN (?)"), "{predicate}");
+        assert_eq!(
+            binds,
+            vec![
+                SqlValue::from("org".to_owned()),
+                SqlValue::from("team".to_owned()),
+                SqlValue::from("platform".to_owned()),
+                SqlValue::from("owner".to_owned()),
+                SqlValue::from("agent_a".to_owned()),
+            ],
+            "a placeholder without its value in the same order is a silently wrong query"
+        );
+    }
+
+    #[test]
+    fn an_entitlement_without_the_identity_to_use_it_widens_nothing() {
+        // Team-visible records and no team: the entitlement is real and satisfies no record.
+        let mut binds: Vec<SqlValue> = Vec::new();
+        let scope = Scope::Caller {
+            visibility: vec![Visibility::Team],
+            agent: "agent_a".to_owned(),
+            teams: Vec::new(),
+        };
+        assert_eq!(
+            scope_predicate(&scope, "rec", &mut binds).as_deref(),
+            Some("1 = 0")
+        );
+        assert!(binds.is_empty());
     }
 
     #[test]

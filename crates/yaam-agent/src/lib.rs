@@ -12,24 +12,23 @@
 //!
 //! # Shape of a running sidecar
 //!
-//! [`listener::serve`] binds one socket per [`listener::CallerSocket`], reads the service's address
-//! and public key from `upstream.json` in its state directory, and keeps its spool in the same
-//! place. A record's path through it is: parse, validate, check attribution against the socket, seal
-//! to the service's public key, post — and spool only if the service said *later* rather than *no*.
+//! [`listener::serve`] binds one socket per [`listener::CallerSocket`] and keeps its spool in the
+//! state directory it is given. Where the service is, its public key and the keys to sign with all
+//! arrive as an [`upstream::Upstream`] the caller passes in — [`listener::Config::load`] reads one
+//! from a file for a deployment that keeps it there, and nothing here reaches for process-wide
+//! state. A record's path through the sidecar is: parse, validate, check attribution against the
+//! socket, seal to the service's public key, sign, post — and spool only if the service said
+//! *later* rather than *no*.
 //!
-//! # One thing this sidecar does not do
+//! # What the service sees
 //!
-//! It does not authenticate its requests. [`upstream::Upstream`] carries a base URL and the
-//! service's *public* key, and neither is a caller credential; the type has nowhere to put the
-//! shared secret the service's HMAC verification expects. Deriving one from a public key would look
-//! like authentication while providing none, so requests go out unsigned and this says so. Closing
-//! the gap needs one field on [`upstream::Upstream`], or a credential argument to
-//! [`upstream::Upstream::post_record`] — a change to a frozen surface, and so a decision for whoever
-//! owns it rather than one to make quietly here.
+//! One sealed envelope per record, signed as the agent whose socket it arrived on. The envelope
+//! format and the canonical signed message are both shared code — [`yaam_crypto::envelope`] and
+//! [`yaam_contract::request`] — because the service is the other end of both, and a sidecar-local
+//! spelling of either is a system whose halves cannot talk while each passes its own tests.
 
 #![forbid(unsafe_code)]
 
-pub mod envelope;
 pub mod error;
 pub mod listener;
 mod sidecar;
@@ -39,3 +38,8 @@ mod stub;
 pub mod upstream;
 
 pub use error::{Error, Result};
+/// Sealing to the service's public key.
+///
+/// Re-exported rather than reimplemented: the service opens what this seals, so both sides use one
+/// module.
+pub use yaam_crypto::envelope;

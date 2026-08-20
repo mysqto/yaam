@@ -16,6 +16,12 @@ serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 saphyr.workspace = true
+hex.workspace = true
+# Request signing: HMAC-SHA256 over the canonical message, compared in constant time. Here rather
+# than in each crate that signs or verifies, so there is one spelling of what gets signed.
+hmac = "0.13"
+sha2 = "0.11"
+subtle = "2.6"
 # Entity patterns are configuration, so the matcher has to take arbitrary regexes.
 regex = "1"
 

@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use yaam_md::Document;
-use yaam_store::query::{self, Filter};
+use yaam_store::query::{self, Filter, Scope};
 
 use crate::fsutil;
 use crate::layout;
@@ -95,7 +95,13 @@ fn redrive_staging(pipeline: &mut Pipeline) -> Result<usize> {
 fn index_the_unindexed(pipeline: &mut Pipeline) -> Result<usize> {
     let indexed: HashSet<String> = {
         let store = pipeline.reader()?;
-        query::by_filter(&store, &Filter::default())?
+        // Unrestricted, because this read is not answering anybody: the sweeper compares the index
+        // against the tree, and a row it could not see is a row it would publish a second time.
+        let everything = Filter {
+            scope: Scope::Unrestricted,
+            ..Filter::default()
+        };
+        query::by_filter(&store, &everything)?
             .into_iter()
             .map(|id| id.as_str().to_owned())
             .collect()

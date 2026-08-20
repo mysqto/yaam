@@ -15,6 +15,9 @@ thiserror.workspace = true
 hex.workspace = true
 yaam-contract = { path = "../yaam-contract" }
 aes-gcm = "0.11"
+# Sealing a record to the service's public key: X25519 for the key agreement, the same HKDF-SHA256
+# and AES-GCM the block format already uses, so there is one set of primitives to review.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 aes-kw = { version = "0.3", features = ["zeroize"] }
 hkdf = "0.13"
 sha2 = "0.11"

@@ -1,8 +1,10 @@
 //! Rebuilding the index from the tree.
 //!
-//! This is the operation that proves the index is derived. It must reproduce every row from the
-//! Markdown tree plus local cold manifests — and then replay tombstones, or a rebuild would
-//! resurrect structure that was erased.
+//! This is the operation that proves the index is derived. It replays the tombstone log *first* and
+//! then reproduces every row from the Markdown tree plus local cold manifests — in that order, or a
+//! rebuild would resurrect structure that was erased. A publish carrying no key share deliberately
+//! keeps the share the index already holds, so a replay after the walk could not take one back;
+//! re-applying each erasure to the tree first makes the walk itself produce the erased shape.
 
 use std::fs;
 
@@ -254,14 +256,25 @@ mod tests {
         // Queryable but not searchable: a manifest carries no body to index.
         let store = harness.pipeline.reader().expect("reader");
         assert!(
-            yaam_store::query::search(&store, "shards", 10)
-                .expect("search")
-                .is_empty()
+            yaam_store::query::search(
+                &store,
+                "shards",
+                10,
+                &yaam_store::query::Scope::Unrestricted
+            )
+            .expect("search")
+            .is_empty()
         );
         assert_eq!(
-            yaam_store::query::by_entity(&store, "ticket", "PROJ-42", 1.0)
-                .expect("by entity")
-                .len(),
+            yaam_store::query::by_entity(
+                &store,
+                "ticket",
+                "PROJ-42",
+                1.0,
+                &yaam_store::query::Scope::Unrestricted,
+            )
+            .expect("by entity")
+            .len(),
             1
         );
     }

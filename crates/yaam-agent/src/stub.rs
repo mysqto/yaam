@@ -18,8 +18,9 @@ pub(crate) struct Stub {
     status: Arc<AtomicU16>,
     /// Bodies received so far, in arrival order.
     received: Arc<Mutex<Vec<Vec<u8>>>>,
-    /// Request lines received so far, so a test can check where a record was posted.
-    lines: Arc<Mutex<Vec<String>>>,
+    /// Request heads received so far, so a test can check where a record was posted and what it
+    /// was signed as.
+    heads: Arc<Mutex<Vec<String>>>,
 }
 
 impl Stub {
@@ -30,22 +31,22 @@ impl Stub {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let status = Arc::new(AtomicU16::new(status));
         let received = Arc::new(Mutex::new(Vec::new()));
-        let lines = Arc::new(Mutex::new(Vec::new()));
+        let heads = Arc::new(Mutex::new(Vec::new()));
 
         let task = (
             Arc::clone(&status),
             Arc::clone(&received),
-            Arc::clone(&lines),
+            Arc::clone(&heads),
         );
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (status, received, lines) = (
+                let (status, received, heads) = (
                     Arc::clone(&task.0),
                     Arc::clone(&task.1),
                     Arc::clone(&task.2),
                 );
                 tokio::spawn(async move {
-                    serve_one(stream, &status, &received, &lines).await;
+                    serve_one(stream, &status, &received, &heads).await;
                 });
             }
         });
@@ -54,7 +55,7 @@ impl Stub {
             base_url,
             status,
             received,
-            lines,
+            heads,
         }
     }
 
@@ -70,7 +71,23 @@ impl Stub {
 
     /// Request lines received so far, e.g. `POST /records HTTP/1.1`.
     pub(crate) fn request_lines(&self) -> Vec<String> {
-        self.lines.lock().unwrap().clone()
+        self.heads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|head| head.lines().next().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// Value of `name` on the request at `index`, lowercased header name.
+    pub(crate) fn header(&self, index: usize, name: &str) -> Option<String> {
+        let heads = self.heads.lock().unwrap();
+        heads.get(index)?.lines().find_map(|line| {
+            let (found, value) = line.split_once(':')?;
+            found
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
     }
 }
 
@@ -79,7 +96,7 @@ async fn serve_one(
     mut stream: TcpStream,
     status: &AtomicU16,
     received: &Mutex<Vec<Vec<u8>>>,
-    lines: &Mutex<Vec<String>>,
+    heads: &Mutex<Vec<String>>,
 ) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -102,13 +119,10 @@ async fn serve_one(
         }
     }
 
-    lines.lock().unwrap().push(
-        String::from_utf8_lossy(&buf[..head_end])
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned(),
-    );
+    heads
+        .lock()
+        .unwrap()
+        .push(String::from_utf8_lossy(&buf[..head_end]).into_owned());
     received
         .lock()
         .unwrap()

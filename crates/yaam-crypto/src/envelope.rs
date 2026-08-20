@@ -1,9 +1,13 @@
-//! Sealing a spool entry to the service's public key.
+//! Sealing a record to the service's public key.
 //!
-//! One direction only, and that is the point: the sidecar holds a public key, so it can seal an
-//! entry it will never be able to read back. A symmetric spool key would mean that anything with
-//! read access to the sidecar's host — a backup, a core dump, an operator — could recover every
-//! record that ever passed through it.
+//! One direction only, and that is the point: a sidecar holds the public half, so it can seal an
+//! entry it will never be able to read back — on its spool or on the wire. A symmetric key would
+//! mean that anything with read access to the sidecar's host — a backup, a core dump, an operator
+//! — could recover every record that ever passed through it.
+//!
+//! Both halves of the scheme live here rather than in the sidecar, because the service is the side
+//! that opens what the sidecar sealed. A second implementation of the layout below, one per side,
+//! is how the two stop agreeing.
 //!
 //! The construction is ephemeral-static X25519, HKDF-SHA256, AES-256-GCM: a fresh key pair per
 //! entry whose private half is dropped as soon as the shared secret is derived, so even the process
@@ -30,11 +34,18 @@ use hkdf::Hkdf;
 use rand::CryptoRng;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
-use yaam_crypto::Error as CryptoError;
 use zeroize::Zeroizing;
+
+use crate::Error as CryptoError;
 
 /// Length of an X25519 key, public or secret.
 pub const KEY_LEN: usize = 32;
+
+/// Media type a sealed envelope is posted under.
+///
+/// A distinct type rather than a sniffed body: the service has to know whether to open the bytes or
+/// parse them, and guessing from the first byte is a decision that can be wrong.
+pub const CONTENT_TYPE: &str = "application/vnd.yaam.envelope";
 
 /// Current envelope format version.
 const FORMAT_VERSION: u8 = 1;
@@ -79,6 +90,15 @@ pub fn generate_keypair() -> ([u8; KEY_LEN], [u8; KEY_LEN]) {
     (secret.to_bytes(), public.to_bytes())
 }
 
+/// The public half of a service secret key.
+///
+/// A service holds the secret and has to publish the public half for sidecars to seal to; deriving
+/// it here means the two halves cannot be configured out of step.
+pub fn public_key(service_secret_key: &[u8]) -> crate::Result<[u8; KEY_LEN]> {
+    let secret = StaticSecret::from(key_bytes(service_secret_key, "service secret key")?);
+    Ok(PublicKey::from(&secret).to_bytes())
+}
+
 /// Seals `plaintext` to the service's public key.
 ///
 /// Fails only on a malformed key: the sidecar has no other way to get this wrong, and a wrong-length
@@ -95,12 +115,12 @@ pub fn seal(service_public_key: &[u8], plaintext: &[u8]) -> crate::Result<Vec<u8
         &ephemeral.diffie_hellman(&recipient).to_bytes(),
         &ephemeral_public.to_bytes(),
         &recipient.to_bytes(),
-    )?;
+    );
 
     let mut nonce = [0u8; NONCE_LEN];
     fill_random(&mut nonce);
 
-    let ciphertext = cipher(&key)?
+    let ciphertext = cipher(&key)
         .encrypt(
             &Array::from(nonce),
             Payload {
@@ -129,15 +149,13 @@ pub fn open(service_secret_key: &[u8], sealed: &[u8]) -> crate::Result<Vec<u8>> 
         return Err(CryptoError::MalformedBlock(format!(
             "envelope is {} bytes, shorter than its header",
             sealed.len()
-        ))
-        .into());
+        )));
     }
     if sealed[0] != FORMAT_VERSION {
         return Err(CryptoError::MalformedBlock(format!(
             "unsupported envelope version `{}`",
             sealed[0]
-        ))
-        .into());
+        )));
     }
 
     let mut ephemeral_public = [0u8; KEY_LEN];
@@ -151,9 +169,9 @@ pub fn open(service_secret_key: &[u8], sealed: &[u8]) -> crate::Result<Vec<u8>> 
             .to_bytes(),
         &ephemeral_public,
         &PublicKey::from(&secret).to_bytes(),
-    )?;
+    );
 
-    Ok(cipher(&key)?
+    cipher(&key)
         .decrypt(
             &Array::from(nonce),
             Payload {
@@ -161,7 +179,7 @@ pub fn open(service_secret_key: &[u8], sealed: &[u8]) -> crate::Result<Vec<u8>> 
                 aad: AAD,
             },
         )
-        .map_err(|_| CryptoError::Authentication)?)
+        .map_err(|_| CryptoError::Authentication)
 }
 
 /// Derives the content key from a shared secret, binding it to both public keys.
@@ -172,7 +190,7 @@ fn derive(
     shared: &[u8; KEY_LEN],
     ephemeral_public: &[u8; KEY_LEN],
     recipient_public: &[u8; KEY_LEN],
-) -> crate::Result<Zeroizing<[u8; KEY_LEN]>> {
+) -> Zeroizing<[u8; KEY_LEN]> {
     let mut info = Vec::with_capacity(2 * KEY_LEN);
     info.extend_from_slice(ephemeral_public);
     info.extend_from_slice(recipient_public);
@@ -180,24 +198,24 @@ fn derive(
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
     Hkdf::<Sha256>::new(Some(HKDF_SALT), shared)
         .expand(&info, key.as_mut())
-        .map_err(|_| CryptoError::MalformedBlock("cannot expand envelope key".to_owned()))?;
-    Ok(key)
+        .expect("HKDF expands up to 255 hash lengths and this asks for one, so it cannot fail");
+    key
 }
 
 /// AES-256-GCM under a derived content key.
-fn cipher(key: &Zeroizing<[u8; KEY_LEN]>) -> crate::Result<Aes256Gcm> {
-    Ok(Aes256Gcm::new_from_slice(key.as_ref())
-        .map_err(|_| CryptoError::MalformedBlock("envelope key is not 32 bytes".to_owned()))?)
+fn cipher(key: &Zeroizing<[u8; KEY_LEN]>) -> Aes256Gcm {
+    Aes256Gcm::new_from_slice(key.as_ref())
+        .expect("the derived key is exactly one AES-256 key long, by construction")
 }
 
 /// Checks a configured key is exactly one X25519 key long.
 fn key_bytes(bytes: &[u8], what: &str) -> crate::Result<[u8; KEY_LEN]> {
-    Ok(bytes.try_into().map_err(|_| {
+    bytes.try_into().map_err(|_| {
         CryptoError::MalformedBlock(format!(
             "{what} is {} bytes, expected {KEY_LEN}",
             bytes.len()
         ))
-    })?)
+    })
 }
 
 #[cfg(test)]
@@ -211,6 +229,13 @@ mod tests {
         let (secret, public) = generate_keypair();
         let sealed = seal(&public, RECORD).unwrap();
         assert_eq!(open(&secret, &sealed).unwrap(), RECORD);
+    }
+
+    #[test]
+    fn the_public_half_is_derivable_from_the_secret_one() {
+        let (secret, public) = generate_keypair();
+        assert_eq!(public_key(&secret).unwrap(), public);
+        assert!(public_key(b"short").is_err());
     }
 
     #[test]
