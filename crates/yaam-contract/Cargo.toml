@@ -15,5 +15,8 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
+saphyr.workspace = true
+# Entity patterns are configuration, so the matcher has to take arbitrary regexes.
+regex = "1"
 
 [dev-dependencies]
