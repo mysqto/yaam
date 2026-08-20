@@ -8,6 +8,11 @@
 //!
 //! The types here exist to make the failure modes unrepresentable rather than documented:
 //! a [`Nonce`] can only come from a CSPRNG, and a [`Dek`] can only be derived from a full share set.
+//!
+//! Every seal and unseal therefore needs a [`keystore::KeyStore`] to wrap and unwrap the shares.
+//! Pass it explicitly to [`seal::seal_in`] and [`seal::unseal_in`]; [`seal::seal`] and
+//! [`seal::unseal`], whose signatures have nowhere to put one, take the store installed by
+//! [`keystore::with_store`] and fail with [`Error::NoKeyStore`] when there is none.
 
 #![forbid(unsafe_code)]
 
