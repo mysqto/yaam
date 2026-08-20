@@ -19,9 +19,13 @@
 //! trying; `rejected` means the caller must fix the record, because nothing else will. A caller that
 //! treats a missing answer as success has invented its own durability — the answer is the ack.
 //!
-//! Where the service lives is read from `upstream.json` in the state directory rather than passed
-//! in, because [`serve`] takes only the sockets and that directory.
+//! Where the service lives, and what to sign as, are passed in. [`Config::load`] reads them from
+//! `upstream.json` for a deployment that keeps them in a file, but it is the caller that decides to
+//! call it: a `serve` that reached for a file — or for process-wide state — could not be pointed at
+//! two services in one test, and a sidecar whose configuration is invisible at the call site is one
+//! whose configuration nobody checks.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -32,10 +36,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use yaam_contract::request::SigningKeys;
 
 use crate::sidecar::Sidecar;
 use crate::spool::{self, Spool};
-use crate::upstream::Upstream;
+use crate::upstream::{Credentials, Upstream};
 use crate::{Error, envelope};
 
 /// Name of the configuration file inside the state directory.
@@ -69,17 +74,45 @@ pub struct CallerSocket {
 ///
 /// Kept in the state directory, next to the spool it belongs with, and readable only by the sidecar.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Base URL of the service.
     pub base_url: String,
     /// Service public key, hex encoded. The sidecar seals to it and can never unseal.
     pub service_public_key: String,
+    /// Signing key per agent, hex encoded: the same key the service's keyring holds for that agent.
+    ///
+    /// Only the current key. Which retired key the service will still accept is the service's
+    /// business, and a signer never needs one.
+    #[serde(default)]
+    pub signing_keys: BTreeMap<String, String>,
     /// Delay between drain attempts while the spool is backed up.
     #[serde(default = "default_retry_ms")]
     pub retry_interval_ms: u64,
     /// Entries the spool holds before it starts refusing writes.
     #[serde(default = "default_capacity")]
     pub spool_capacity: usize,
+}
+
+/// The bounds a running sidecar works within.
+///
+/// Separate from [`Upstream`] because neither knob is about reaching the service: they are what this
+/// sidecar does while it cannot.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Delay between drain attempts while the spool is backed up.
+    pub retry_interval_ms: u64,
+    /// Entries the spool holds before it starts refusing writes.
+    pub spool_capacity: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            retry_interval_ms: DEFAULT_RETRY_MS,
+            spool_capacity: spool::DEFAULT_CAPACITY,
+        }
+    }
 }
 
 /// Default for [`Config::retry_interval_ms`].
@@ -105,42 +138,87 @@ impl Config {
         })
     }
 
-    /// Resolves the upstream, decoding and length-checking the service key.
+    /// Resolves the upstream, decoding and length-checking every configured key.
     ///
-    /// Checked at startup rather than at the first record: a sidecar that cannot seal cannot do its
-    /// job, and finding out during a write means the caller wears a failure the operator caused.
+    /// Checked at startup rather than at the first record: a sidecar that cannot seal or cannot sign
+    /// cannot do its job, and finding out during a write means the caller wears a failure the
+    /// operator caused.
     pub fn upstream(&self) -> crate::Result<Upstream> {
-        let key = hex::decode(self.service_public_key.trim()).map_err(|e| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("service public key is not hex: {e}"),
-            ))
-        })?;
+        let key = decode_key(&self.service_public_key, "service public key")?;
         if key.len() != envelope::KEY_LEN {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "service public key is {} bytes, expected {}",
-                    key.len(),
-                    envelope::KEY_LEN
-                ),
+            return Err(invalid(format!(
+                "service public key is {} bytes, expected {}",
+                key.len(),
+                envelope::KEY_LEN
             )));
+        }
+        let mut credentials = Credentials::new();
+        for (agent, hex_key) in &self.signing_keys {
+            let signing = decode_key(hex_key, &format!("signing key for `{agent}`"))?;
+            if signing.is_empty() {
+                return Err(invalid(format!("signing key for `{agent}` is empty")));
+            }
+            credentials = credentials.with(agent.clone(), SigningKeys::new(signing));
         }
         Ok(Upstream {
             base_url: self.base_url.clone(),
             service_public_key: key,
+            credentials,
         })
+    }
+
+    /// The bounds this configuration asks for.
+    #[must_use]
+    pub fn limits(&self) -> Limits {
+        Limits {
+            retry_interval_ms: self.retry_interval_ms,
+            spool_capacity: self.spool_capacity,
+        }
     }
 }
 
-/// Serves every configured caller socket until shutdown.
+/// Decodes one hex-encoded configured key.
+fn decode_key(text: &str, what: &str) -> crate::Result<Vec<u8>> {
+    hex::decode(text.trim()).map_err(|e| invalid(format!("{what} is not hex: {e}")))
+}
+
+/// A configuration fault, reported as unusable input rather than a missing file.
+fn invalid(message: String) -> Error {
+    Error::Io(io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+/// Serves every configured caller socket until shutdown, with default [`Limits`].
 ///
 /// Returns when the process is interrupted, after removing the sockets it created — a socket file
 /// outliving its sidecar is a caller writing into something that will never answer.
-pub async fn serve(sockets: &[CallerSocket], state_dir: &Path) -> crate::Result<()> {
-    let config = Config::load(state_dir)?;
-    let spool = Spool::open_with_capacity(state_dir.join(SPOOL_DIR), config.spool_capacity)?;
-    let sidecar = Arc::new(Sidecar::new(config.upstream()?, spool));
+pub async fn serve(
+    sockets: &[CallerSocket],
+    state_dir: &Path,
+    upstream: &Upstream,
+) -> crate::Result<()> {
+    serve_with(sockets, state_dir, upstream, Limits::default()).await
+}
+
+/// As [`serve`], with the spool bound and retry cadence named.
+///
+/// Refuses to bind a socket whose agent this sidecar cannot sign as: the alternative is a caller
+/// writing records all day that the service will refuse one at a time.
+pub async fn serve_with(
+    sockets: &[CallerSocket],
+    state_dir: &Path,
+    upstream: &Upstream,
+    limits: Limits,
+) -> crate::Result<()> {
+    for socket in sockets {
+        if upstream.credentials.keys(&socket.agent).is_none() {
+            return Err(invalid(format!(
+                "no signing key configured for `{}`",
+                socket.agent
+            )));
+        }
+    }
+    let spool = Spool::open_with_capacity(state_dir.join(SPOOL_DIR), limits.spool_capacity)?;
+    let sidecar = Arc::new(Sidecar::new(upstream.clone(), spool));
 
     let mut tasks = Vec::with_capacity(sockets.len() + 1);
     for socket in sockets {
@@ -155,7 +233,7 @@ pub async fn serve(sockets: &[CallerSocket], state_dir: &Path) -> crate::Result<
     }
     tasks.push(tokio::spawn(retry_loop(
         Arc::clone(&sidecar),
-        Duration::from_millis(config.retry_interval_ms),
+        Duration::from_millis(limits.retry_interval_ms),
     )));
 
     tokio::signal::ctrl_c().await?;
@@ -396,12 +474,15 @@ mod tests {
         format!("{}\n", serde_json::to_string(&record).unwrap())
     }
 
+    /// The key this sidecar and the service share, per agent.
+    const KEY: &str = "6b65792d6d6174657269616c";
+
     /// A state directory pointed at `stub`, plus the service secret key.
     fn state_dir(stub: &Stub, retry_ms: u64, capacity: usize) -> (TempDir, [u8; 32]) {
         let dir = TempDir::new().unwrap();
         let (secret, public) = envelope::generate_keypair();
         let config = format!(
-            r#"{{"base_url":"{}","service_public_key":"{}","retry_interval_ms":{retry_ms},"spool_capacity":{capacity}}}"#,
+            r#"{{"base_url":"{}","service_public_key":"{}","signing_keys":{{"writer":"{KEY}","auditor":"{KEY}"}},"retry_interval_ms":{retry_ms},"spool_capacity":{capacity}}}"#,
             stub.base_url,
             hex::encode(public)
         );
@@ -409,11 +490,15 @@ mod tests {
         (dir, secret)
     }
 
-    /// Starts [`serve`] in the background and waits for its socket to appear.
+    /// Loads the configuration the way a deployment does, then starts [`serve_with`] in the
+    /// background and waits for its socket to appear.
     async fn start(sockets: Vec<CallerSocket>, state: &Path) -> tokio::task::JoinHandle<()> {
+        let config = Config::load(state).expect("configuration");
+        let upstream = config.upstream().expect("upstream");
+        let limits = config.limits();
         let (owned, state) = (sockets.clone(), state.to_path_buf());
         let handle = tokio::spawn(async move {
-            serve(&owned, &state).await.unwrap();
+            serve_with(&owned, &state, &upstream, limits).await.unwrap();
         });
         // Connectability, not existence: a stale socket file from a previous run exists before
         // this sidecar has replaced it.
@@ -458,8 +543,17 @@ mod tests {
         let posted = stub.received();
         assert_eq!(posted.len(), 1);
         let opened = envelope::open(&secret, &posted[0]).unwrap();
-        let record: ActionRecord = serde_json::from_slice(&opened).unwrap();
-        assert_eq!(record.summary, "shipped it");
+        let request: yaam_contract::request::WriteRequest =
+            serde_json::from_slice(&opened).unwrap();
+        assert_eq!(request.record.summary, "shipped it");
+        // Signed as the socket's agent, with the key the service holds for it.
+        assert_eq!(
+            stub.header(0, yaam_contract::request::SIGNATURE_HEADER),
+            Some(
+                SigningKeys::new(hex::decode(KEY).unwrap())
+                    .sign("POST", "/records", "writer", &posted[0])
+            )
+        );
 
         serving.abort();
     }
@@ -693,16 +787,40 @@ mod tests {
         let path = dir.path().join("writer.sock");
         fs::write(&path, b"in the way").unwrap();
 
+        let config = Config::load(dir.path()).unwrap();
         let err = serve(
             &[CallerSocket {
                 agent: "writer".to_owned(),
                 path,
             }],
             dir.path(),
+            &config.upstream().unwrap(),
         )
         .await
         .expect_err("an ordinary file must not be removed");
         assert!(matches!(err, Error::Io(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_socket_the_sidecar_cannot_sign_for_is_refused_at_startup() {
+        let stub = Stub::start(200).await;
+        let (dir, _secret) = state_dir(&stub, 60_000, 8);
+        let config = Config::load(dir.path()).unwrap();
+        let path = dir.path().join("stranger.sock");
+
+        let err = serve(
+            &[CallerSocket {
+                agent: "stranger".to_owned(),
+                path: path.clone(),
+            }],
+            dir.path(),
+            &config.upstream().unwrap(),
+        )
+        .await
+        .expect_err("a socket with no credential must not be served");
+
+        assert!(err.to_string().contains("stranger"), "{err}");
+        assert!(!path.exists(), "the socket must not have been bound");
     }
 
     #[test]
@@ -720,6 +838,47 @@ mod tests {
         fs::write(dir.path().join(CONFIG_FILE), b"{not json").unwrap();
         let err = Config::load(dir.path()).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err}");
+    }
+
+    #[test]
+    fn a_configured_signing_key_reaches_the_credentials() {
+        let dir = TempDir::new().unwrap();
+        let public = envelope::generate_keypair().1;
+        fs::write(
+            dir.path().join(CONFIG_FILE),
+            format!(
+                r#"{{"base_url":"http://localhost:9","service_public_key":"{}","signing_keys":{{"writer":"{KEY}"}}}}"#,
+                hex::encode(public)
+            ),
+        )
+        .unwrap();
+
+        let upstream = Config::load(dir.path()).unwrap().upstream().unwrap();
+        assert_eq!(
+            upstream.credentials.keys("writer"),
+            Some(&SigningKeys::new(hex::decode(KEY).unwrap()))
+        );
+        assert!(upstream.credentials.keys("auditor").is_none());
+    }
+
+    #[test]
+    fn an_unusable_signing_key_fails_at_startup() {
+        let public = hex::encode(envelope::generate_keypair().1);
+        let config = Config {
+            base_url: "http://localhost:9".to_owned(),
+            service_public_key: public.clone(),
+            signing_keys: BTreeMap::from([("writer".to_owned(), "zz".to_owned())]),
+            retry_interval_ms: 1,
+            spool_capacity: 1,
+        };
+        assert!(config.upstream().is_err(), "a key that is not hex");
+
+        let empty = Config {
+            signing_keys: BTreeMap::from([("writer".to_owned(), String::new())]),
+            ..config
+        };
+        let err = empty.upstream().expect_err("an empty key signs nothing");
+        assert!(err.to_string().contains("writer"), "{err}");
     }
 
     #[test]
@@ -749,6 +908,7 @@ mod tests {
         let short = Config {
             base_url: "http://localhost:9".to_owned(),
             service_public_key: hex::encode([0u8; 8]),
+            signing_keys: BTreeMap::new(),
             retry_interval_ms: 1,
             spool_capacity: 1,
         };

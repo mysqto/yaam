@@ -8,12 +8,17 @@
 //! service needs to know which caller a queued record came from before it can unseal anything, and
 //! an agent name is a configured identity rather than anyone's data — unlike the record itself,
 //! which is sealed and stays that way for the whole time it sits on disk.
+//!
+//! What gets sealed is the service's own write-request shape rather than a bare record, so a
+//! spooled entry is the request the service will parse — the sidecar cannot reopen it later to
+//! reshape it, which is exactly why the shape has to be right when it is sealed.
 
 use std::io;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use yaam_contract::ActionRecord;
+use yaam_contract::request::WriteRequest;
 
 use crate::spool::Spool;
 use crate::upstream::Upstream;
@@ -49,8 +54,14 @@ impl Sidecar {
     pub(crate) async fn submit(&self, socket_agent: &str, line: &[u8]) -> crate::Result<()> {
         let record = parse(socket_agent, line)?;
         // Re-serialised from the parsed record, not forwarded verbatim: what the service unseals is
-        // then exactly what this sidecar validated, with no unknown fields riding along.
-        let body = serde_json::to_vec(&record)
+        // then exactly what this sidecar validated, with no unknown fields riding along. The body
+        // is left out so the service uses the record's own summary, which is the prose the caller
+        // sent.
+        let request = WriteRequest {
+            record: record.clone(),
+            body: None,
+        };
+        let body = serde_json::to_vec(&request)
             .map_err(|e| Error::Rejected(format!("unserialisable record: {e}")))?;
         let sealed = envelope::seal(&self.upstream.service_public_key, &body)?;
         let entry = frame(&record.agent, &sealed);
@@ -197,8 +208,29 @@ mod tests {
     use tempfile::TempDir;
     use yaam_contract::{DataClass, Outcome, RecordId, SchemaVer, Visibility};
 
+    use yaam_contract::request::SigningKeys;
+
     use super::*;
     use crate::stub::Stub;
+    use crate::upstream::Credentials;
+
+    /// The key this sidecar and the test service share.
+    const KEY: &[u8] = b"a-shared-signing-key";
+
+    /// Credentials for every agent the tests here post as.
+    fn credentials() -> Credentials {
+        Credentials::new()
+            .with("writer", SigningKeys::new(KEY))
+            .with("auditor", SigningKeys::new(KEY))
+    }
+
+    /// The record inside a sealed entry the service would have opened.
+    fn opened(secret: &[u8], sealed: &[u8]) -> ActionRecord {
+        let plain = envelope::open(secret, sealed).expect("the service opens it");
+        serde_json::from_slice::<WriteRequest>(&plain)
+            .expect("the shape the service parses")
+            .record
+    }
 
     /// A valid record attributed to `agent`, as a caller would write it.
     fn line(agent: &str, summary: &str) -> Vec<u8> {
@@ -235,6 +267,7 @@ mod tests {
         let upstream = Upstream {
             base_url,
             service_public_key: public.to_vec(),
+            credentials: credentials(),
         };
         (dir, secret, Sidecar::new(upstream, spool))
     }
@@ -255,9 +288,7 @@ mod tests {
             !posted[0].windows(10).any(|w| w == b"shipped it"),
             "the body went out in the clear"
         );
-        let opened = envelope::open(&secret, &posted[0]).unwrap();
-        let record: ActionRecord = serde_json::from_slice(&opened).unwrap();
-        assert_eq!(record.summary, "shipped it");
+        assert_eq!(opened(&secret, &posted[0]).summary, "shipped it");
         assert_eq!(sidecar.depth().await.unwrap(), 0);
     }
 
@@ -297,12 +328,7 @@ mod tests {
 
         let summaries: Vec<String> = stub.received()[before_recovery..]
             .iter()
-            .filter_map(|body| envelope::open(&secret, body).ok())
-            .map(|plain| {
-                serde_json::from_slice::<ActionRecord>(&plain)
-                    .unwrap()
-                    .summary
-            })
+            .map(|body| opened(&secret, body).summary)
             .collect();
         assert_eq!(summaries, ["record 0", "record 1", "record 2"]);
     }
@@ -329,12 +355,7 @@ mod tests {
 
         let summaries: Vec<String> = stub.received()[before_recovery..]
             .iter()
-            .filter_map(|body| envelope::open(&secret, body).ok())
-            .map(|plain| {
-                serde_json::from_slice::<ActionRecord>(&plain)
-                    .unwrap()
-                    .summary
-            })
+            .map(|body| opened(&secret, body).summary)
             .collect();
         assert_eq!(summaries, ["older", "newer"]);
     }
@@ -415,6 +436,7 @@ mod tests {
             Upstream {
                 base_url: "http://127.0.0.1:1".to_owned(),
                 service_public_key: vec![0u8; 3],
+                credentials: credentials(),
             },
             spool,
         );
@@ -437,6 +459,7 @@ mod tests {
             Upstream {
                 base_url: stub.base_url.clone(),
                 service_public_key: public.to_vec(),
+                credentials: credentials(),
             },
             spool,
         );

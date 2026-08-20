@@ -97,6 +97,13 @@ CREATE TABLE records (
     outcome        TEXT GENERATED ALWAYS AS (json_extract(frontmatter, '$.outcome')) STORED,
     agent          TEXT GENERATED ALWAYS AS (json_extract(frontmatter, '$.agent')) STORED,
     correlation_id TEXT GENERATED ALWAYS AS (json_extract(frontmatter, '$.correlation_id')) STORED,
+    -- Promoted for the same reason as the columns above, and needed by *every* read: what a caller
+    -- may see is decided per caller, and a predicate over inline JSON could not be one.
+    visibility     TEXT GENERATED ALWAYS AS (json_extract(frontmatter, '$.visibility')) STORED,
+    -- NULL unless visibility is 'team'. A team-scoped record without a team is rejected by the
+    -- contract, so NULL here can only mean the record is not team-scoped — and NULL matches no
+    -- team, which is the answer a scope test wants.
+    team           TEXT GENERATED ALWAYS AS (json_extract(frontmatter, '$.team')) STORED,
     sealed         INTEGER GENERATED ALWAYS AS
                    (json_extract(frontmatter, '$.data_class') = 'subject_derived') STORED
 ) STRICT;

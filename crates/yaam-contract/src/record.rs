@@ -38,6 +38,22 @@ pub enum Visibility {
     Operator,
 }
 
+impl Visibility {
+    /// How this level is spelled on the wire and in every derived copy.
+    ///
+    /// Needed because the index promotes visibility into a column and has to compare against the
+    /// same spelling the frontmatter carries; a second spelling would silently match nothing.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Team => "team",
+            Self::Org => "org",
+            Self::Operator => "operator",
+        }
+    }
+}
+
 /// Whether a record's body is erasable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -169,12 +185,12 @@ impl ActionRecord {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::entity::{self, EntityRef};
 
-    /// A minimal valid record: internal, org-visible, no subjects and no entities.
-    fn internal() -> ActionRecord {
+    /// A minimal valid record, for this crate's tests: internal, org-visible, no subjects.
+    pub(crate) fn internal_record() -> ActionRecord {
         ActionRecord {
             record_id: RecordId::generate(),
             schema_ver: SchemaVer(1),
@@ -218,12 +234,12 @@ mod tests {
 
     #[test]
     fn a_minimal_internal_record_is_valid() {
-        internal().validate().unwrap();
+        internal_record().validate().unwrap();
     }
 
     #[test]
     fn a_subject_derived_record_must_name_a_subject() {
-        let mut r = internal();
+        let mut r = internal_record();
         r.data_class = DataClass::SubjectDerived;
         assert!(r.validate().is_err());
 
@@ -233,7 +249,7 @@ mod tests {
 
     #[test]
     fn an_internal_record_must_name_none() {
-        let mut r = internal();
+        let mut r = internal_record();
         r.subjects.push(subject());
         let err = r
             .validate()
@@ -243,7 +259,7 @@ mod tests {
 
     #[test]
     fn team_visibility_requires_a_team() {
-        let mut r = internal();
+        let mut r = internal_record();
         r.visibility = Visibility::Team;
         assert!(r.validate().is_err());
 
@@ -258,7 +274,7 @@ mod tests {
     #[test]
     fn other_visibilities_need_no_team() {
         for visibility in [Visibility::Owner, Visibility::Org, Visibility::Operator] {
-            let mut r = internal();
+            let mut r = internal_record();
             r.visibility = visibility;
             r.validate().unwrap();
         }
@@ -267,7 +283,7 @@ mod tests {
     #[test]
     fn action_must_not_be_empty() {
         for action in ["", "   "] {
-            let mut r = internal();
+            let mut r = internal_record();
             r.action = action.to_owned();
             assert!(r.validate().is_err(), "{action:?} must be rejected");
         }
@@ -276,12 +292,12 @@ mod tests {
     #[test]
     fn confidence_must_be_a_probability() {
         for good in [0.0, 0.5, 1.0] {
-            let mut r = internal();
+            let mut r = internal_record();
             r.entities.push(entity_ref(good));
             r.validate().unwrap();
         }
         for bad in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
-            let mut r = internal();
+            let mut r = internal_record();
             r.entities.push(entity_ref(bad));
             let err = r.validate().expect_err("confidence out of range");
             assert!(err.to_string().contains("PROJ-42"), "{err}");
@@ -290,7 +306,7 @@ mod tests {
 
     #[test]
     fn every_entity_is_checked_not_just_the_first() {
-        let mut r = internal();
+        let mut r = internal_record();
         r.entities.push(entity_ref(1.0));
         r.entities.push(entity_ref(2.0));
         assert!(r.validate().is_err());
@@ -298,7 +314,7 @@ mod tests {
 
     #[test]
     fn a_record_survives_json() {
-        let mut r = internal();
+        let mut r = internal_record();
         r.data_class = DataClass::SubjectDerived;
         r.subjects.push(subject());
         r.subjects.push(SubjectRef {
@@ -325,6 +341,20 @@ mod tests {
         assert!(json.contains(r#""data_class":"subject_derived""#), "{json}");
         assert!(json.contains(r#""visibility":"team""#), "{json}");
         assert!(json.contains(r#""role":"principal""#), "{json}");
+    }
+
+    #[test]
+    fn a_visibility_spells_itself_the_way_it_serialises() {
+        // The index compares a column against `as_str`, and that column holds the serialised form.
+        for visibility in [
+            Visibility::Owner,
+            Visibility::Team,
+            Visibility::Org,
+            Visibility::Operator,
+        ] {
+            let json = serde_json::to_string(&visibility).unwrap();
+            assert_eq!(json, format!("\"{}\"", visibility.as_str()));
+        }
     }
 
     #[test]

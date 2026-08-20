@@ -3,30 +3,24 @@
 //! Every request carries a signature, reads included: what a caller may see is decided per caller,
 //! and an anonymous request has no caller to decide about.
 //!
-//! The signature is HMAC-SHA256 over the agent header and the exact body bytes, and both the
-//! current and the previous key are accepted so a key roll needs no synchronised restart. The
-//! comparison is constant-time — a byte-by-byte check that returns on the first mismatch hands an
-//! attacker the tag one byte at a time.
+//! What a signature covers, and how it is compared, is [`yaam_contract::request`] — shared with
+//! everything that signs, because a service and a sidecar that spell the canonical message
+//! differently cannot talk while each passes its own tests. Both the current and the previous key
+//! are accepted, so a key roll needs no synchronised restart.
 //!
-//! Replay is not defended against here, which is a decision rather than an omission: writes are
-//! idempotent on the record id and reads mutate nothing, so replaying a captured message gains an
-//! attacker nothing that the captured response did not already give them. Keeping the message
-//! secret in flight is the transport's job.
+//! The keyring is an argument, never process state. A test — and a process serving more than one
+//! deployment — has to be able to say which callers it authenticates, and ambient state cannot be
+//! asked that at the call site.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use axum::http::HeaderMap;
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
+use yaam_contract::Visibility;
+use yaam_store::query::Scope;
 
 use crate::{Error, Result};
 
-/// Header naming the agent a request is signed as.
-pub const AGENT_HEADER: &str = "x-yaam-agent";
-/// Header carrying the hex-encoded signature.
-pub const SIGNATURE_HEADER: &str = "x-yaam-signature";
+pub use yaam_contract::request::{AGENT_HEADER, SIGNATURE_HEADER, SigningKeys, sign};
 
 /// A verified caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +29,32 @@ pub struct Caller {
     pub agent: String,
     /// What the caller is allowed to do.
     pub role: Role,
+    /// Teams whose team-visible records this caller may read.
+    pub teams: Vec<String>,
+}
+
+impl Caller {
+    /// What this caller may read.
+    ///
+    /// Org-visible records for anyone the service authenticated; team-visible records only for the
+    /// teams the credential names; owner-visible records only where this caller is the record's own
+    /// agent; operator-visible records — the audit trail — only for the operator role.
+    ///
+    /// An operator's extra reach is that last level, not other teams'. Team membership is the same
+    /// predicate for every role, and a read that has to see everything is a maintenance read
+    /// ([`Scope::Unrestricted`]), not a caller with a wide badge.
+    #[must_use]
+    pub fn scope(&self) -> Scope {
+        let mut visibility = vec![Visibility::Org, Visibility::Team, Visibility::Owner];
+        if self.role.covers(Role::Operator) {
+            visibility.push(Visibility::Operator);
+        }
+        Scope::Caller {
+            visibility,
+            agent: self.agent.clone(),
+            teams: self.teams.clone(),
+        }
+    }
 }
 
 /// Capability level.
@@ -65,39 +85,45 @@ impl Role {
     }
 }
 
-/// One caller's signing material and capability.
+/// One caller's signing material, capability and read scope.
 ///
-/// Two keys, not one. During a roll the caller and the service pick up the new key at different
-/// moments, and a service that knows only the current key rejects every request signed with the old
-/// one until both sides restart together.
+/// The key material is [`SigningKeys`], the same type a sidecar holds, so the two sides of a
+/// deployment cannot describe one credential differently.
 #[derive(Debug, Clone)]
 pub struct Credential {
     /// Agent identity this credential authenticates.
     pub agent: String,
     /// What that agent may do.
     pub role: Role,
-    /// Key signatures are expected under.
-    pub current_key: Vec<u8>,
-    /// Key retired by the most recent roll, still accepted. `None` before the first roll.
-    pub previous_key: Option<Vec<u8>>,
+    /// Keys signatures are accepted under.
+    pub keys: SigningKeys,
+    /// Teams this agent belongs to. Empty means it reads no team's records.
+    pub teams: Vec<String>,
 }
 
 impl Credential {
-    /// A credential with no retired key.
+    /// A credential with no retired key and no team.
     #[must_use]
     pub fn new(agent: impl Into<String>, role: Role, current_key: impl Into<Vec<u8>>) -> Self {
         Self {
             agent: agent.into(),
             role,
-            current_key: current_key.into(),
-            previous_key: None,
+            keys: SigningKeys::new(current_key),
+            teams: Vec::new(),
         }
     }
 
     /// Records the key this credential rolled away from.
     #[must_use]
     pub fn rolled_from(mut self, previous_key: impl Into<Vec<u8>>) -> Self {
-        self.previous_key = Some(previous_key.into());
+        self.keys = self.keys.rolled_from(previous_key);
+        self
+    }
+
+    /// Names the teams this agent belongs to.
+    #[must_use]
+    pub fn in_teams<T: Into<String>>(mut self, teams: impl IntoIterator<Item = T>) -> Self {
+        self.teams = teams.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -129,48 +155,17 @@ impl Keyring {
     }
 }
 
-/// The keyring [`verify`] resolves against. Empty until installed, so a process nobody configured
-/// authenticates nobody rather than authenticating everybody.
-static INSTALLED: LazyLock<RwLock<Arc<Keyring>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(Keyring::new())));
-
-/// Installs the keyring [`verify`] resolves against, replacing whatever was there.
-///
-/// Replaceable rather than write-once so a rotation can be loaded into a running process. Together
-/// with [`Credential::previous_key`], that is what makes a roll a reload instead of a restart.
-pub fn install_keyring(keyring: Keyring) {
-    let mut slot = INSTALLED.write().unwrap_or_else(PoisonError::into_inner);
-    *slot = Arc::new(keyring);
-}
-
-/// The installed keyring.
-#[must_use]
-pub fn installed_keyring() -> Arc<Keyring> {
-    INSTALLED
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-}
-
-/// Signs a request the way [`verify`] checks it.
-///
-/// Public because the signing side has to agree byte for byte with the checking side, and two
-/// independent spellings of the same canonical message is how that agreement gets lost.
-#[must_use]
-pub fn sign(key: &[u8], agent: &str, body: &[u8]) -> String {
-    hex::encode(tag(key, agent, body))
-}
-
 /// Verifies a signature over the request and resolves the caller.
-pub fn verify(headers: &HeaderMap, body: &[u8]) -> Result<Caller> {
-    verify_with(&installed_keyring(), headers, body)
-}
-
-/// Verifies against an explicit keyring.
 ///
-/// The keyring is a parameter here and ambient in [`verify`]: a test — and a process serving more
-/// than one keyring — needs to say which one, and the signature [`verify`] is fixed at cannot.
-pub fn verify_with(keyring: &Keyring, headers: &HeaderMap, body: &[u8]) -> Result<Caller> {
+/// `method` and `path` are the request's own, query string included: they are in the signature, so a
+/// captured signature cannot be lifted onto another endpoint or another set of filters.
+pub fn verify(
+    keyring: &Keyring,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Caller> {
     let agent = header(headers, AGENT_HEADER)?;
     // A malformed signature is reported exactly like a wrong one: telling the two apart tells a
     // prober whether it got the encoding right.
@@ -178,17 +173,11 @@ pub fn verify_with(keyring: &Keyring, headers: &HeaderMap, body: &[u8]) -> Resul
         hex::decode(header(headers, SIGNATURE_HEADER)?).map_err(|_| Error::Unauthenticated)?;
     let credential = keyring.credential(agent).ok_or(Error::Unauthenticated)?;
 
-    let current = matches(&credential.current_key, agent, body, &offered);
-    let previous = credential
-        .previous_key
-        .as_deref()
-        .is_some_and(|key| matches(key, agent, body, &offered));
-    // Non-short-circuiting: both keys are checked whichever one matched, so a request signed with
-    // the retired key takes no longer than one signed with the current key.
-    if current | previous {
+    if credential.keys.matches(method, path, agent, body, &offered) {
         Ok(Caller {
             agent: credential.agent.clone(),
             role: credential.role,
+            teams: credential.teams.clone(),
         })
     } else {
         Err(Error::Unauthenticated)
@@ -228,24 +217,6 @@ pub fn require_role(caller: &Caller, needed: Role) -> Result<()> {
     }
 }
 
-/// The canonical message: agent, a separator, then the body exactly as it arrived.
-///
-/// A header value cannot contain a newline, so the separator cannot be smuggled into an agent name
-/// to make two different requests sign the same.
-fn tag(key: &[u8], agent: &str, body: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .expect("hmac takes a key of any length, so this cannot fail");
-    mac.update(agent.as_bytes());
-    mac.update(b"\n");
-    mac.update(body);
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// Constant-time tag comparison.
-fn matches(key: &[u8], agent: &str, body: &[u8], offered: &[u8]) -> bool {
-    tag(key, agent, body).ct_eq(offered).into()
-}
-
 /// Reads a header as text, treating anything missing or non-ASCII as unauthenticated.
 fn header<'h>(headers: &'h HeaderMap, name: &str) -> Result<&'h str> {
     headers
@@ -263,10 +234,11 @@ mod tests {
     const CURRENT: &[u8] = b"current-signing-key";
     const RETIRED: &[u8] = b"retired-signing-key";
     const BODY: &[u8] = b"{\"action\":\"deploy\"}";
+    const PATH: &str = "/records";
 
     fn keyring() -> Keyring {
         Keyring::new()
-            .with(Credential::new("agent-reader", Role::Reader, CURRENT))
+            .with(Credential::new("agent-reader", Role::Reader, CURRENT).in_teams(["platform"]))
             .with(Credential::new("agent-writer", Role::Writer, CURRENT).rolled_from(RETIRED))
     }
 
@@ -278,17 +250,23 @@ mod tests {
     }
 
     fn signed(agent: &str, key: &[u8], body: &[u8]) -> HeaderMap {
-        headers(agent, &sign(key, agent, body))
+        headers(agent, &sign(key, "POST", PATH, agent, body))
+    }
+
+    /// Verifies a `POST /records`, which is what all but the path test is about.
+    fn check(keyring: &Keyring, headers: &HeaderMap, body: &[u8]) -> Result<Caller> {
+        verify(keyring, "POST", PATH, headers, body)
     }
 
     #[test]
     fn a_valid_signature_authenticates() {
-        let caller = verify_with(&keyring(), &signed("agent-writer", CURRENT, BODY), BODY).unwrap();
+        let caller = check(&keyring(), &signed("agent-writer", CURRENT, BODY), BODY).unwrap();
         assert_eq!(
             caller,
             Caller {
                 agent: "agent-writer".to_owned(),
-                role: Role::Writer
+                role: Role::Writer,
+                teams: Vec::new(),
             }
         );
     }
@@ -296,13 +274,13 @@ mod tests {
     #[test]
     fn the_retired_key_still_verifies() {
         // The point of the second key: a caller that has not yet picked up the roll keeps working.
-        let caller = verify_with(&keyring(), &signed("agent-writer", RETIRED, BODY), BODY).unwrap();
+        let caller = check(&keyring(), &signed("agent-writer", RETIRED, BODY), BODY).unwrap();
         assert_eq!(caller.role, Role::Writer);
 
         // A key that was never configured does not verify, retired or otherwise.
         let stranger = signed("agent-writer", b"never-configured", BODY);
         assert!(matches!(
-            verify_with(&keyring(), &stranger, BODY),
+            check(&keyring(), &stranger, BODY),
             Err(Error::Unauthenticated)
         ));
     }
@@ -311,7 +289,7 @@ mod tests {
     fn a_credential_without_a_roll_has_nothing_to_fall_back_on() {
         let headers = signed("agent-reader", RETIRED, BODY);
         assert!(matches!(
-            verify_with(&keyring(), &headers, BODY),
+            check(&keyring(), &headers, BODY),
             Err(Error::Unauthenticated)
         ));
     }
@@ -320,17 +298,17 @@ mod tests {
     fn a_tampered_body_fails() {
         let headers = signed("agent-writer", CURRENT, BODY);
         assert!(matches!(
-            verify_with(&keyring(), &headers, b"{\"action\":\"erase\"}"),
+            check(&keyring(), &headers, b"{\"action\":\"erase\"}"),
             Err(Error::Unauthenticated)
         ));
     }
 
     #[test]
     fn a_tampered_signature_fails() {
-        let mut signature = sign(CURRENT, "agent-writer", BODY);
+        let mut signature = sign(CURRENT, "POST", PATH, "agent-writer", BODY);
         signature.replace_range(0..1, if signature.starts_with('a') { "b" } else { "a" });
         assert!(matches!(
-            verify_with(&keyring(), &headers("agent-writer", &signature), BODY),
+            check(&keyring(), &headers("agent-writer", &signature), BODY),
             Err(Error::Unauthenticated)
         ));
     }
@@ -339,16 +317,16 @@ mod tests {
     fn a_signature_that_is_not_hex_fails() {
         let headers = headers("agent-writer", "not-a-hex-tag");
         assert!(matches!(
-            verify_with(&keyring(), &headers, BODY),
+            check(&keyring(), &headers, BODY),
             Err(Error::Unauthenticated)
         ));
     }
 
     #[test]
     fn a_signature_of_the_wrong_length_fails() {
-        let truncated = sign(CURRENT, "agent-writer", BODY)[..16].to_owned();
+        let truncated = sign(CURRENT, "POST", PATH, "agent-writer", BODY)[..16].to_owned();
         assert!(matches!(
-            verify_with(&keyring(), &headers("agent-writer", &truncated), BODY),
+            check(&keyring(), &headers("agent-writer", &truncated), BODY),
             Err(Error::Unauthenticated)
         ));
     }
@@ -365,7 +343,7 @@ mod tests {
 
         for headers in [HeaderMap::new(), without_signature, without_agent] {
             assert!(matches!(
-                verify_with(&ring, &headers, BODY),
+                check(&ring, &headers, BODY),
                 Err(Error::Unauthenticated)
             ));
         }
@@ -375,7 +353,7 @@ mod tests {
     fn an_unknown_agent_fails() {
         let headers = signed("agent-nobody", CURRENT, BODY);
         assert!(matches!(
-            verify_with(&keyring(), &headers, BODY),
+            check(&keyring(), &headers, BODY),
             Err(Error::Unauthenticated)
         ));
     }
@@ -385,34 +363,62 @@ mod tests {
         let mut headers = signed("agent-writer", CURRENT, BODY);
         headers.insert(AGENT_HEADER, HeaderValue::from_bytes(b"\xff").unwrap());
         assert!(matches!(
-            verify_with(&keyring(), &headers, BODY),
+            check(&keyring(), &headers, BODY),
             Err(Error::Unauthenticated)
         ));
     }
 
     #[test]
-    fn signing_binds_the_agent_and_the_body() {
-        assert_ne!(
-            sign(CURRENT, "agent-writer", BODY),
-            sign(CURRENT, "agent-reader", BODY),
-            "a signature must not transfer between agents"
-        );
-        assert_ne!(
-            sign(CURRENT, "agent-writer", BODY),
-            sign(CURRENT, "agent-writer", b"other"),
-            "a signature must not transfer between bodies"
-        );
-    }
-
-    #[test]
-    fn an_agent_the_installed_keyring_does_not_know_is_refused() {
-        // `verify` reads process state, so this asserts only what every deployment relies on: the
-        // ambient path resolves a keyring and refuses a caller that is not in it.
-        let headers = signed("agent-not-installed-anywhere", CURRENT, BODY);
+    fn a_signature_valid_for_one_request_target_is_refused_on_another() {
+        let headers = signed("agent-writer", CURRENT, BODY);
+        // Same body, same agent, same key — a different endpoint. Replaying it must fail.
         assert!(matches!(
-            verify(&headers, BODY),
+            verify(&keyring(), "POST", "/erase", &headers, BODY),
             Err(Error::Unauthenticated)
         ));
+        // And the same endpoint reached with a different method, or different filters.
+        assert!(matches!(
+            verify(&keyring(), "GET", PATH, &headers, BODY),
+            Err(Error::Unauthenticated)
+        ));
+        assert!(matches!(
+            verify(&keyring(), "POST", "/records?limit=1", &headers, BODY),
+            Err(Error::Unauthenticated)
+        ));
+    }
+
+    #[test]
+    fn a_readers_scope_is_its_own_teams_and_never_the_audit_trail() {
+        let caller = check(&keyring(), &signed("agent-reader", CURRENT, BODY), BODY).unwrap();
+        assert_eq!(caller.teams, ["platform"]);
+
+        let Scope::Caller {
+            visibility,
+            agent,
+            teams,
+        } = caller.scope()
+        else {
+            panic!("a verified caller reads under its own scope");
+        };
+        assert_eq!(agent, "agent-reader");
+        assert_eq!(teams, ["platform"]);
+        assert!(!visibility.contains(&Visibility::Operator));
+        for level in [Visibility::Org, Visibility::Team, Visibility::Owner] {
+            assert!(visibility.contains(&level), "{level:?}");
+        }
+    }
+
+    #[test]
+    fn only_an_operator_reads_the_audit_trail() {
+        let operator = Caller {
+            agent: "agent-operator".to_owned(),
+            role: Role::Operator,
+            teams: vec!["platform".to_owned()],
+        };
+        let Scope::Caller { visibility, .. } = operator.scope() else {
+            panic!("an operator reads under its own scope too");
+        };
+        assert!(visibility.contains(&Visibility::Operator));
     }
 
     #[test]
@@ -420,6 +426,7 @@ mod tests {
         let writer = Caller {
             agent: "agent-writer".to_owned(),
             role: Role::Writer,
+            teams: Vec::new(),
         };
         assert!(authorise_write(&writer, "agent-writer").is_ok());
 
@@ -432,6 +439,7 @@ mod tests {
         let reader = Caller {
             agent: "agent-reader".to_owned(),
             role: Role::Reader,
+            teams: Vec::new(),
         };
         assert!(matches!(
             authorise_write(&reader, "agent-reader"),
@@ -453,6 +461,7 @@ mod tests {
         let writer = Caller {
             agent: "agent-writer".to_owned(),
             role: Role::Writer,
+            teams: Vec::new(),
         };
         assert!(require_role(&writer, Role::Writer).is_ok());
         let Err(Error::Forbidden(message)) = require_role(&writer, Role::Operator) else {
@@ -464,7 +473,7 @@ mod tests {
     #[test]
     fn a_later_credential_replaces_an_earlier_one_for_the_same_agent() {
         let ring = keyring().with(Credential::new("agent-writer", Role::Operator, RETIRED));
-        let caller = verify_with(&ring, &signed("agent-writer", RETIRED, BODY), BODY).unwrap();
+        let caller = check(&ring, &signed("agent-writer", RETIRED, BODY), BODY).unwrap();
         assert_eq!(caller.role, Role::Operator);
     }
 }

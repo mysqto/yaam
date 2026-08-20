@@ -4,11 +4,12 @@
 //! route added later is signed by default. It covers the fallback too: an unmatched path must not
 //! be a way to reach the service unsigned.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -17,11 +18,14 @@ use serde::{Deserialize, Serialize};
 use yaam_contract::{RecordId, SubjectHash};
 use yaam_core::bundle;
 use yaam_core::pipeline::Accepted;
+use yaam_crypto::envelope;
 use yaam_store::query::{Filter, Window};
 
 use crate::auth::{self, Caller, Keyring, Role};
-use crate::service::{self, Service};
+use crate::service::Service;
 use crate::{Error, Result};
+
+pub use yaam_contract::request::WriteRequest;
 
 /// Largest request body the service will buffer.
 ///
@@ -44,51 +48,78 @@ const DEFAULT_MIN_CONFIDENCE: f32 = 0.0;
 const RETAINED: &str = "frontmatter, attributes, entity references and timelines are retained";
 
 /// What every handler needs.
+///
+/// Passed in, never resolved from process state: a router that reached for an ambient keyring or
+/// service could not be pointed at two deployments in one process, and a request whose
+/// configuration is invisible at the call site is one nobody can check.
 #[derive(Clone, Debug)]
 pub struct AppState {
-    /// `None` resolves the process-wide installation once per request, so a keyring reloaded during
-    /// a key roll reaches a router that is already serving.
-    fixed: Option<Fixed>,
-}
-
-/// An explicitly supplied keyring and service.
-#[derive(Clone, Debug)]
-struct Fixed {
+    /// Callers this service authenticates.
     keyring: Arc<Keyring>,
+    /// What answers the requests.
     service: Arc<dyn Service>,
+    /// Secret half of the key sidecars seal to. `None` refuses a sealed body rather than guessing
+    /// at it.
+    unseal_key: Option<Arc<Vec<u8>>>,
 }
 
 impl AppState {
-    /// State that follows the process-wide installation.
+    /// State bound to one keyring and one service.
     #[must_use]
-    pub fn installed() -> Self {
-        Self { fixed: None }
-    }
-
-    /// State bound to one keyring and service, for a test or an embedded deployment.
-    #[must_use]
-    pub fn fixed(keyring: Arc<Keyring>, service: Arc<dyn Service>) -> Self {
+    pub fn new(keyring: Arc<Keyring>, service: Arc<dyn Service>) -> Self {
         Self {
-            fixed: Some(Fixed { keyring, service }),
+            keyring,
+            service,
+            unseal_key: None,
         }
     }
 
+    /// Adds the secret half of the key sidecars seal to.
+    ///
+    /// Without it this service accepts plain JSON only. A sidecar seals to the public half before it
+    /// writes the same bytes to its own spool — it can neither read nor reshape what it queued — so
+    /// this is the half that lets the service read a record at all.
+    #[must_use]
+    pub fn unsealing_with(mut self, secret_key: impl Into<Vec<u8>>) -> Self {
+        self.unseal_key = Some(Arc::new(secret_key.into()));
+        self
+    }
+
     /// The keyring this request authenticates against.
-    fn keyring(&self) -> Arc<Keyring> {
-        self.fixed
-            .as_ref()
-            .map_or_else(auth::installed_keyring, |fixed| Arc::clone(&fixed.keyring))
+    fn keyring(&self) -> &Keyring {
+        &self.keyring
     }
 
     /// The service this request is answered from.
     fn service(&self) -> Arc<dyn Service> {
-        self.fixed
-            .as_ref()
-            .map_or_else(service::installed, |fixed| Arc::clone(&fixed.service))
+        Arc::clone(&self.service)
+    }
+
+    /// The request body, opened if it arrived sealed.
+    ///
+    /// A body that will not open is reported as transient, which is the direction that keeps
+    /// history: the bytes are unreadable here, so the service cannot tell a corrupt envelope from a
+    /// service configured with the wrong key — and a permanent refusal would have every sidecar
+    /// discard perfectly good records over an operator's mistake. A wedged spool is visible and
+    /// recoverable; a dropped record is neither.
+    fn opened<'b>(&self, headers: &HeaderMap, body: &'b [u8]) -> Result<Cow<'b, [u8]>> {
+        let sealed = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with(envelope::CONTENT_TYPE));
+        if !sealed {
+            return Ok(Cow::Borrowed(body));
+        }
+        let key = self.unseal_key.as_ref().ok_or_else(|| {
+            Error::Unavailable("this service holds no key for sealed bodies".to_owned())
+        })?;
+        envelope::open(key, body)
+            .map(Cow::Owned)
+            .map_err(|error| Error::Unavailable(format!("sealed body would not open: {error}")))
     }
 }
 
-/// Builds the router.
+/// Builds the router over its state.
 ///
 /// | Route | Purpose |
 /// |---|---|
@@ -97,16 +128,11 @@ impl AppState {
 /// | `GET /entities/{kind}/{id}` | Everything about one entity. |
 /// | `GET /bundle` | Compose context for a request. |
 /// | `POST /erase` | Destroy a subject's keys. Operator only. |
-pub fn router() -> Router {
-    router_with(AppState::installed())
-}
-
-/// Builds the router over explicit state.
 ///
 /// There is deliberately no reindex route. A rebuild walks the whole tree, and an endpoint would
 /// make that reachable by request — so it stays a command-line operation, which keeps "the index is
 /// derived" something an operator asserts rather than something a caller can trigger.
-pub fn router_with(state: AppState) -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/records", post(write_record).get(query_records))
         .route("/entities/{kind}/{id}", get(entity_records))
@@ -114,18 +140,6 @@ pub fn router_with(state: AppState) -> Router {
         .route("/erase", post(erase_subject))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
-}
-
-/// A record and the prose stored as its body.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WriteRequest {
-    /// The record itself.
-    pub record: yaam_contract::ActionRecord,
-    /// Body to store. Defaults to the record's summary, which is the prose that becomes the body
-    /// when the caller has nothing longer to add.
-    #[serde(default)]
-    pub body: Option<String>,
 }
 
 /// What a write did.
@@ -203,6 +217,8 @@ impl RecordQuery {
                 ));
             }
         };
+        // The scope is deliberately not a query parameter: what a caller may see comes from the
+        // credential the signature proved, and is filled in from it below.
         Ok(Filter {
             action: self.action,
             outcome: self.outcome,
@@ -210,6 +226,7 @@ impl RecordQuery {
             attr,
             window,
             limit: self.limit,
+            ..Filter::default()
         })
     }
 }
@@ -248,6 +265,7 @@ impl BundleQuery {
             entities,
             actor: self.actor,
             deadline_ms: self.deadline_ms.unwrap_or(DEFAULT_DEADLINE_MS),
+            ..bundle::Request::default()
         })
     }
 }
@@ -306,7 +324,19 @@ async fn authenticate(
                 "body unreadable or larger than {MAX_BODY_BYTES} bytes"
             ))
         })?;
-    let caller = auth::verify_with(&state.keyring(), &parts.headers, &bytes)?;
+    // The request target as it arrived, query string and all: it is in the signature, so a captured
+    // read cannot be replayed with different filters.
+    let target = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_owned(), ToString::to_string);
+    let caller = auth::verify(
+        state.keyring(),
+        parts.method.as_str(),
+        &target,
+        &parts.headers,
+        &bytes,
+    )?;
     let mut request = Request::from_parts(parts, Body::from(bytes));
     request.extensions_mut().insert(caller);
     Ok(next.run(request).await)
@@ -316,9 +346,10 @@ async fn authenticate(
 async fn write_record(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<WriteResponse>)> {
-    let request: WriteRequest = decode(&body)?;
+    let request: WriteRequest = decode(&state.opened(&headers, &body)?)?;
     auth::authorise_write(&caller, &request.record.agent)?;
     // Validated before the record reaches the pipeline, so the caller is told what is wrong with
     // its record rather than which layer noticed.
@@ -444,6 +475,29 @@ mod tests {
     use crate::auth::{AGENT_HEADER, Credential, SIGNATURE_HEADER};
     use crate::testing::{self, Fake};
 
+    /// The service secret a sidecar's envelopes are sealed to, fixed so a test needs no fixture.
+    const SERVICE_SECRET: &[u8; 32] = &[7u8; 32];
+
+    /// Public half of [`SERVICE_SECRET`], derived rather than written down twice.
+    fn service_public() -> [u8; 32] {
+        envelope::public_key(SERVICE_SECRET).expect("a 32-byte secret")
+    }
+
+    /// A signed `POST /records` carrying a sealed body, as a sidecar sends it.
+    fn sealed_post(agent: &str, sealed: &[u8]) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/records")
+            .header(header::CONTENT_TYPE, envelope::CONTENT_TYPE)
+            .header(AGENT_HEADER, agent)
+            .header(
+                SIGNATURE_HEADER,
+                auth::sign(KEY, "POST", "/records", agent, sealed),
+            )
+            .body(Body::from(sealed.to_vec()))
+            .unwrap()
+    }
+
     const KEY: &[u8] = b"a-signing-key";
     const READER: &str = "agent-reader";
     const WRITER: &str = "agent-writer";
@@ -457,32 +511,37 @@ mod tests {
     }
 
     fn app(fake: &Arc<Fake>) -> Router {
-        router_with(AppState::fixed(
-            Arc::new(keyring()),
-            Arc::clone(fake) as Arc<dyn Service>,
-        ))
+        router(state(fake))
+    }
+
+    /// State over a fake service, able to open what a sidecar seals.
+    fn state(fake: &Arc<Fake>) -> AppState {
+        AppState::new(Arc::new(keyring()), Arc::clone(fake) as Arc<dyn Service>)
+            .unsealing_with(SERVICE_SECRET.to_vec())
     }
 
     /// A request signed by `agent`, or unsigned when `agent` is `None`.
-    fn request(method: Method, uri: &str, agent: Option<&str>, body: &str) -> Request<Body> {
+    fn request(method: &Method, uri: &str, agent: Option<&str>, body: &str) -> Request<Body> {
+        let method_name = method.as_str();
         let mut builder = Request::builder()
-            .method(method)
+            .method(method.clone())
             .uri(uri)
             .header(header::CONTENT_TYPE, "application/json");
         if let Some(agent) = agent {
-            builder = builder
-                .header(AGENT_HEADER, agent)
-                .header(SIGNATURE_HEADER, auth::sign(KEY, agent, body.as_bytes()));
+            builder = builder.header(AGENT_HEADER, agent).header(
+                SIGNATURE_HEADER,
+                auth::sign(KEY, method_name, uri, agent, body.as_bytes()),
+            );
         }
         builder.body(Body::from(body.to_owned())).unwrap()
     }
 
     fn get(uri: &str, agent: Option<&str>) -> Request<Body> {
-        request(Method::GET, uri, agent, "")
+        request(&Method::GET, uri, agent, "")
     }
 
     fn post(uri: &str, agent: Option<&str>, body: &str) -> Request<Body> {
-        request(Method::POST, uri, agent, body)
+        request(&Method::POST, uri, agent, body)
     }
 
     async fn serve(fake: &Arc<Fake>, request: Request<Body>) -> (StatusCode, serde_json::Value) {
@@ -834,24 +893,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_ambient_router_serves_the_installed_keyring_and_service() {
-        let fake = Arc::new(Fake::new().holding(vec![RecordId::generate()]));
-        auth::install_keyring(keyring());
-        service::install(Arc::clone(&fake) as Arc<dyn Service>);
-
-        let signed = router()
-            .oneshot(get("/records", Some(READER)))
-            .await
+    async fn a_signature_for_one_endpoint_is_refused_on_another() {
+        let fake = Arc::new(Fake::new());
+        let body = write_body(WRITER);
+        // Captured from a write, replayed at erasure: same agent, same key, same body.
+        let stolen = auth::sign(KEY, "POST", "/records", WRITER, body.as_bytes());
+        let replayed = Request::builder()
+            .method(Method::POST)
+            .uri("/erase")
+            .header(AGENT_HEADER, WRITER)
+            .header(SIGNATURE_HEADER, stolen)
+            .body(Body::from(body))
             .unwrap();
-        assert_eq!(signed.status(), StatusCode::OK);
 
-        let unsigned = router().oneshot(get("/records", None)).await.unwrap();
-        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+        let (status, _) = serve(&fake, replayed).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(fake.calls().is_empty());
+    }
 
-        let missing = router()
-            .oneshot(get("/reindex", Some(OPERATOR)))
-            .await
+    #[tokio::test]
+    async fn a_query_signature_cannot_be_replayed_with_other_filters() {
+        let fake = Arc::new(Fake::new());
+        let signed = get("/records?agent=agent-writer", Some(READER));
+        let signature = signed
+            .headers()
+            .get(SIGNATURE_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let widened = Request::builder()
+            .method(Method::GET)
+            .uri("/records")
+            .header(AGENT_HEADER, READER)
+            .header(SIGNATURE_HEADER, signature)
+            .body(Body::empty())
             .unwrap();
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let (status, _) = serve(&fake, widened).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a read's filters are its meaning, so they are signed too"
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sealed_write_is_opened_and_stored() {
+        let fake = Arc::new(Fake::new());
+        let sealed = envelope::seal(&service_public(), write_body(WRITER).as_bytes()).unwrap();
+        let (status, body) = serve(&fake, sealed_post(WRITER, &sealed)).await;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["status"], "stored");
+        assert!(fake.calls()[0].starts_with("write agent-writer agent-writer"));
+    }
+
+    #[tokio::test]
+    async fn a_sealed_body_this_service_cannot_open_is_transient() {
+        let fake = Arc::new(Fake::new());
+        let sealed = envelope::seal(&service_public(), write_body(WRITER).as_bytes()).unwrap();
+
+        // A service with no key at all, and a body sealed to somebody else's: neither says the
+        // record is bad, so neither may tell a sidecar to throw it away.
+        let keyless = router(AppState::new(
+            Arc::new(keyring()),
+            Arc::clone(&fake) as Arc<dyn Service>,
+        ));
+        let response = keyless.oneshot(sealed_post(WRITER, &sealed)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let elsewhere = envelope::seal(&envelope::generate_keypair().1, b"{}").unwrap();
+        let (status, _) = serve(&fake, sealed_post(WRITER, &elsewhere)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(fake.calls().is_empty());
     }
 }

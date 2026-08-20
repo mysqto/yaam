@@ -6,8 +6,10 @@
 //!
 //! Plain HTTP, no TLS stack. The body is already sealed to the service's public key before it
 //! reaches this module, so transport encryption is not what keeps it confidential — and a sidecar
-//! that cannot read what it posts has nothing left to leak to the network.
+//! that cannot read what it posts has nothing left to leak to the network. The *signature* is what
+//! makes the service willing to accept it, and it covers method, path, agent and the sealed bytes.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,6 +17,8 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, StatusCode, Uri, header};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
+use yaam_contract::request::{AGENT_HEADER, SIGNATURE_HEADER, SigningKeys};
+use yaam_crypto::envelope;
 
 use crate::Error;
 
@@ -24,8 +28,8 @@ use crate::Error;
 /// timeout is part of the retry design rather than a safety net.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Header carrying the agent a record is attributed to.
-const AGENT_HEADER: &str = "x-yaam-agent";
+/// Path a record is posted to. Part of what a signature covers, so it is one constant.
+const RECORDS_PATH: &str = "/records";
 
 /// Bytes of an error response quoted back to the caller.
 const REASON_LIMIT: usize = 200;
@@ -35,31 +39,60 @@ const REASON_LIMIT: usize = 200;
 pub struct Upstream {
     /// Base URL.
     pub base_url: String,
-    /// Public key the sidecar seals spool entries to.
+    /// Public key the sidecar seals records to.
     ///
     /// Asymmetric on purpose: the sidecar can seal but never unseal, so holding this key grants no
-    /// read access to anything already stored.
+    /// read access to anything already stored — on its own spool or at the service.
     pub service_public_key: Vec<u8>,
+    /// Signing material, one entry per caller identity this sidecar posts as.
+    pub credentials: Credentials,
+}
+
+/// The signing material a sidecar holds.
+///
+/// One entry per agent, keyed the way the service's keyring is keyed, and holding the same
+/// [`SigningKeys`] the service verifies against — the sidecar signs with `current`, and which key
+/// the service will still accept is the service's business. Sharing the type is what stops the two
+/// sides drifting; a sidecar-local notion of "the key" is how they drifted before.
+#[derive(Debug, Clone, Default)]
+pub struct Credentials {
+    by_agent: BTreeMap<String, SigningKeys>,
+}
+
+impl Credentials {
+    /// Credentials for nobody, which signs for nobody.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds an agent's material, replacing any it already had.
+    #[must_use]
+    pub fn with(mut self, agent: impl Into<String>, keys: SigningKeys) -> Self {
+        self.by_agent.insert(agent.into(), keys);
+        self
+    }
+
+    /// The material for `agent`, if this sidecar holds any.
+    #[must_use]
+    pub fn keys(&self, agent: &str) -> Option<&SigningKeys> {
+        self.by_agent.get(agent)
+    }
 }
 
 impl Upstream {
     /// Posts one sealed record, distinguishing permanent rejection from transient failure.
     ///
     /// `body` is an envelope from [`crate::envelope::seal`], and `agent` is the identity the socket
-    /// established — the service re-checks it against the caller it authenticated, so the header is
-    /// a claim, not a grant.
-    ///
-    /// Requests are **not** signed. Nothing reachable from this type is a caller credential:
-    /// [`Upstream`] carries a base URL and the service's public key, and a public key authenticates
-    /// nobody. Rather than derive a secret from something that is not one, this posts unsigned and
-    /// says so — see the crate documentation for the credential the API would need.
+    /// established — the service re-checks it against the credential the signature verified, so the
+    /// header is a claim, not a grant.
     ///
     /// # Errors
     ///
-    /// [`Error::Rejected`] for a `4xx` other than `429`, and for any other status the service is not
-    /// expected to return: the record will not become acceptable by being sent again, so the caller
-    /// is told instead. [`Error::Spooled`] for `429`, `5xx`, a timeout, or a transport failure —
-    /// all of which say *later*, not *no*.
+    /// [`Error::Rejected`] for a `4xx` other than `429`, for any other status the service is not
+    /// expected to return, and for an agent this sidecar holds no credential for: none of those
+    /// become acceptable by being sent again, so the caller is told instead. [`Error::Spooled`] for
+    /// `429`, `5xx`, a timeout, or a transport failure — all of which say *later*, not *no*.
     pub async fn post_record(&self, agent: &str, body: &[u8]) -> crate::Result<()> {
         tokio::time::timeout(ATTEMPT_TIMEOUT, self.attempt(agent, body))
             .await
@@ -71,7 +104,12 @@ impl Upstream {
 
     /// One request, from connect to classified outcome.
     async fn attempt(&self, agent: &str, body: &[u8]) -> crate::Result<()> {
-        let target: Uri = format!("{}/records", self.base_url.trim_end_matches('/'))
+        // Before the connection, because an agent with no credential is a configuration fault and
+        // has nothing to gain from reaching the service unsigned.
+        let keys = self.credentials.keys(agent).ok_or_else(|| {
+            Error::Rejected(format!("no signing credential configured for `{agent}`"))
+        })?;
+        let target: Uri = format!("{}{RECORDS_PATH}", self.base_url.trim_end_matches('/'))
             .parse()
             .map_err(|e| Error::Rejected(format!("unusable upstream url: {e}")))?;
         let authority = target
@@ -96,11 +134,12 @@ impl Upstream {
 
         // Origin-form target with an explicit `Host`, as a direct HTTP/1.1 request should be:
         // the absolute form is for proxies, and not every server parses it.
-        let path = target.path_and_query().map_or("/records", |p| p.as_str());
+        let path = target.path_and_query().map_or(RECORDS_PATH, |p| p.as_str());
         let request = Request::post(path)
             .header(header::HOST, authority.as_str())
-            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_TYPE, envelope::CONTENT_TYPE)
             .header(AGENT_HEADER, agent)
+            .header(SIGNATURE_HEADER, keys.sign("POST", path, agent, body))
             .body(Full::new(Bytes::copy_from_slice(body)))
             .map_err(|e| Error::Rejected(format!("unbuildable request: {e}")))?;
 
@@ -156,11 +195,15 @@ mod tests {
     use super::*;
     use crate::stub::Stub;
 
-    /// An upstream pointed at `base_url`, with a key it never uses here.
+    /// The key the test service and the test sidecar share.
+    const KEY: &[u8] = b"a-shared-signing-key";
+
+    /// An upstream pointed at `base_url`, able to sign as `writer`.
     fn upstream(base_url: String) -> Upstream {
         Upstream {
             base_url,
-            service_public_key: vec![0u8; crate::envelope::KEY_LEN],
+            service_public_key: vec![0u8; envelope::KEY_LEN],
+            credentials: Credentials::new().with("writer", SigningKeys::new(KEY)),
         }
     }
 
@@ -220,6 +263,45 @@ mod tests {
         assert_eq!(stub.received(), [b"sealed bytes".to_vec()]);
         // The write endpoint is part of the contract, so where it landed is asserted too.
         assert_eq!(stub.request_lines(), ["POST /records HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn a_posted_record_carries_a_signature_over_method_path_agent_and_body() {
+        let stub = Stub::start(202).await;
+        upstream(stub.base_url.clone())
+            .post_record("writer", b"sealed bytes")
+            .await
+            .unwrap();
+
+        assert_eq!(stub.header(0, AGENT_HEADER).as_deref(), Some("writer"));
+        assert_eq!(
+            stub.header(0, SIGNATURE_HEADER),
+            // Recomputed the way the service will, from the shared spelling of the message.
+            Some(SigningKeys::new(KEY).sign("POST", "/records", "writer", b"sealed bytes"))
+        );
+        assert_eq!(
+            stub.header(0, "content-type").as_deref(),
+            Some(envelope::CONTENT_TYPE),
+            "the service has to be told the body is sealed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_credential_is_never_posted_unsigned() {
+        let stub = Stub::start(200).await;
+        let err = upstream(stub.base_url.clone())
+            .post_record("auditor", b"sealed")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, Error::Rejected(why) if why.contains("auditor")),
+            "{err}"
+        );
+        assert!(
+            stub.received().is_empty(),
+            "an unsigned request must not be attempted at all"
+        );
     }
 
     #[tokio::test]

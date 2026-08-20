@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use yaam_contract::RecordId;
-use yaam_store::query::{self, Filter};
+use yaam_store::query::{self, Filter, Scope};
 
 /// Confidence a reference must carry to reach a bundle.
 ///
@@ -42,6 +42,10 @@ pub struct Bundle {
 }
 
 /// What the caller wants context for.
+///
+/// The scope travels with the request rather than being applied afterwards: a bundle is assembled
+/// from several reads, and filtering the assembled result would mean the deadline and the record cap
+/// had already been spent on records the caller may not see.
 #[derive(Debug, Clone, Default)]
 pub struct Request {
     /// Entities to gather history for.
@@ -50,6 +54,8 @@ pub struct Request {
     pub actor: Option<String>,
     /// Budget for the whole composition.
     pub deadline_ms: u64,
+    /// What the caller this bundle is for may see. Defaults to nothing.
+    pub scope: Scope,
 }
 
 /// Composes a bundle, degrading rather than failing when a source is slow.
@@ -70,7 +76,7 @@ pub fn compose(store: &yaam_store::Store, request: &Request) -> crate::Result<Bu
             omit(&mut bundle, format!("entity {kind}:{id}: deadline reached"));
             continue;
         }
-        let found = query::by_entity(store, kind, id, MIN_CONFIDENCE)?;
+        let found = query::by_entity(store, kind, id, MIN_CONFIDENCE, &request.scope)?;
         take(
             &mut bundle,
             &mut seen,
@@ -86,6 +92,7 @@ pub fn compose(store: &yaam_store::Store, request: &Request) -> crate::Result<Bu
             let filter = Filter {
                 agent: Some(actor.clone()),
                 limit: Some(PER_SOURCE_LIMIT),
+                scope: request.scope.clone(),
                 ..Filter::default()
             };
             let found = query::by_filter(store, &filter)?;
@@ -132,7 +139,7 @@ mod tests {
 
     use yaam_contract::RecordId;
 
-    use super::{Bundle, MAX_RECORDS, Request, TOKENS_PER_RECORD, compose, take};
+    use super::{Bundle, MAX_RECORDS, Request, Scope, TOKENS_PER_RECORD, compose, take};
     use crate::testkit::{self, BODY, Harness};
 
     /// A store with two records on the same ticket, one of them also about a subject.
@@ -156,6 +163,7 @@ mod tests {
             entities: vec![("ticket".to_owned(), "PROJ-42".to_owned())],
             actor: Some("agent_a".to_owned()),
             deadline_ms: 5_000,
+            scope: Scope::Unrestricted,
         };
 
         let bundle = compose(&store, &request).expect("composed");
@@ -182,6 +190,7 @@ mod tests {
             ],
             actor: Some("agent_a".to_owned()),
             deadline_ms: 0,
+            scope: Scope::Unrestricted,
         };
 
         let bundle = compose(&store, &request).expect("composed");
@@ -213,11 +222,30 @@ mod tests {
         let request = Request {
             entities: vec![("ticket".to_owned(), "PROJ-99".to_owned())],
             deadline_ms: 5_000,
+            scope: Scope::Unrestricted,
             ..Request::default()
         };
         let bundle = compose(&store, &request).expect("composed");
         assert!(bundle.records.is_empty());
         assert!(!bundle.degraded);
+    }
+
+    #[test]
+    fn a_bundle_for_a_caller_with_no_scope_is_empty_rather_than_complete() {
+        let harness = populated();
+        let store = harness.pipeline.reader().expect("reader");
+        let request = Request {
+            entities: vec![("ticket".to_owned(), "PROJ-42".to_owned())],
+            actor: Some("agent_a".to_owned()),
+            deadline_ms: 5_000,
+            ..Request::default()
+        };
+
+        let bundle = compose(&store, &request).expect("composed");
+        assert!(
+            bundle.records.is_empty(),
+            "an unscoped bundle must not assemble history"
+        );
     }
 
     #[test]
