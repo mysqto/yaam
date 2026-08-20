@@ -44,4 +44,4 @@ Early. See `AGENTS.md` for the invariants any contribution must hold.
 
 ## License
 
-MIT OR Apache-2.0
+MIT — see [LICENSE](LICENSE).
