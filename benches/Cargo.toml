@@ -1,0 +1,20 @@
+[package]
+name = "yaam-bench"
+description = "Latency benchmark over a synthetic 200k-record store. Not shipped; not run in CI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+yaam-contract = { path = "../crates/yaam-contract" }
+yaam-core = { path = "../crates/yaam-core" }
+yaam-md = { path = "../crates/yaam-md" }
+# `explain` so the plan printed beside each figure comes from the query's own statement text rather
+# than from a copy of the SQL that could drift away from it.
+yaam-store = { path = "../crates/yaam-store", features = ["explain"] }

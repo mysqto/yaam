@@ -10,6 +10,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Lets a caller ask the planner how a read would run. Off by default: it is diagnostic surface for
+# benchmarks and operators, and the plan is only trustworthy when it comes from the query's own
+# statement text, which is why it lives in this crate rather than in the benchmark.
+explain = []
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true

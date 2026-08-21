@@ -32,5 +32,8 @@ jobs:
       # assertion, so a green test run cannot hide it — this is here for the readable failure.
       - run: cargo xtask check
       - run: cargo test --workspace
+      # `yaam-bench` is built by the steps above so it cannot rot, and never run: it has no tests,
+      # and its entry point is a `--release` binary that takes minutes. Excluded from coverage
+      # because it is measurement code — see ci/check.sh.
       - name: Coverage gate (>= 85% lines)
-        run: cargo llvm-cov --workspace --fail-under-lines 85 --summary-only
+        run: cargo llvm-cov --workspace --exclude yaam-bench --fail-under-lines 85 --summary-only
