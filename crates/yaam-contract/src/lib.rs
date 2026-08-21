@@ -15,6 +15,10 @@
 //! spell them. `summary` is the largest exception: prose that becomes the record body, sealed with
 //! it for erasable records.
 //!
+//! [`extract`] is here because the same reasoning applies to entities: what counts as a reference to
+//! an entity has to be one rule. A sidecar that infers a reference from prose the service would not
+//! have inferred puts a join key in the index that nothing else in the deployment agrees with.
+//!
 //! [`schema`] emits the same shapes as `spec/schemas/*.json`, which is what other implementations
 //! vendor. Generated rather than written, so the published description cannot become a fourth shape.
 
@@ -23,6 +27,7 @@
 pub mod attrs;
 pub mod entity;
 pub mod error;
+pub mod extract;
 pub mod ids;
 pub mod lockstep;
 pub mod mask;

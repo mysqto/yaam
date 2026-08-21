@@ -827,7 +827,9 @@ components:
           maximum: 1
           description: |
             `1.0` means read out of a structured field. Anything lower was inferred from prose, and
-            a bundle excludes it entirely.
+            a bundle excludes it entirely. What counts as evidence that prose meant an entity is
+            configuration too — `spec/extractors.yaml` — and what it produces stays below `0.9`, so
+            an inferred reference is stored and searchable without being joined on by default.
           example: 1.0
 
     SubjectRef:
