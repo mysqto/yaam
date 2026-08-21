@@ -1,0 +1,3 @@
+[alias]
+# `cargo xtask emit` regenerates `spec/schemas/`; `cargo xtask check` is what CI asks.
+xtask = "run --quiet --package xtask --"

@@ -1,0 +1,332 @@
+{
+  "$defs": {
+    "AttrValue": {
+      "anyOf": [
+        {
+          "description": "Text.",
+          "type": "string"
+        },
+        {
+          "description": "Whole number.",
+          "format": "int64",
+          "type": "integer"
+        },
+        {
+          "description": "Truth value.",
+          "type": "boolean"
+        }
+      ],
+      "description": "A scalar attribute value. Deliberately flat — `attrs` is not a document store."
+    },
+    "CanonVer": {
+      "description": "Version of the canonicalisation ruleset that produced a subject hash.\n\nStamped per subject rather than per record: a re-keyed record can legitimately carry subjects\nresolved under different rulesets. Lookups fan out across live versions.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "DataClass": {
+      "description": "Whether a record's body is erasable.",
+      "oneOf": [
+        {
+          "const": "internal",
+          "description": "System and operational activity. Body stored in plaintext.",
+          "type": "string"
+        },
+        {
+          "const": "subject_derived",
+          "description": "Traceable to a data subject. Body sealed; erasable by destroying subject keys.",
+          "type": "string"
+        }
+      ]
+    },
+    "EntityRef": {
+      "additionalProperties": false,
+      "description": "A reference from a record to an entity, with the role the entity played.\n\nUnknown fields are refused for the reason `ActionRecord` refuses them: an entity reference is\na join key, and a field that silently vanished here would leave the record joining on something\nother than what was sent.",
+      "properties": {
+        "confidence": {
+          "description": "Extraction confidence. Below `1.0` means inferred from text rather than a structured field.\n\nThe bound is published because `ActionRecord::validate` enforces it: a caller that can read\nthe schema can fail before sending rather than after.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "id": {
+          "description": "The canonical identifier.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "The entity kind, e.g. `order_ref`.",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/EntityRole",
+          "description": "How the entity relates to the record."
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "role",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "EntityRole": {
+      "description": "The part an entity plays in a record.",
+      "oneOf": [
+        {
+          "const": "primary",
+          "description": "The record is chiefly about this entity.",
+          "type": "string"
+        },
+        {
+          "const": "context",
+          "description": "Supporting context.",
+          "type": "string"
+        },
+        {
+          "const": "related",
+          "description": "Mentioned, related but not central.",
+          "type": "string"
+        }
+      ]
+    },
+    "Outcome": {
+      "description": "How the outcome of an action is reported.",
+      "oneOf": [
+        {
+          "const": "success",
+          "description": "The action did what it set out to do.",
+          "type": "string"
+        },
+        {
+          "const": "failure",
+          "description": "It failed.",
+          "type": "string"
+        },
+        {
+          "const": "partial",
+          "description": "It partly succeeded, and the record says how.",
+          "type": "string"
+        },
+        {
+          "const": "declined",
+          "description": "It was refused, by us or by a downstream system.",
+          "type": "string"
+        }
+      ]
+    },
+    "RecordId": {
+      "description": "A ULID, and the write's idempotency key. Crockford base32: uppercase, without `I`, `L`, `O` or `U`, so a transcription slip cannot turn one valid identifier into another.",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "type": "string"
+    },
+    "SchemaVer": {
+      "description": "Version of the record schema a row was written under.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "SubjectHash": {
+      "description": "Keyed pseudonym for an erasable data subject — an HMAC over a canonical subject identifier, never a direct identifier, so it is safe in paths, indexes and tombstones. Pseudonymous, not anonymous: whoever holds the keying secret can still relink it. Hex is lowercase, because one spelling per hash is what lets it serve as both a map key and a path component with no normalisation step a caller could forget.",
+      "pattern": "^s_[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "SubjectRef": {
+      "additionalProperties": false,
+      "description": "One data subject named by a record.\n\nUnknown fields are refused for the reason `ActionRecord` refuses them: a field this type does\nnot declare is one nothing downstream will ever read.",
+      "properties": {
+        "canon_ver": {
+          "$ref": "#/$defs/CanonVer",
+          "description": "Canonicalisation ruleset that produced `hash`."
+        },
+        "hash": {
+          "$ref": "#/$defs/SubjectHash",
+          "description": "The keyed pseudonym."
+        },
+        "role": {
+          "$ref": "#/$defs/SubjectRole",
+          "description": "The part this subject plays."
+        }
+      },
+      "required": [
+        "hash",
+        "role",
+        "canon_ver"
+      ],
+      "type": "object"
+    },
+    "SubjectRole": {
+      "description": "The part a subject plays in a record.",
+      "oneOf": [
+        {
+          "const": "principal",
+          "description": "Acted, or was acted for.",
+          "type": "string"
+        },
+        {
+          "const": "party",
+          "description": "Named in the record without being its principal.",
+          "type": "string"
+        }
+      ]
+    },
+    "Visibility": {
+      "description": "Who may read a record.",
+      "oneOf": [
+        {
+          "const": "owner",
+          "description": "The actor only.\n\nStored apart: a subtree of its own per owner, whose directories and files admit no group or\nother access. The two halves cover each other — a scoped read answers nothing to anybody\nelse, and a reader on the host cannot go around the query by opening the file unless it is\nthe identity the writer runs as.",
+          "type": "string"
+        },
+        {
+          "const": "team",
+          "description": "A named team.",
+          "type": "string"
+        },
+        {
+          "const": "org",
+          "description": "Everyone in the deployment.",
+          "type": "string"
+        },
+        {
+          "const": "operator",
+          "description": "Audit records. Readable only by the operator role.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/mysqto/yaam/blob/main/spec/schemas/action-record.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A single thing an agent did.\n\n`action` and `outcome` are top-level and indexed because every useful query filters on them.\n\nThe wire record, the Markdown frontmatter and the index columns are three projections of this\ntype and cannot diverge. `summary` is the exception, being prose that becomes the record body.\n\nUnknown fields are refused, for the reason `WriteRequest` refuses them one level up, and with\nmore force: here the mistyped field *is* the record, so dropping it would store history the\ncaller did not describe and cannot tell is missing. `attrs` stays open — it is a declared map,\nchecked against `spec/attrs-schema.yaml` rather than against this struct.",
+  "properties": {
+    "action": {
+      "description": "What was done.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "agent": {
+      "description": "Which agent produced this.",
+      "type": "string"
+    },
+    "agent_ver": {
+      "description": "Agent version, for attributing behaviour changes.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "at": {
+      "description": "Source-reported time. May be skewed; not used for ordering.",
+      "type": "string"
+    },
+    "attrs": {
+      "additionalProperties": {
+        "$ref": "#/$defs/AttrValue"
+      },
+      "description": "Declared, classified attributes.\n\nDeliberately open: the permitted keys are declared per action in `spec/attrs-schema.yaml`,\nwhich is deployment configuration this type cannot see. Closing the map here would make the\ncontract carry one deployment's vocabulary.",
+      "type": "object"
+    },
+    "backfilled": {
+      "description": "`true` when `received_at` came from an upstream source rather than our clock.",
+      "type": "boolean"
+    },
+    "correlation_id": {
+      "description": "Ties every stage of one interaction together.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_class": {
+      "$ref": "#/$defs/DataClass",
+      "description": "Whether the body is erasable."
+    },
+    "entities": {
+      "description": "Entities this record joins on.",
+      "items": {
+        "$ref": "#/$defs/EntityRef"
+      },
+      "type": "array"
+    },
+    "fields_masked": {
+      "description": "Fields the policy masked. Informational.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "outcome": {
+      "$ref": "#/$defs/Outcome",
+      "description": "How it went."
+    },
+    "received_at": {
+      "description": "Time stamped by the service. Authoritative for ordering and windowing.",
+      "type": "string"
+    },
+    "record_id": {
+      "$ref": "#/$defs/RecordId",
+      "description": "Identity and idempotency key."
+    },
+    "redaction_policy": {
+      "description": "Redaction policy applied before the write.",
+      "type": "string"
+    },
+    "schema_ver": {
+      "$ref": "#/$defs/SchemaVer",
+      "description": "Schema version this record was written under."
+    },
+    "subjects": {
+      "description": "Data subjects named by this record. Empty for `DataClass::Internal`.",
+      "items": {
+        "$ref": "#/$defs/SubjectRef"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "description": "Prose. Becomes the record body, sealed when `data_class` is subject-derived.",
+      "type": "string"
+    },
+    "tags": {
+      "description": "Free tags.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "team": {
+      "description": "Team, required when `visibility` is `Visibility::Team`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "visibility": {
+      "$ref": "#/$defs/Visibility",
+      "description": "Read scope."
+    }
+  },
+  "required": [
+    "record_id",
+    "schema_ver",
+    "at",
+    "received_at",
+    "backfilled",
+    "agent",
+    "action",
+    "outcome",
+    "attrs",
+    "entities",
+    "subjects",
+    "visibility",
+    "data_class",
+    "redaction_policy",
+    "fields_masked",
+    "tags",
+    "summary"
+  ],
+  "title": "ActionRecord",
+  "type": "object"
+}

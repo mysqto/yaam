@@ -14,6 +14,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use yaam_contract::{RecordId, SubjectHash};
 use yaam_core::bundle;
@@ -148,7 +149,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// What a write did.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteStatus {
     /// First time this identifier was seen.
@@ -160,7 +161,7 @@ pub enum WriteStatus {
 }
 
 /// Answer to a write.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct WriteResponse {
     /// Identifier the record is addressable by.
     pub record_id: RecordId,
@@ -276,7 +277,7 @@ impl BundleQuery {
 }
 
 /// Context assembled for a caller.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct BundleResponse {
     /// Records judged relevant.
     pub records: Vec<RecordId>,

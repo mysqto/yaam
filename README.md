@@ -36,7 +36,24 @@ crates/
   yaam-core       write pipeline, sweeper, reindex, erasure, bundle composition
   yaam-server     HTTP service
   yaam-agent      local sidecar: one socket per caller, seals and signs on their behalf
+xtask/            repository chores: generates spec/schemas, checks the shapes behind it
 spec/             the contract bundle other implementations vendor
+  memory.v1.yaml    the wire contract as OpenAPI 3.1, checked against the router and the types
+  schemas/          the same shapes as JSON Schema 2020-12, generated — never edit by hand
+```
+
+## The three shapes
+
+A record has three faces: the wire record, the Markdown frontmatter, and the index columns. All
+three are projections of `yaam_contract::ActionRecord`, and keeping them in step used to be a
+convention — which missed a field on the wire that frontmatter spelled differently, and a column
+with no field behind it, one after the other. It is now a check: `yaam_contract::lockstep` holds the
+rule and the table of deliberate exceptions, each with a reason, and `cargo xtask check` hands it the
+three shapes as the crates that own them actually spell them.
+
+```sh
+cargo xtask emit     # regenerate spec/schemas from the types
+cargo xtask check    # the shapes agree, and the committed schemas are current
 ```
 
 ## Deployment seams

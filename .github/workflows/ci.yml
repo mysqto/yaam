@@ -28,6 +28,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The published schemas, and the three shapes they are generated from. Also a `cargo test`
+      # assertion, so a green test run cannot hide it — this is here for the readable failure.
+      - run: cargo xtask check
       - run: cargo test --workspace
       - name: Coverage gate (>= 85% lines)
         run: cargo llvm-cov --workspace --fail-under-lines 85 --summary-only

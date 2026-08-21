@@ -9,9 +9,14 @@
 //! worth designing out.
 //!
 //! Three shapes must agree: the wire record, the Markdown frontmatter, and the database columns.
-//! They are all projections of [`ActionRecord`], so divergence is a compile error rather than a
-//! runtime surprise. `summary` is the one deliberate exception — it is prose that becomes the
-//! record body, and for erasable records that body is sealed.
+//! They are all projections of [`ActionRecord`]. That is not a compile error — nothing in the type
+//! system can see three crates at once — so it is a test: [`lockstep`] holds the rule and the list
+//! of deliberate exceptions, and `xtask` hands it the three shapes as the crates that own them
+//! spell them. `summary` is the largest exception: prose that becomes the record body, sealed with
+//! it for erasable records.
+//!
+//! [`schema`] emits the same shapes as `spec/schemas/*.json`, which is what other implementations
+//! vendor. Generated rather than written, so the published description cannot become a fourth shape.
 
 #![forbid(unsafe_code)]
 
@@ -19,9 +24,11 @@ pub mod attrs;
 pub mod entity;
 pub mod error;
 pub mod ids;
+pub mod lockstep;
 pub mod mask;
 pub mod record;
 pub mod request;
+pub mod schema;
 mod spec_yaml;
 pub mod timestamp;
 

@@ -1,0 +1,29 @@
+[package]
+name = "xtask"
+description = "Repository chores: generating spec/schemas, and checking the shapes that feed it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json.workspace = true
+# Reading `spec/memory.v1.yaml` back, so the generated schemas and the published OpenAPI document
+# are checked against each other rather than both trusted.
+saphyr.workspace = true
+# The columns are asked of a migrated database rather than parsed out of the migration text.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# Every crate that owns one of the shapes. This is the only place all of them are visible, which is
+# why the check lives here rather than beside any one of them.
+yaam-contract = { path = "../crates/yaam-contract" }
+yaam-md = { path = "../crates/yaam-md" }
+yaam-server = { path = "../crates/yaam-server" }
+yaam-store = { path = "../crates/yaam-store" }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,5 +1,8 @@
 //! Newtypes for the identifiers that flow through every layer.
 
+use std::borrow::Cow;
+
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 /// Length of a ULID in its canonical textual form.
@@ -8,6 +11,17 @@ const ULID_LEN: usize = 26;
 const SUBJECT_HASH_LEN: usize = 2 + 64;
 /// Prefix that marks a string as a subject pseudonym rather than a raw identifier.
 const SUBJECT_PREFIX: &str = "s_";
+
+/// The set [`RecordId`] admits, as a JSON Schema `pattern`.
+///
+/// One rule needs two spellings: a regex cannot be a `const fn` and a byte match cannot be a
+/// schema. [`crate::schema`] emits this into the published schema, and a test drives the pattern and
+/// [`RecordId::try_from`] over the same corpus — two spellings agree only until one is edited alone.
+pub const RECORD_ID_PATTERN: &str = "^[0-9A-HJKMNP-TV-Z]{26}$";
+
+/// The set [`SubjectHash`] admits, as a JSON Schema `pattern`. Paired with its parser the way
+/// [`RECORD_ID_PATTERN`] is.
+pub const SUBJECT_HASH_PATTERN: &str = "^s_[0-9a-f]{64}$";
 
 /// Whether a byte is a Crockford base32 digit as ULID spells it: uppercase, with `I`, `L`, `O` and
 /// `U` excluded so a transcription slip cannot turn one valid id into another.
@@ -133,15 +147,59 @@ impl TryFrom<String> for SubjectHash {
     }
 }
 
+/// Describes an identifier as the string it is on the wire, not as the struct that holds it.
+///
+/// Needed because both newtypes deserialise `try_from = "String"`, which schemars cannot see: the
+/// derive would describe the private `String` field and publish an object where the wire carries a
+/// scalar. The constraint is the `pattern`, so it is stated rather than lost.
+macro_rules! string_schema {
+    ($type:ident, $pattern:expr, $description:expr) => {
+        impl JsonSchema for $type {
+            fn schema_name() -> Cow<'static, str> {
+                stringify!($type).into()
+            }
+
+            fn schema_id() -> Cow<'static, str> {
+                concat!(module_path!(), "::", stringify!($type)).into()
+            }
+
+            fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+                json_schema!({
+                    "type": "string",
+                    "pattern": $pattern,
+                    "description": $description,
+                })
+            }
+        }
+    };
+}
+
+string_schema!(
+    RecordId,
+    RECORD_ID_PATTERN,
+    "A ULID, and the write's idempotency key. Crockford base32: uppercase, without `I`, `L`, `O` \
+     or `U`, so a transcription slip cannot turn one valid identifier into another."
+);
+
+string_schema!(
+    SubjectHash,
+    SUBJECT_HASH_PATTERN,
+    "Keyed pseudonym for an erasable data subject — an HMAC over a canonical subject identifier, \
+     never a direct identifier, so it is safe in paths, indexes and tombstones. Pseudonymous, not \
+     anonymous: whoever holds the keying secret can still relink it. Hex is lowercase, because one \
+     spelling per hash is what lets it serve as both a map key and a path component with no \
+     normalisation step a caller could forget."
+);
+
 /// Version of the record schema a row was written under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaVer(pub u32);
 
 /// Version of the canonicalisation ruleset that produced a subject hash.
 ///
 /// Stamped per subject rather than per record: a re-keyed record can legitimately carry subjects
 /// resolved under different rulesets. Lookups fan out across live versions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CanonVer(pub u32);
 
 #[cfg(test)]
@@ -285,5 +343,49 @@ mod tests {
         assert_eq!(SchemaVer(1).0, 1);
         assert_eq!(CanonVer(2), CanonVer(2));
         assert_ne!(CanonVer(2), CanonVer(3));
+    }
+
+    /// Every input either parser or pattern could disagree about, in one corpus.
+    ///
+    /// A vendored schema is the only description a foreign implementation gets. If its `pattern`
+    /// admitted one string this parser refuses, that implementation would emit records this service
+    /// rejects, and the schema would be the thing at fault.
+    #[test]
+    fn the_published_patterns_admit_exactly_what_the_parsers_do() {
+        let hex = hex64();
+        let hash = format!("s_{hex}");
+        let corpus = [
+            String::new(),
+            VALID_ULID.to_owned(),
+            VALID_ULID.to_lowercase(),
+            VALID_ULID[..25].to_owned(),
+            format!("{VALID_ULID}0"),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAI".to_owned(),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAL".to_owned(),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAO".to_owned(),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAU".to_owned(),
+            "é123456789012345678901234".to_owned(),
+            hash.clone(),
+            hex.clone(),
+            hash.to_uppercase(),
+            format!("s_{}", &hex[..63]),
+            "s_short".to_owned(),
+            "../../escape".to_owned(),
+        ];
+
+        let record = regex::Regex::new(RECORD_ID_PATTERN).expect("a valid pattern");
+        let subject = regex::Regex::new(SUBJECT_HASH_PATTERN).expect("a valid pattern");
+        for candidate in &corpus {
+            assert_eq!(
+                record.is_match(candidate),
+                RecordId::parse(candidate).is_ok(),
+                "RECORD_ID_PATTERN and RecordId::parse disagree about {candidate:?}"
+            );
+            assert_eq!(
+                subject.is_match(candidate),
+                SubjectHash::parse(candidate).is_ok(),
+                "SUBJECT_HASH_PATTERN and SubjectHash::parse disagree about {candidate:?}"
+            );
+        }
     }
 }

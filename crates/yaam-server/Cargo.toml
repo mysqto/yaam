@@ -22,6 +22,9 @@ hex.workspace = true
 hmac = "0.13"
 sha2 = "0.11"
 subtle = "2.6"
+# The two answers below are published as JSON Schemas alongside the wire record, through the
+# contract crate's generator so the whole bundle speaks one dialect.
+schemars = "1"
 yaam-contract = { path = "../yaam-contract" }
 yaam-core = { path = "../yaam-core" }
 # Opening what a sidecar sealed. The same module the sidecar seals with, so there is one envelope

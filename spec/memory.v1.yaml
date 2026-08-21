@@ -124,6 +124,15 @@ info:
     from the erased tree, and the endpoint does it before answering. That is the exception, it is
     expensive, and it is priced into the erasure call rather than offered on its own.
 
+    ## The schemas below have a generated twin
+
+    `spec/schemas/{action-record,envelope,result,bundle}.v1.json` are JSON Schema 2020-12 documents
+    generated from the implementation's own types, and are the copy to vendor if your tooling reads
+    JSON Schema rather than OpenAPI. The schemas *here* are written by hand, and a test compares the
+    two: every shape both name has to agree on its fields, its required fields, its enum values and
+    its identifier patterns. So this document is checked against the types, not merely against the
+    router — but the generated files are the ones that cannot be out of date.
+
 servers:
   - url: /
     description: |

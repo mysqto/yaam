@@ -24,5 +24,8 @@ sha2 = "0.11"
 subtle = "2.6"
 # Entity patterns are configuration, so the matcher has to take arbitrary regexes.
 regex = "1"
+# The wire shapes are described here, so the portable description of them is emitted from here too.
+# A schema written by hand somewhere else would be a fourth shape with nothing holding it in line.
+schemars = "1"
 
 [dev-dependencies]

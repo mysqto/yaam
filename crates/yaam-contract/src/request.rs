@@ -18,6 +18,7 @@
 //! in flight is the transport's job.
 
 use hmac::{Hmac, KeyInit, Mac};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -34,7 +35,7 @@ pub const SIGNATURE_HEADER: &str = "x-yaam-signature";
 ///
 /// Here rather than in the service, because the sidecar composes exactly what the service parses.
 /// Two declarations of one request body is how a sender and a receiver stop agreeing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteRequest {
     /// The record itself.

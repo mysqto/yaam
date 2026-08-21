@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Outcome, spec_yaml};
@@ -46,8 +47,11 @@ fn spec(detail: String) -> Error {
 }
 
 /// A scalar attribute value. Deliberately flat — `attrs` is not a document store.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// Published as `AttrValue`, because `Value` alone collides with every other value type a vendoring
+// implementation holds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
+#[schemars(rename = "AttrValue")]
 pub enum Value {
     /// Text.
     Text(String),
