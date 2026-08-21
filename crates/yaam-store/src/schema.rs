@@ -108,10 +108,17 @@ CREATE TABLE records (
                    (json_extract(frontmatter, '$.data_class') = 'subject_derived') STORED
 ) STRICT;
 
--- Covering, in this order, for the correlation join: both sides select on (action, outcome) and
--- then range-scan received_ms, and record_id is here so the join never touches the table.
+-- Covering for a read that pins both `action` and `outcome` and then range-scans `received_ms`,
+-- with `record_id` here so the read never touches the table. The correlation join's right-hand
+-- side pins only `action`, which is why it needs the index below rather than this one.
 CREATE INDEX records_action_outcome_time
     ON records (action, outcome, received_ms, record_id);
+-- The correlation join's right-hand side constrains `action` and range-scans `received_ms`, but
+-- says nothing about `outcome`. Under the index above that leaves `outcome` a gap mid-key, so the
+-- range degrades from a seek to a per-row filter and the join costs (left rows) x (every row of the
+-- right action). Measured: 97 ms windowed and 4.5 s unwindowed become 1.0 ms each with this.
+CREATE INDEX records_action_time
+    ON records (action, received_ms, record_id);
 CREATE INDEX records_agent_time ON records (agent, received_ms);
 CREATE INDEX records_time       ON records (received_ms);
 CREATE INDEX records_correlation
