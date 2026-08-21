@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+use yaam_contract::entity::Registry;
 use yaam_contract::{ActionRecord, RecordId, SubjectHash};
 use yaam_core::bundle::{self, Bundle};
 use yaam_core::erase::EraseReport;
@@ -31,6 +32,11 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
     fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordId>>;
 
     /// Answers everything touching one entity.
+    ///
+    /// An implementation must canonicalise `kind` and `id` the way the write path does before
+    /// matching them, and refuse what it cannot canonicalise. Matching an identifier as sent is how
+    /// a caller asking for `proj-42` where the store holds `PROJ-42` gets an empty answer it reads
+    /// as "no history".
     fn entity(
         &self,
         caller: &Caller,
@@ -40,6 +46,9 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
     ) -> Result<Vec<RecordId>>;
 
     /// Composes context for a request.
+    ///
+    /// The entities it names are canonicalised as [`Service::entity`] canonicalises its own, and for
+    /// the same reason: a bundle silently missing a source is worse than one that says so.
     fn bundle(&self, caller: &Caller, request: &bundle::Request) -> Result<Bundle>;
 
     /// Destroys a subject's keys.
@@ -56,6 +65,9 @@ pub struct CoreService {
     /// The pipeline is the single writer, and the lock is what makes that true under concurrent
     /// requests rather than by convention.
     pipeline: Mutex<yaam_core::Pipeline>,
+    /// The pipeline's entity kinds, copied out so a read canonicalises without taking the write
+    /// lock: one lock contended by every read is a queue behind whatever is being written.
+    registry: Registry,
     index: PathBuf,
     /// The shared read handle, opened by the first read that finds an index.
     store: OnceLock<Store>,
@@ -77,10 +89,23 @@ impl CoreService {
     /// instead of passing a root and getting the defaults.
     pub fn with_pipeline(pipeline: yaam_core::Pipeline, index: &Path) -> Self {
         Self {
+            registry: pipeline.registry().clone(),
             pipeline: Mutex::new(pipeline),
             index: index.to_path_buf(),
             store: OnceLock::new(),
         }
+    }
+
+    /// The canonical form of an identifier, or the client error saying why there is none.
+    ///
+    /// `422` and not an empty answer: an unconfigured kind or an identifier the kind's pattern does
+    /// not admit is a question this deployment cannot be asked, and answering it with no rows would
+    /// have the caller read a bug as a fact. The same status the write path gives the same
+    /// identifier, so one spelling cannot be good enough to store and not good enough to find.
+    fn canonical(&self, kind: &str, id: &str) -> Result<String> {
+        self.registry
+            .canonicalise(kind, id)
+            .map_err(|error| Error::Unprocessable(error.to_string()))
     }
 
     /// The write pipeline, recovering a lock a panicking request poisoned.
@@ -130,14 +155,20 @@ impl Service for CoreService {
         id: &str,
         min_confidence: f32,
     ) -> Result<Vec<RecordId>> {
+        let id = self.canonical(kind, id)?;
         Ok(
-            query::by_entity(self.store()?, kind, id, min_confidence, &caller.scope())
+            query::by_entity(self.store()?, kind, &id, min_confidence, &caller.scope())
                 .map_err(yaam_core::Error::from)?,
         )
     }
 
     fn bundle(&self, caller: &Caller, request: &bundle::Request) -> Result<Bundle> {
+        let mut entities = Vec::with_capacity(request.entities.len());
+        for (kind, id) in &request.entities {
+            entities.push((kind.clone(), self.canonical(kind, id)?));
+        }
         let scoped = bundle::Request {
+            entities,
             scope: caller.scope(),
             ..request.clone()
         };

@@ -5,7 +5,15 @@ version: 1
 policy: default-v1
 
 patterns:
+  # Spans the whole block: a pattern matching the BEGIN marker alone masks the caption and leaves
+  # the key sitting in the record.
   - name: private_key_block
+    regex: '(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----'
+    action: mask
+  # An unterminated block still has to trip something, or a truncated key would be masked by
+  # neither pattern and accepted by the service. This one masks only the caption, which is all
+  # there is to anchor on.
+  - name: private_key_marker
     regex: '-----BEGIN [A-Z ]*PRIVATE KEY-----'
     action: mask
   - name: bearer_token

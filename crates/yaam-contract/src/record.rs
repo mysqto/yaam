@@ -80,7 +80,11 @@ pub enum Role {
 }
 
 /// One data subject named by a record.
+///
+/// Unknown fields are refused for the reason [`ActionRecord`] refuses them: a field this type does
+/// not declare is one nothing downstream will ever read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubjectRef {
     /// The keyed pseudonym.
     pub hash: SubjectHash,
@@ -93,7 +97,15 @@ pub struct SubjectRef {
 /// A single thing an agent did.
 ///
 /// `action` and `outcome` are top-level and indexed because every useful query filters on them.
+///
+/// Unknown fields are refused, for the reason [`WriteRequest`] refuses them one level up, and with
+/// more force: here the mistyped field *is* the record, so dropping it would store history the
+/// caller did not describe and cannot tell is missing. `attrs` stays open — it is a declared map,
+/// checked against `spec/attrs-schema.yaml` rather than against this struct.
+///
+/// [`WriteRequest`]: crate::request::WriteRequest
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionRecord {
     /// Identity and idempotency key.
     pub record_id: RecordId,
@@ -374,6 +386,35 @@ pub(crate) mod tests {
         assert!(json.contains(r#""data_class":"subject_derived""#), "{json}");
         assert!(json.contains(r#""visibility":"team""#), "{json}");
         assert!(json.contains(r#""role":"principal""#), "{json}");
+    }
+
+    #[test]
+    fn a_field_the_record_does_not_declare_is_refused_rather_than_dropped() {
+        // What this costs when it is dropped: the record stored is not the record the caller
+        // described, and no later read can tell. The wrapper has always refused a stray field at
+        // the top level; one *inside* the record is the same mistake about more.
+        let mut r = internal_record();
+        r.entities.push(entity_ref(1.0));
+        r.subjects.push(subject());
+        r.data_class = DataClass::SubjectDerived;
+        let json = serde_json::to_value(&r).expect("serialises");
+
+        for pointer in ["/nonsense", "/entities/0/nonsense", "/subjects/0/nonsense"] {
+            let mut smuggled = json.clone();
+            let (parent, key) = pointer.rsplit_once('/').expect("a pointer names its key");
+            smuggled
+                .pointer_mut(parent)
+                .expect("the parent is in the document")
+                .as_object_mut()
+                .expect("an object")
+                .insert(key.to_owned(), serde_json::json!(1));
+            let error = serde_json::from_value::<ActionRecord>(smuggled)
+                .expect_err("an undeclared field must be refused");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "{pointer}: {error}"
+            );
+        }
     }
 
     #[test]

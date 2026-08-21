@@ -261,6 +261,16 @@ impl Pipeline {
         Ok(settled)
     }
 
+    /// The entity kinds this deployment configured.
+    ///
+    /// Public because the read paths need the same canonicalisation the write path applies: an
+    /// identifier matched as sent against an index of canonical ones answers nothing, and "nothing"
+    /// is indistinguishable from "no history".
+    #[must_use]
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
     /// Root of the memory tree.
     pub(crate) fn root(&self) -> &Path {
         &self.root

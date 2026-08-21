@@ -166,7 +166,7 @@ impl Service for Fake {
             bodies_sealed_off: 3,
             keys_destroyed: 2,
             quarantine_settled: 1,
-            tombstone_id: "tombstone-1".to_owned(),
+            tombstone_id: "tomb-01ARZ3NDEKTSV4RRFFQ69G5FC7".to_owned(),
         })
     }
 }

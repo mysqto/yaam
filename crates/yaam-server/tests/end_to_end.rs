@@ -114,6 +114,71 @@ fn a_record_the_deployment_does_not_configure_is_refused_before_anything_is_writ
     assert!(!tree.holds(&id));
 }
 
+#[test]
+fn a_read_canonicalises_its_identifier_rather_than_answering_nothing() {
+    let tree = Tree::new();
+    let service = Arc::clone(&tree.service);
+    let writer = caller("agent_a", Role::Writer, &["platform"]);
+    let stored = record("agent_a", "2026-08-20T09:00:00Z");
+    let id = stored.record_id.clone();
+    service.write(&writer, stored, BODY).expect("written");
+
+    // The write stored the canonical `PROJ-42`. A read that matched the caller's spelling as sent
+    // would answer nothing — and nothing is indistinguishable from "this entity has no history",
+    // which is the worst kind of wrong answer because it looks like a fact.
+    assert_eq!(
+        service
+            .entity(&writer, "ticket", "  proj-42 ", 1.0)
+            .expect("entity"),
+        vec![id.clone()]
+    );
+
+    let request = bundle::Request {
+        entities: vec![("ticket".to_owned(), "proj-42".to_owned())],
+        deadline_ms: 5_000,
+        ..bundle::Request::default()
+    };
+    assert_eq!(
+        service.bundle(&writer, &request).expect("bundle").records,
+        vec![id]
+    );
+}
+
+#[test]
+fn a_read_the_deployment_cannot_canonicalise_is_refused_rather_than_answered_empty() {
+    let tree = Tree::new();
+    let reader = caller("agent_b", Role::Reader, &["support"]);
+
+    // An identifier the kind's pattern does not admit, and a kind nothing configures. Both are
+    // questions this deployment cannot be asked, and the write path already says so with a `422`.
+    for (kind, id) in [("ticket", "not a ticket"), ("no_such_kind", "PROJ-42")] {
+        let error = tree
+            .service
+            .entity(&reader, kind, id, 0.0)
+            .expect_err("an unaskable entity read");
+        assert_eq!(
+            error.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{kind}/{id}"
+        );
+
+        let request = bundle::Request {
+            entities: vec![(kind.to_owned(), id.to_owned())],
+            deadline_ms: 5_000,
+            ..bundle::Request::default()
+        };
+        let error = tree
+            .service
+            .bundle(&reader, &request)
+            .expect_err("an unaskable bundle term");
+        assert_eq!(
+            error.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{kind}/{id}"
+        );
+    }
+}
+
 /// A tree holding one record per visibility, and the router over it.
 fn scoped_tree() -> (Tree, axum::Router, Vec<RecordId>) {
     let tree = Tree::new();

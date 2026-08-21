@@ -93,6 +93,10 @@ impl Upstream {
     /// expected to return, and for an agent this sidecar holds no credential for: none of those
     /// become acceptable by being sent again, so the caller is told instead. [`Error::Spooled`] for
     /// `429`, `5xx`, a timeout, or a transport failure — all of which say *later*, not *no*.
+    ///
+    /// The memory service does not return `429` itself; a proxy, gateway or load balancer in front
+    /// of it can, and that is what the case is for. Treating it as transient there is the difference
+    /// between a spooled record and a discarded one.
     pub async fn post_record(&self, agent: &str, body: &[u8]) -> crate::Result<()> {
         tokio::time::timeout(ATTEMPT_TIMEOUT, self.attempt(agent, body))
             .await

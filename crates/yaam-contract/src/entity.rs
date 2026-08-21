@@ -27,7 +27,14 @@ const ESCAPE: char = '~';
 const ESCAPES: [(char, char); 5] = [('~', '~'), ('/', 's'), (':', 'c'), ('#', 'h'), ('@', 'a')];
 
 /// A reference from a record to an entity, with the role the entity played.
+///
+/// Unknown fields are refused for the reason [`ActionRecord`] refuses them: an entity reference is
+/// a join key, and a field that silently vanished here would leave the record joining on something
+/// other than what was sent.
+///
+/// [`ActionRecord`]: crate::ActionRecord
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EntityRef {
     /// The entity kind, e.g. `order_ref`.
     pub kind: String,

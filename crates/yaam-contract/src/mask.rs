@@ -234,6 +234,9 @@ mod tests {
         "policy: default-v1\n",
         "patterns:\n",
         "  - name: private_key_block\n",
+        "    regex: '(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----'\n",
+        "    action: mask\n",
+        "  - name: private_key_marker\n",
         "    regex: '-----BEGIN [A-Z ]*PRIVATE KEY-----'\n",
         "    action: mask\n",
         "  - name: bearer_token\n",
@@ -255,6 +258,8 @@ mod tests {
     const DIRTY: &str = concat!(
         "Rolled out the api service to staging.\n",
         "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        "bm90LWEtcmVhbC1rZXktYXQtYWxs\n",
+        "-----END OPENSSH PRIVATE KEY-----\n",
         "authorization: Bearer not-a-real-token-0123456789\n",
         "api_key: not-a-real-key-value\n",
         "contact: someone@example.test\n",
@@ -289,6 +294,47 @@ mod tests {
                 "card: [masked:card_like]\n",
                 "order_ref: ord10014721, 12 shards\n",
             )
+        );
+    }
+
+    #[test]
+    fn a_private_key_is_masked_body_and_all() {
+        // The pattern used to match the BEGIN marker alone, so masking stripped the caption and left
+        // the base64 and the END line in the record — a leaked key with its label taken off.
+        const MATERIAL: &str = "bm90LWEtcmVhbC1rZXktYXQtYWxs";
+        let policy = Policy::from_yaml(DEFAULT).expect("loads");
+        let masked = policy.mask(concat!(
+            "found this in a log line:\n",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+            "bm90LWEtcmVhbC1rZXktYXQtYWxs\n",
+            "-----END OPENSSH PRIVATE KEY-----\n",
+            "and carried on.\n",
+        ));
+
+        assert!(
+            !masked.text.contains(MATERIAL),
+            "the key itself survived: {}",
+            masked.text
+        );
+        assert!(!masked.text.contains("PRIVATE KEY"), "{}", masked.text);
+        assert_eq!(
+            masked.text,
+            "found this in a log line:\n[masked:private_key_block]\nand carried on.\n"
+        );
+        assert_eq!(masked.fields_masked, ["private_key_block"]);
+        assert_eq!(policy.first_match(&masked.text), None);
+    }
+
+    #[test]
+    fn an_unterminated_private_key_block_is_still_caught() {
+        // A block pattern alone would match nothing here, and the service would accept the body:
+        // the marker pattern is what keeps a truncated key from passing unnoticed.
+        let policy = Policy::from_yaml(DEFAULT).expect("loads");
+        let truncated = "-----BEGIN OPENSSH PRIVATE KEY-----\nbm90LWEtcmVhbC1rZXk=\n";
+        assert_eq!(policy.first_match(truncated), Some("private_key_marker"));
+        assert_eq!(
+            policy.mask(truncated).text,
+            "[masked:private_key_marker]\nbm90LWEtcmVhbC1rZXk=\n"
         );
     }
 
