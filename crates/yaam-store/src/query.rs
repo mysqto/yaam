@@ -91,6 +91,23 @@ pub fn by_entity(
     min_confidence: f32,
     scope: &Scope,
 ) -> crate::Result<Vec<RecordId>> {
+    let (sql, binds) = by_entity_sql(kind, id, min_confidence, scope);
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds), one_id)?;
+    collect(rows)
+}
+
+/// Builds the entity query and its bindings.
+///
+/// Separate from running it for the reason [`filter_sql`] is: the plan is the only thing that says
+/// whether the entity index was used, and it can only be asked of the statement text.
+fn by_entity_sql(
+    kind: &str,
+    id: &str,
+    min_confidence: f32,
+    scope: &Scope,
+) -> (String, Vec<SqlValue>) {
     let mut binds: Vec<SqlValue> = vec![
         kind.to_owned().into(),
         id.to_owned().into(),
@@ -106,11 +123,7 @@ pub fn by_entity(
         sql.push_str(&predicate);
     }
     sql.push_str(" ORDER BY rec.received_ms DESC, rec.id DESC");
-
-    let lease = store.lease()?;
-    let mut stmt = lease.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(binds), one_id)?;
-    collect(rows)
+    (sql, binds)
 }
 
 /// Whether one record is in the index, as a point lookup.
@@ -245,6 +258,15 @@ pub fn search(
     limit: u32,
     scope: &Scope,
 ) -> crate::Result<Vec<RecordId>> {
+    let (sql, binds) = search_sql(needle, limit, scope);
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds), one_id)?;
+    collect(rows)
+}
+
+/// Builds the full-text query and its bindings.
+fn search_sql(needle: &str, limit: u32, scope: &Scope) -> (String, Vec<SqlValue>) {
     let mut binds: Vec<SqlValue> = vec![needle.to_owned().into()];
     let mut sql = "SELECT rec.record_id
          FROM records_fts
@@ -257,11 +279,7 @@ pub fn search(
     }
     sql.push_str(" ORDER BY records_fts.rank, rec.received_ms DESC LIMIT ?");
     binds.push(i64::from(limit).into());
-
-    let lease = store.lease()?;
-    let mut stmt = lease.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(binds), one_id)?;
-    collect(rows)
+    (sql, binds)
 }
 
 /// Predicates over a record alias, appending their bindings in the same order.
@@ -370,6 +388,89 @@ fn collect(rows: impl Iterator<Item = rusqlite::Result<String>>) -> crate::Resul
         ids.push(crate::stored_record_id(row?)?);
     }
     Ok(ids)
+}
+
+/// What the planner says it will do, for the reads above.
+///
+/// Behind a non-default feature because it is diagnostic surface, not caller surface: benchmarks and
+/// operators need it, and a default build should not carry it. It lives here rather than in a
+/// benchmark because the plan has to come from the *same* statement text the query runs — a plan
+/// explained from a second, hand-copied spelling of the SQL is a plan for a query nobody executes.
+#[cfg(feature = "explain")]
+pub mod explain {
+    use super::{Filter, Scope, by_entity_sql, correlate_sql, filter_sql, search_sql};
+
+    /// How [`super::by_entity`] would run.
+    pub fn by_entity(
+        store: &crate::Store,
+        kind: &str,
+        id: &str,
+        min_confidence: f32,
+        scope: &Scope,
+    ) -> crate::Result<String> {
+        let (sql, binds) = by_entity_sql(kind, id, min_confidence, scope);
+        plan(store, &sql, binds)
+    }
+
+    /// How [`super::by_filter`] would run.
+    pub fn by_filter(store: &crate::Store, filter: &Filter) -> crate::Result<String> {
+        let (sql, binds) = filter_sql(filter);
+        plan(store, &sql, binds)
+    }
+
+    /// How [`super::correlate`] would run.
+    pub fn correlate(
+        store: &crate::Store,
+        left: &Filter,
+        right: &Filter,
+        within_ms: i64,
+    ) -> crate::Result<String> {
+        let (sql, binds) = correlate_sql(left, right, within_ms);
+        plan(store, &sql, binds)
+    }
+
+    /// How [`super::search`] would run.
+    pub fn search(
+        store: &crate::Store,
+        needle: &str,
+        limit: u32,
+        scope: &Scope,
+    ) -> crate::Result<String> {
+        let (sql, binds) = search_sql(needle, limit, scope);
+        plan(store, &sql, binds)
+    }
+
+    /// Runs `EXPLAIN QUERY PLAN`, indenting each step under its parent.
+    ///
+    /// The parameters are bound rather than omitted: the planner is free to use a bound value, so a
+    /// plan explained without them is not necessarily the plan the query gets.
+    fn plan(
+        store: &crate::Store,
+        sql: &str,
+        binds: Vec<rusqlite::types::Value>,
+    ) -> crate::Result<String> {
+        let lease = store.lease()?;
+        let mut stmt = lease.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        // Depth by walking parents rather than by nesting level in the result set: the rows arrive
+        // flat, and a child can appear before another subtree's parent.
+        let mut depth = std::collections::HashMap::from([(0i64, 0usize)]);
+        let mut lines = Vec::new();
+        for row in rows {
+            let (id, parent, detail) = row?;
+            let level = depth.get(&parent).copied().unwrap_or(0) + 1;
+            depth.insert(id, level);
+            lines.push(format!("{}{detail}", "  ".repeat(level - 1)));
+        }
+        Ok(lines.join("\n"))
+    }
 }
 
 #[cfg(test)]
@@ -560,6 +661,47 @@ mod tests {
             Some("1 = 0")
         );
         assert!(binds.is_empty());
+    }
+
+    /// The plan helpers explain the *same* statement text the queries run.
+    ///
+    /// Compiled only with the `explain` feature, which is what the benchmark turns on. Worth a test
+    /// rather than trusting the benchmark to notice: a helper that quietly explained a different
+    /// query would print a plan for something nobody executes, which is worse than printing none.
+    #[cfg(feature = "explain")]
+    #[test]
+    fn the_plan_helpers_explain_the_queries_they_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("index.sqlite");
+        drop(crate::Writer::open(&path).expect("migrate"));
+        let store = crate::Store::open_read(&path).expect("open");
+
+        let filter = Filter {
+            action: Some("deploy".to_owned()),
+            outcome: Some("failure".to_owned()),
+            scope: reader(),
+            ..Filter::default()
+        };
+        let plan = super::explain::by_filter(&store, &filter).expect("a plan");
+        assert!(plan.contains("records_action_outcome_time"), "{plan}");
+
+        // Every helper answers, and the join names both sides.
+        assert!(
+            super::explain::by_entity(&store, "ticket", "PROJ-42", 1.0, &reader())
+                .expect("a plan")
+                .contains("entity_refs_lookup")
+        );
+        assert!(
+            super::explain::search(&store, "shards", 10, &reader())
+                .expect("a plan")
+                .contains("records_fts")
+        );
+        let join = super::explain::correlate(&store, &filter, &filter, 1_000).expect("a plan");
+        assert_eq!(
+            join.matches("records_action_outcome_time").count(),
+            2,
+            "{join}"
+        );
     }
 
     #[test]
