@@ -1,24 +1,25 @@
-//! The seam nobody's own tests could see: a real sidecar posting to a real service.
+//! The seam nobody's own tests could see: a real sidecar talking to a real service.
 //!
 //! Both crates passed their own suites while the system did not work — the sidecar posted unsigned
 //! bytes the service had no key to open, and neither test suite had the other side in it. So this
 //! test runs [`yaam_agent::listener::serve`] against [`yaam_server::routes::router`] over a real
-//! socket and a real port, and asserts a record written by a caller is in the service's tree.
+//! socket and a real port, and asserts a record written by a caller is in the service's tree, and
+//! that the caller can read it back without ever holding a key.
 //!
 //! Anything that changes the wire — the canonical signed message, the envelope, the request shape —
 //! fails here, which is the only place it can fail before a deployment.
 
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use yaam_agent::listener::{self, CallerSocket, Limits};
 use yaam_agent::upstream::{Credentials, Upstream};
-use yaam_contract::request::SigningKeys;
+use yaam_contract::request::{AGENT_HEADER, SIGNATURE_HEADER, SigningKeys};
 use yaam_crypto::envelope;
 use yaam_server::auth::Role;
 use yaam_server::routes::{AppState, router};
@@ -72,6 +73,63 @@ async fn sidecar(agent: &str, base_url: &str, public: &[u8], state: &Path) -> st
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("the sidecar never accepted a connection");
+}
+
+/// The read socket beside a record socket, named the way the library names it.
+///
+/// Derived through [`CallerSocket::read_path`] rather than spelled out here: a test that wrote the
+/// name itself would keep passing after the sidecar started using a different one.
+fn read_socket(agent: &str, record: &Path) -> PathBuf {
+    CallerSocket {
+        agent: agent.to_owned(),
+        path: record.to_path_buf(),
+    }
+    .read_path()
+}
+
+/// Waits until a socket answers.
+async fn await_socket(path: &Path) {
+    for _ in 0..200 {
+        if UnixStream::connect(path).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("{} never accepted a connection", path.display());
+}
+
+/// Sends one raw HTTP request to a read socket and returns the whole answer.
+///
+/// Raw text rather than a client, because what is under test is that the socket speaks HTTP/1.1 at
+/// all — a client that shares this repository's own idea of a request would prove less.
+async fn read_through(path: &Path, request: &str) -> String {
+    let mut stream = UnixStream::connect(path).await.expect("connect");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write the request");
+    let mut answer = Vec::new();
+    stream
+        .read_to_end(&mut answer)
+        .await
+        .expect("read the answer");
+    String::from_utf8_lossy(&answer).into_owned()
+}
+
+/// Sends one raw HTTP request straight at the service, with no sidecar in the way.
+async fn read_directly(base_url: &str, request: &str) -> String {
+    let authority = base_url.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(authority).await.expect("connect");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write the request");
+    let mut answer = Vec::new();
+    stream
+        .read_to_end(&mut answer)
+        .await
+        .expect("read the answer");
+    String::from_utf8_lossy(&answer).into_owned()
 }
 
 /// Writes one record line to a caller socket and returns the sidecar's answer.
@@ -206,5 +264,133 @@ async fn a_service_with_no_unsealing_key_holds_the_record_rather_than_dropping_i
             .next()
             .is_some(),
         "the record is the sidecar's until the service can open it"
+    );
+}
+
+#[tokio::test]
+async fn a_read_reaches_the_service_only_because_the_sidecar_signs_it() {
+    let (secret, public) = envelope::generate_keypair();
+    let (tree, base_url) = service(&secret).await;
+    let state = tempfile::tempdir().expect("state dir");
+    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+    let reads = read_socket("agent_a", &socket);
+    await_socket(&reads).await;
+
+    // Written through the record socket, which is the only way a record gets in.
+    let doc = record("agent_a", "2026-08-20T09:00:00Z");
+    let id = doc.record_id.clone();
+    let line = format!("{}\n", serde_json::to_string(&doc).expect("serialise"));
+    assert_eq!(submit(&socket, &line).await, r#"{"status":"accepted"}"#);
+
+    // Read back by a caller that holds no signing key at all.
+    let answer = read_through(
+        &reads,
+        "GET /records HTTP/1.1\r\nhost: sidecar\r\nconnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+    assert!(
+        answer.contains(id.as_str()),
+        "the service's own answer has to come back whole: {answer}"
+    );
+
+    // The same read, unsigned, straight at the service. This is what the caller could do for
+    // itself, and it is why the proxy exists rather than being a convenience.
+    let refused = read_directly(
+        &base_url,
+        "GET /records HTTP/1.1\r\nhost: service\r\nconnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(refused.starts_with("HTTP/1.1 401 "), "{refused}");
+    assert!(refused.contains("unauthenticated"), "{refused}");
+    assert!(tree.holds(&id));
+}
+
+#[tokio::test]
+async fn a_signature_valid_for_one_query_is_refused_on_another() {
+    let (secret, _public) = envelope::generate_keypair();
+    let (_tree, base_url) = service(&secret).await;
+
+    // The signature a sidecar would put on `?limit=1`, from the one shared spelling of the message.
+    let signed = SigningKeys::new(KEY.to_vec()).sign("GET", "/records?limit=1", "agent_a", b"");
+    // The header names come from the contract, not from this file: a test that spelled them out
+    // would keep passing after the service started reading different ones.
+    let request = |target: &str| {
+        format!(
+            "GET {target} HTTP/1.1\r\nhost: service\r\n{AGENT_HEADER}: \
+             agent_a\r\n{SIGNATURE_HEADER}: {signed}\r\nconnection: close\r\n\r\n"
+        )
+    };
+
+    let accepted = read_directly(&base_url, &request("/records?limit=1")).await;
+    assert!(accepted.starts_with("HTTP/1.1 200 "), "{accepted}");
+
+    // Same key, same agent, same body, one different filter. For a read the query *is* the request,
+    // so lifting the signature onto another one has to fail.
+    let refused = read_directly(&base_url, &request("/records?limit=2")).await;
+    assert!(refused.starts_with("HTTP/1.1 401 "), "{refused}");
+}
+
+#[tokio::test]
+async fn a_write_on_the_read_socket_is_refused_and_never_reaches_the_service() {
+    let (secret, public) = envelope::generate_keypair();
+    let (tree, base_url) = service(&secret).await;
+    let state = tempfile::tempdir().expect("state dir");
+    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+    let reads = read_socket("agent_a", &socket);
+    await_socket(&reads).await;
+
+    let doc = record("agent_a", "2026-08-20T09:00:00Z");
+    let body = serde_json::to_string(&serde_json::json!({"record": doc})).expect("serialise");
+    let answer = read_through(
+        &reads,
+        &format!(
+            "POST /records HTTP/1.1\r\nhost: sidecar\r\ncontent-type: application/json\r\ncontent\
+             -length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+
+    // Refused here, not forwarded: a record proxied as HTTP would skip the sealing and the spool
+    // that the record socket gives it, and the caller could not tell.
+    assert!(answer.starts_with("HTTP/1.1 405 "), "{answer}");
+    assert!(answer.to_lowercase().contains("allow: get"), "{answer}");
+    assert!(!tree.holds(&doc.record_id), "it must not have been written");
+    assert!(
+        std::fs::read_dir(state.path().join("spool"))
+            .expect("spool dir")
+            .next()
+            .is_none(),
+        "and it must not have been queued"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_service_fails_the_read_rather_than_queueing_it() {
+    let (_secret, public) = envelope::generate_keypair();
+    // Bind and drop, so the port is almost certainly nobody's.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    drop(listener);
+
+    let state = tempfile::tempdir().expect("state dir");
+    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+    let reads = read_socket("agent_a", &socket);
+    await_socket(&reads).await;
+
+    let answer = read_through(
+        &reads,
+        "GET /records HTTP/1.1\r\nhost: sidecar\r\nconnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
+    assert!(
+        std::fs::read_dir(state.path().join("spool"))
+            .expect("spool dir")
+            .next()
+            .is_none(),
+        "a spooled read would be answered later with data that was already stale"
     );
 }

@@ -23,7 +23,7 @@ index that makes it queryable in single-digit milliseconds.
 | **Erasable bodies** | Per-record keys, per-subject key encryption. Deleting a subject's keys makes their record bodies permanently unreadable in every copy, including backups. |
 | **Idempotent** | Every write is keyed. Replays, retries and re-drives are safe. |
 | **Redacted at the source** | The writer masks, the service only checks and refuses what is still unmasked — so a record's `fields_masked` is the writer's own account. `yaam_contract::mask` is the one implementation of masking, reading the same policy file the service checks against. |
-| **Portable** | Any harness that speaks HTTP can participate; a local sidecar handles signing and sealing so callers hold no keys. |
+| **Portable** | Any harness that speaks HTTP can participate; a local sidecar handles signing and sealing, for reads as well as writes, so callers hold no keys. |
 | **Inferred references are marked as such** | An entity reference read out of a structured field carries `confidence: 1.0`; one inferred from prose carries less and is stored without being joined on by default. Which text counts as evidence is configuration (`spec/extractors.yaml`), and the precision of the answer is measured against a labelled corpus rather than asserted. |
 
 ## Layout
@@ -36,7 +36,7 @@ crates/
   yaam-store      SQLite schema, queries, full-text search
   yaam-core       write pipeline, sweeper, reindex, erasure, bundle composition
   yaam-server     HTTP service
-  yaam-agent      local sidecar: one socket per caller, seals and signs on their behalf
+  yaam-agent      local sidecar: two sockets per caller, seals and signs on their behalf
   yaam-cli        the three entry points: `yaam-server`, `yaam-agent`, `yaam`
 xtask/            repository chores: generates spec/schemas, checks the shapes behind it
 spec/             the contract bundle other implementations vendor
@@ -60,8 +60,16 @@ Three binaries, one crate, one configuration type. `--root` names the memory tre
 yaam-server --root /srv/memory --listen 127.0.0.1:8787 \
             --keyring /etc/yaam/keyring.json --unseal-key-file /etc/yaam/sealing.key
 
-# The sidecar. One socket per agent the state directory holds a signing key for.
+# The sidecar. Two sockets per agent the state directory holds a signing key for:
+#   <state-dir>/sockets/<agent>.sock        records, one JSON line in, one JSON line out
+#   <state-dir>/sockets/<agent>.read.sock   reads, HTTP/1.1, signed as that agent
+# `--socket agent=path` names the first; the second is the same path with `.read.sock` for its
+# extension. A caller needs no key material for either.
 yaam-agent --state-dir /var/lib/yaam/agent
+
+# A read through the sidecar. The request is ordinary HTTP; the signature is the sidecar's to add.
+curl --unix-socket /var/lib/yaam/agent/sockets/agent_a.read.sock \
+     "http://localhost/records?limit=10"
 
 # The operator command line.
 yaam --root /srv/memory check                       # schema, drift, backlog, quarantine
@@ -73,6 +81,13 @@ yaam --root /srv/memory verify-erasure --tombstone tomb-…
 
 Both long-running binaries shut down on `SIGINT` or `SIGTERM`: they stop accepting, finish what is
 in flight, and the sidecar removes its sockets and drains what the service will still take.
+
+A record and a read take different paths on purpose. A record can be sealed and queued, so its
+socket answers `accepted`, `spooled` or `rejected` — `spooled` meaning *durably held here*, which
+HTTP has no good status for. A read cannot be queued at all: an answer that arrives later is data
+that was already stale, so an unreachable service is a `503` and nothing is kept. Writes are
+refused on the read socket with `405`, because a record proxied as HTTP would skip both the sealing
+and the spool that the record socket gives it.
 
 Exit codes are the scriptable interface and are listed in every `--help`:
 

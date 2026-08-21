@@ -1,10 +1,21 @@
-//! Accepting records from local callers.
+//! Accepting records and reads from local callers.
 //!
-//! One socket per caller, permissioned to that caller, so the sidecar knows who is on the other end
-//! without being told. A single shared socket would let any local process attribute a record to any
-//! agent, which would quietly undo write attribution.
+//! Two sockets per caller, both permissioned to that caller, so the sidecar knows who is on the
+//! other end without being told. A single shared socket would let any local process attribute a
+//! record to any agent, which would quietly undo write attribution.
 //!
-//! The protocol is one JSON line in, one JSON line out. A caller writes a serialised
+//! | Socket | Protocol | Carries |
+//! |---|---|---|
+//! | `<name>.sock` | one JSON line in, one JSON line out | records |
+//! | `<name>.read.sock` | HTTP/1.1 | reads, signed as this caller |
+//!
+//! The read socket's path is *derived* from the record socket's — [`CallerSocket::read_path`] — so
+//! one configured path names both, and the two cannot be configured out of step. What answers on it
+//! is this crate's read proxy; the protocols stay on separate sockets because choosing between an
+//! HTTP request line and a JSON line on one socket means guessing from whatever the first read
+//! happened to return.
+//!
+//! The record protocol is one JSON line in, one JSON line out. A caller writes a serialised
 //! [`yaam_contract::ActionRecord`] and reads back one of
 //!
 //! ```text
@@ -30,7 +41,7 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +52,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use yaam_contract::request::SigningKeys;
 
+use crate::proxy::ReadProxy;
 use crate::sidecar::Sidecar;
 use crate::spool::{self, Spool};
 use crate::upstream::{Credentials, Upstream};
@@ -51,6 +63,15 @@ pub const CONFIG_FILE: &str = "upstream.json";
 
 /// Name of the spool directory inside the state directory.
 pub const SPOOL_DIR: &str = "spool";
+
+/// Extension a caller's record socket is expected to carry.
+const SOCKET_EXT: &str = "sock";
+
+/// What a caller's read socket is named, in place of [`SOCKET_EXT`].
+///
+/// Two suffixes on one stem, so `ls` shows the pair together and a caller that knows its record
+/// socket knows its read socket without being told a second path.
+const READ_SUFFIX: &str = ".read.sock";
 
 /// Longest line a caller may send, in bytes.
 ///
@@ -64,13 +85,33 @@ const DEFAULT_RETRY_MS: u64 = 5_000;
 /// Pause after a failed `accept`, so a persistent error cannot become a busy loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// A configured caller and the socket it owns.
+/// A configured caller and the sockets it owns.
 #[derive(Debug, Clone)]
 pub struct CallerSocket {
-    /// Agent identity records from this socket are attributed to.
+    /// Agent identity records and reads from these sockets are attributed to.
     pub agent: String,
-    /// Filesystem path of the socket.
+    /// Filesystem path of the record socket.
     pub path: std::path::PathBuf,
+}
+
+impl CallerSocket {
+    /// Path of this caller's read socket: the record socket's, with `.read.sock` for its extension.
+    ///
+    /// Derived rather than configured. One path names both sockets, so there is no way to point a
+    /// caller's reads at one identity and its records at another, and no second flag to forget.
+    #[must_use]
+    pub fn read_path(&self) -> PathBuf {
+        let stem = if self.path.extension().is_some_and(|ext| ext == SOCKET_EXT) {
+            self.path.file_stem()
+        } else {
+            // Not the expected name, so nothing is stripped: appending is the one rule that cannot
+            // collide with the record socket's own path.
+            self.path.file_name()
+        };
+        let mut name = stem.unwrap_or_default().to_os_string();
+        name.push(READ_SUFFIX);
+        self.path.with_file_name(name)
+    }
 }
 
 /// What the sidecar needs to know about the service it feeds.
@@ -190,7 +231,7 @@ fn invalid(message: String) -> Error {
     Error::Io(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
-/// Serves every configured caller socket until shutdown, with default [`Limits`].
+/// Serves every configured caller's sockets until shutdown, with default [`Limits`].
 ///
 /// Returns when the process is interrupted, after removing the sockets it created — a socket file
 /// outliving its sidecar is a caller writing into something that will never answer.
@@ -246,13 +287,15 @@ pub async fn interrupted() {
 /// that has to be right.
 ///
 /// Refuses to bind a socket whose agent this sidecar cannot sign as: the alternative is a caller
-/// writing records all day that the service will refuse one at a time.
+/// writing records all day that the service will refuse one at a time. The same key signs that
+/// caller's reads, so one missing credential refuses both of its sockets rather than half of them.
 ///
-/// Shutdown is ordered: stop accepting, let each open connection finish the record it is on, drain
-/// what the service will still take, then remove the sockets. Two parts of that carry weight.
-/// Removing a socket first would leave a caller writing into a path whose answer is never coming.
-/// And telling connections to stop between records is what bounds the wait at all — a caller holds
-/// its end open indefinitely, so waiting for the last one to hang up is waiting for ever.
+/// Shutdown is ordered: stop accepting, let each open connection finish the record or read it is
+/// on, drain what the service will still take, then remove the sockets. Two parts of that carry
+/// weight. Removing a socket first would leave a caller writing into a path whose answer is never
+/// coming. And telling connections to stop between requests is what bounds the wait at all — a
+/// caller holds its end open indefinitely, so waiting for the last one to hang up is waiting for
+/// ever.
 pub async fn serve_until<S>(
     sockets: &[CallerSocket],
     state_dir: &Path,
@@ -273,19 +316,29 @@ where
     }
     let spool = Spool::open_with_capacity(state_dir.join(SPOOL_DIR), limits.spool_capacity)?;
     let sidecar = Arc::new(Sidecar::new(upstream.clone(), spool));
+    // The read path gets its own handle on the upstream and no handle on the spool at all, which is
+    // what makes "a read is never spooled" a fact about the code rather than a promise about it.
+    let proxy = Arc::new(ReadProxy::new(upstream.clone()));
 
     let (closing, closed) = watch::channel(false);
     let mut accepting = JoinSet::new();
     for socket in sockets {
-        let (listener, owner) = bind(socket)?;
-        tracing::info!(agent = %socket.agent, path = %socket.path.display(), "listening");
-        accepting.spawn(accept_loop(
-            listener,
-            socket.agent.clone(),
-            owner,
-            Arc::clone(&sidecar),
-            closed.clone(),
-        ));
+        for serving in [
+            Serving::Records(Arc::clone(&sidecar)),
+            Serving::Reads(Arc::clone(&proxy)),
+        ] {
+            let path = serving.path(socket);
+            let (listener, owner) = bind(&path)?;
+            let (agent, serves) = (&socket.agent, serving.serves());
+            tracing::info!(%agent, serves, path = %path.display(), "listening");
+            accepting.spawn(accept_loop(
+                listener,
+                socket.agent.clone(),
+                owner,
+                serving,
+                closed.clone(),
+            ));
+        }
     }
     let retry = tokio::spawn(retry_loop(
         Arc::clone(&sidecar),
@@ -310,8 +363,40 @@ where
     }
     for socket in sockets {
         remove_socket(&socket.path);
+        remove_socket(&socket.read_path());
     }
     Ok(())
+}
+
+/// What one socket carries, and what it needs to carry it.
+///
+/// An enum rather than two accept loops: accepting, backing off after a failed accept and reaping
+/// finished connections are the same in both cases, and each variant holds exactly what its own
+/// protocol needs — the read path has no way to reach the spool.
+#[derive(Clone)]
+enum Serving {
+    /// Records, over the newline-JSON protocol.
+    Records(Arc<Sidecar>),
+    /// Reads, over HTTP/1.1.
+    Reads(Arc<ReadProxy>),
+}
+
+impl Serving {
+    /// The socket path this protocol is served on for `socket`.
+    fn path(&self, socket: &CallerSocket) -> PathBuf {
+        match self {
+            Self::Records(_) => socket.path.clone(),
+            Self::Reads(_) => socket.read_path(),
+        }
+    }
+
+    /// What the startup log calls this socket.
+    fn serves(&self) -> &'static str {
+        match self {
+            Self::Records(_) => "records",
+            Self::Reads(_) => "reads",
+        }
+    }
 }
 
 /// Binds one caller socket, returning it with the uid that owns it.
@@ -319,45 +404,42 @@ where
 /// The mode is set immediately after the bind. The window between the two is why peer credentials
 /// are checked as well: a connection that slips through it still has to come from the uid the socket
 /// ended up owned by.
-fn bind(socket: &CallerSocket) -> crate::Result<(UnixListener, u32)> {
-    if let Some(parent) = socket.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+fn bind(path: &Path) -> crate::Result<(UnixListener, u32)> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    match fs::symlink_metadata(&socket.path) {
+    match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
             // Whether anybody is answering is the whole question. A socket nobody answers is litter
             // from a process that died, and refusing to start over it would make every crash need a
             // manual cleanup. A socket somebody *does* answer is a real conflict: two sidecars on
             // one path would each take an arbitrary share of one caller's records, and both would
             // sign as the same agent — so that one refuses rather than stealing the path.
-            if std::os::unix::net::UnixStream::connect(&socket.path).is_ok() {
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
                 return Err(Error::Io(io::Error::new(
                     io::ErrorKind::AddrInUse,
-                    format!(
-                        "{} is already served by another process",
-                        socket.path.display()
-                    ),
+                    format!("{} is already served by another process", path.display()),
                 )));
             }
-            fs::remove_file(&socket.path)?;
+            fs::remove_file(path)?;
             tracing::warn!(
-                path = %socket.path.display(),
+                path = %path.display(),
                 "replaced a socket nobody was answering"
             );
         }
         Ok(_) => {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!("{} exists and is not a socket", socket.path.display()),
+                format!("{} exists and is not a socket", path.display()),
             )));
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
 
-    let listener = UnixListener::bind(&socket.path)?;
-    fs::set_permissions(&socket.path, fs::Permissions::from_mode(0o600))?;
-    let owner = fs::metadata(&socket.path)?.uid();
+    let listener = UnixListener::bind(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let owner = fs::metadata(path)?.uid();
     Ok((listener, owner))
 }
 
@@ -378,7 +460,7 @@ async fn accept_loop(
     listener: UnixListener,
     agent: String,
     owner: u32,
-    sidecar: Arc<Sidecar>,
+    serving: Serving,
     mut closed: watch::Receiver<bool>,
 ) {
     let mut connections = JoinSet::new();
@@ -391,11 +473,16 @@ async fn accept_loop(
         };
         match accepted {
             Ok((stream, _)) => {
-                let (agent, sidecar, closed) =
-                    (agent.clone(), Arc::clone(&sidecar), closed.clone());
+                let (agent, closed) = (agent.clone(), closed.clone());
+                let serving = serving.clone();
                 connections.spawn(async move {
-                    if let Err(e) = serve_connection(stream, &agent, owner, &sidecar, closed).await
-                    {
+                    let served = match &serving {
+                        Serving::Records(sidecar) => {
+                            serve_connection(stream, &agent, owner, sidecar, closed).await
+                        }
+                        Serving::Reads(proxy) => proxy.serve(stream, &agent, owner, closed).await,
+                    };
+                    if let Err(e) = served {
                         tracing::warn!(agent = %agent, error = %e, "connection ended badly");
                     }
                 });
@@ -436,7 +523,7 @@ async fn serve_connection(
     mut closed: watch::Receiver<bool>,
 ) -> crate::Result<()> {
     let peer = stream.peer_cred()?;
-    if !peer_may_write(peer.uid(), owner) {
+    if !peer_owns_socket(peer.uid(), owner) {
         tracing::warn!(
             agent,
             peer_uid = peer.uid(),
@@ -487,7 +574,10 @@ async fn serve_connection(
 /// The `0600` mode already turns away anyone but the owner; this checks the same fact from the other
 /// side. Credentials arrive with the connection and cannot be changed after the fact, while a mode
 /// can — including in the moment between binding a socket and tightening it.
-fn peer_may_write(peer_uid: u32, socket_owner_uid: u32) -> bool {
+///
+/// Shared with the read path rather than restated there: one predicate is what keeps both of a
+/// caller's sockets answering the same question about who is allowed to use them.
+pub(crate) fn peer_owns_socket(peer_uid: u32, socket_owner_uid: u32) -> bool {
     peer_uid == socket_owner_uid
 }
 
@@ -668,6 +758,15 @@ mod tests {
         let mut answer = String::new();
         BufReader::new(read).read_line(&mut answer).await.unwrap();
         answer
+    }
+
+    /// Sends one raw HTTP request to a read socket and reads the whole answer.
+    async fn read_request(path: &Path, request: &str) -> String {
+        let mut stream = UnixStream::connect(path).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer).await.unwrap();
+        String::from_utf8_lossy(&answer).into_owned()
     }
 
     #[tokio::test]
@@ -984,6 +1083,10 @@ mod tests {
             !path.exists(),
             "a socket outliving its sidecar is a caller writing into nothing"
         );
+        assert!(
+            !sockets[0].read_path().exists(),
+            "the read socket goes the same way, for the same reason"
+        );
         assert_eq!(stub.received().len(), 1);
         assert!(
             crate::envelope::open(&secret, &stub.received()[0]).is_ok(),
@@ -1075,11 +1178,111 @@ mod tests {
         assert!(!path.exists(), "the socket must not have been bound");
     }
 
+    #[tokio::test]
+    async fn each_caller_gets_a_read_socket_beside_its_record_socket() {
+        let stub = Stub::start(200).await;
+        let (dir, _secret) = state_dir(&stub, 60_000, 8);
+        let socket = CallerSocket {
+            agent: "writer".to_owned(),
+            path: dir.path().join("sockets/writer.sock"),
+        };
+        let reads = socket.read_path();
+        assert_eq!(reads, dir.path().join("sockets/writer.read.sock"));
+        let serving = start(vec![socket.clone()], dir.path()).await;
+        await_socket(&reads).await;
+
+        // The same protections as the record socket, because it carries the same identity.
+        let mode = fs::metadata(&reads).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+
+        let answer = read_request(
+            &reads,
+            "GET /records?limit=1 HTTP/1.1\r\nhost: sidecar\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+        assert_eq!(stub.request_lines(), ["GET /records?limit=1 HTTP/1.1"]);
+        // Signed as the socket's agent, over the target the query string is part of.
+        assert_eq!(
+            stub.header(0, yaam_contract::request::SIGNATURE_HEADER),
+            Some(SigningKeys::new(hex::decode(KEY).unwrap()).sign(
+                "GET",
+                "/records?limit=1",
+                "writer",
+                b""
+            ))
+        );
+
+        // And a record still goes to the record socket, unchanged.
+        assert_eq!(
+            round_trip(&socket.path, &line("writer", "still working"))
+                .await
+                .trim(),
+            r#"{"status":"accepted"}"#
+        );
+
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_write_on_the_read_socket_is_refused_and_never_spooled() {
+        let stub = Stub::start(200).await;
+        let (dir, _secret) = state_dir(&stub, 60_000, 8);
+        let socket = CallerSocket {
+            agent: "writer".to_owned(),
+            path: dir.path().join("sockets/writer.sock"),
+        };
+        let reads = socket.read_path();
+        let serving = start(vec![socket], dir.path()).await;
+        await_socket(&reads).await;
+
+        let answer = read_request(
+            &reads,
+            "POST /records HTTP/1.1\r\nhost: sidecar\r\ncontent-length: 2\r\nconnection: \
+             close\r\n\r\n{}",
+        )
+        .await;
+        assert!(answer.starts_with("HTTP/1.1 405 "), "{answer}");
+        assert!(stub.received().is_empty(), "a write must not be proxied");
+        assert!(
+            fs::read_dir(dir.path().join(SPOOL_DIR))
+                .unwrap()
+                .next()
+                .is_none(),
+            "and it must not be queued either — the record socket is what seals and spools"
+        );
+
+        serving.abort();
+    }
+
+    #[test]
+    fn a_read_socket_is_named_after_the_record_socket() {
+        let named = |path: &str| {
+            CallerSocket {
+                agent: "writer".to_owned(),
+                path: std::path::PathBuf::from(path),
+            }
+            .read_path()
+        };
+
+        assert_eq!(
+            named("/run/yaam/writer.sock"),
+            Path::new("/run/yaam/writer.read.sock")
+        );
+        // A path that does not end in `.sock` keeps its whole name, so the derived path cannot
+        // collide with the record socket's.
+        assert_eq!(
+            named("/run/yaam/writer"),
+            Path::new("/run/yaam/writer.read.sock")
+        );
+        assert_eq!(named("writer.socket"), Path::new("writer.socket.read.sock"));
+    }
+
     #[test]
     fn a_peer_that_is_not_the_socket_owner_is_refused() {
-        assert!(peer_may_write(1000, 1000));
-        assert!(!peer_may_write(1000, 1001));
-        assert!(!peer_may_write(0, 1000), "root is not an exception");
+        assert!(peer_owns_socket(1000, 1000));
+        assert!(!peer_owns_socket(1000, 1001));
+        assert!(!peer_owns_socket(0, 1000), "root is not an exception");
     }
 
     #[test]

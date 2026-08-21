@@ -130,8 +130,10 @@ async fn serve_one(
 
     let code = status.load(Ordering::SeqCst);
     let body = format!("stub says {code}");
+    // A content type, so a test can tell whether a proxied answer kept the service's own.
     let response = format!(
-        "HTTP/1.1 {code} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {code} X\r\ncontent-type: text/plain\r\ncontent-length: \
+         {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;

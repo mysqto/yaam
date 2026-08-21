@@ -1,7 +1,9 @@
 //! Request authentication and write attribution.
 //!
 //! Every request carries a signature, reads included: what a caller may see is decided per caller,
-//! and an anonymous request has no caller to decide about.
+//! and an anonymous request has no caller to decide about. A caller that holds no key of its own
+//! reads through a sidecar, which signs as that caller. Nothing here is relaxed for it: the service
+//! cannot tell a proxied read from a direct one, and must not.
 //!
 //! What a signature covers, and how it is compared, is [`yaam_contract::request`] — shared with
 //! everything that signs, because a service and a sidecar that spell the canonical message
