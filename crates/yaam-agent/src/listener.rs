@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -36,6 +37,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 use yaam_contract::request::SigningKeys;
 
 use crate::sidecar::Sidecar;
@@ -200,15 +203,66 @@ pub async fn serve(
 }
 
 /// As [`serve`], with the spool bound and retry cadence named.
-///
-/// Refuses to bind a socket whose agent this sidecar cannot sign as: the alternative is a caller
-/// writing records all day that the service will refuse one at a time.
 pub async fn serve_with(
     sockets: &[CallerSocket],
     state_dir: &Path,
     upstream: &Upstream,
     limits: Limits,
 ) -> crate::Result<()> {
+    serve_until(sockets, state_dir, upstream, limits, interrupted()).await
+}
+
+/// Completes on `SIGINT` or `SIGTERM`.
+///
+/// Public because a process that serves alongside this sidecar needs the same wait, and two
+/// spellings of which signals mean shutdown is how one half of a deployment exits on `SIGTERM` and
+/// the other keeps running.
+pub async fn interrupted() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    match (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+    ) {
+        (Ok(mut interrupt), Ok(mut terminate)) => {
+            tokio::select! {
+                _ = interrupt.recv() => tracing::info!("interrupted"),
+                _ = terminate.recv() => tracing::info!("terminated"),
+            }
+        }
+        // With no handler installed the default disposition applies and the signal ends the process
+        // anyway, so there is nothing useful to wait for or to do instead.
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::error!(%error, "cannot listen for signals");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// As [`serve_with`], returning once `shutdown` completes.
+///
+/// `shutdown` is a parameter rather than a signal handler reached for inside, because a shutdown
+/// path only a signal can trigger is a shutdown path no test exercises — and this one has ordering
+/// that has to be right.
+///
+/// Refuses to bind a socket whose agent this sidecar cannot sign as: the alternative is a caller
+/// writing records all day that the service will refuse one at a time.
+///
+/// Shutdown is ordered: stop accepting, let each open connection finish the record it is on, drain
+/// what the service will still take, then remove the sockets. Two parts of that carry weight.
+/// Removing a socket first would leave a caller writing into a path whose answer is never coming.
+/// And telling connections to stop between records is what bounds the wait at all — a caller holds
+/// its end open indefinitely, so waiting for the last one to hang up is waiting for ever.
+pub async fn serve_until<S>(
+    sockets: &[CallerSocket],
+    state_dir: &Path,
+    upstream: &Upstream,
+    limits: Limits,
+    shutdown: S,
+) -> crate::Result<()>
+where
+    S: Future<Output = ()>,
+{
     for socket in sockets {
         if upstream.credentials.keys(&socket.agent).is_none() {
             return Err(invalid(format!(
@@ -220,26 +274,39 @@ pub async fn serve_with(
     let spool = Spool::open_with_capacity(state_dir.join(SPOOL_DIR), limits.spool_capacity)?;
     let sidecar = Arc::new(Sidecar::new(upstream.clone(), spool));
 
-    let mut tasks = Vec::with_capacity(sockets.len() + 1);
+    let (closing, closed) = watch::channel(false);
+    let mut accepting = JoinSet::new();
     for socket in sockets {
         let (listener, owner) = bind(socket)?;
         tracing::info!(agent = %socket.agent, path = %socket.path.display(), "listening");
-        tasks.push(tokio::spawn(accept_loop(
+        accepting.spawn(accept_loop(
             listener,
             socket.agent.clone(),
             owner,
             Arc::clone(&sidecar),
-        )));
+            closed.clone(),
+        ));
     }
-    tasks.push(tokio::spawn(retry_loop(
+    let retry = tokio::spawn(retry_loop(
         Arc::clone(&sidecar),
         Duration::from_millis(limits.retry_interval_ms),
-    )));
+    ));
 
-    tokio::signal::ctrl_c().await?;
+    shutdown.await;
     tracing::info!("shutting down");
-    for task in tasks {
-        task.abort();
+
+    // The retry loop is aborted rather than woken: it is a timer, and the drain below is the same
+    // work done once more with nothing else competing for the spool lock.
+    retry.abort();
+    let _ = closing.send(true);
+    while accepting.join_next().await.is_some() {}
+
+    // Best effort by design. What the service will not take now stays on disk sealed, which is what
+    // the spool is for — a shutdown that waited for an unreachable service would never finish.
+    match sidecar.flush().await {
+        Ok(0) => {}
+        Ok(sent) => tracing::info!(sent, "drained the spool on the way out"),
+        Err(error) => tracing::warn!(%error, "spool not drained; entries stay for the next run"),
     }
     for socket in sockets {
         remove_socket(&socket.path);
@@ -253,9 +320,31 @@ pub async fn serve_with(
 /// are checked as well: a connection that slips through it still has to come from the uid the socket
 /// ended up owned by.
 fn bind(socket: &CallerSocket) -> crate::Result<(UnixListener, u32)> {
+    if let Some(parent) = socket.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
     match fs::symlink_metadata(&socket.path) {
-        // Only this process binds this path, so an existing socket is from a run that is over.
-        Ok(meta) if meta.file_type().is_socket() => fs::remove_file(&socket.path)?,
+        Ok(meta) if meta.file_type().is_socket() => {
+            // Whether anybody is answering is the whole question. A socket nobody answers is litter
+            // from a process that died, and refusing to start over it would make every crash need a
+            // manual cleanup. A socket somebody *does* answer is a real conflict: two sidecars on
+            // one path would each take an arbitrary share of one caller's records, and both would
+            // sign as the same agent — so that one refuses rather than stealing the path.
+            if std::os::unix::net::UnixStream::connect(&socket.path).is_ok() {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "{} is already served by another process",
+                        socket.path.display()
+                    ),
+                )));
+            }
+            fs::remove_file(&socket.path)?;
+            tracing::warn!(
+                path = %socket.path.display(),
+                "replaced a socket nobody was answering"
+            );
+        }
         Ok(_) => {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -281,14 +370,32 @@ fn remove_socket(path: &Path) {
     }
 }
 
-/// Accepts connections on one caller socket for as long as it lives.
-async fn accept_loop(listener: UnixListener, agent: String, owner: u32, sidecar: Arc<Sidecar>) {
+/// Accepts connections on one caller socket until `closed` says to stop.
+///
+/// The listener is dropped before the open connections are waited on, so nothing new arrives on a
+/// socket that is about to be removed.
+async fn accept_loop(
+    listener: UnixListener,
+    agent: String,
+    owner: u32,
+    sidecar: Arc<Sidecar>,
+    mut closed: watch::Receiver<bool>,
+) {
+    let mut connections = JoinSet::new();
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            // Checked first, so a shutdown wins over a connection that arrived the same moment.
+            _ = closed.changed() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
             Ok((stream, _)) => {
-                let (agent, sidecar) = (agent.clone(), Arc::clone(&sidecar));
-                tokio::spawn(async move {
-                    if let Err(e) = serve_connection(stream, &agent, owner, &sidecar).await {
+                let (agent, sidecar, closed) =
+                    (agent.clone(), Arc::clone(&sidecar), closed.clone());
+                connections.spawn(async move {
+                    if let Err(e) = serve_connection(stream, &agent, owner, &sidecar, closed).await
+                    {
                         tracing::warn!(agent = %agent, error = %e, "connection ended badly");
                     }
                 });
@@ -298,7 +405,11 @@ async fn accept_loop(listener: UnixListener, agent: String, owner: u32, sidecar:
                 tokio::time::sleep(ACCEPT_BACKOFF).await;
             }
         }
+        // Reap what has finished, so the set does not grow for the life of the process.
+        while connections.try_join_next().is_some() {}
     }
+    drop(listener);
+    while connections.join_next().await.is_some() {}
 }
 
 /// Drains the spool on a timer, so a backlog clears without waiting for the next caller write.
@@ -322,6 +433,7 @@ async fn serve_connection(
     agent: &str,
     owner: u32,
     sidecar: &Sidecar,
+    mut closed: watch::Receiver<bool>,
 ) -> crate::Result<()> {
     let peer = stream.peer_cred()?;
     if !peer_may_write(peer.uid(), owner) {
@@ -340,10 +452,14 @@ async fn serve_connection(
         let mut line = Vec::new();
         // A fresh limit per line: a bound on the whole stream would cut off a caller's later
         // records for the sin of having sent earlier ones.
-        let read = (&mut reader)
-            .take(MAX_LINE + 1)
-            .read_until(b'\n', &mut line)
-            .await?;
+        let mut bounded = (&mut reader).take(MAX_LINE + 1);
+        let read = tokio::select! {
+            biased;
+            // Between records, never during one: a shutdown abandons what had not been read yet
+            // and finishes what had, so no caller is left without an answer to a record it sent.
+            _ = closed.changed() => return Ok(()),
+            read = bounded.read_until(b'\n', &mut line) => read?,
+        };
         if read == 0 {
             return Ok(());
         }
@@ -500,20 +616,48 @@ mod tests {
         let handle = tokio::spawn(async move {
             serve_with(&owned, &state, &upstream, limits).await.unwrap();
         });
-        // Connectability, not existence: a stale socket file from a previous run exists before
-        // this sidecar has replaced it.
         for socket in &sockets {
-            let mut ready = false;
-            for _ in 0..200 {
-                if UnixStream::connect(&socket.path).await.is_ok() {
-                    ready = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert!(ready, "socket never accepted a connection");
+            await_socket(&socket.path).await;
         }
         handle
+    }
+
+    /// Starts [`serve_until`] in the background, returning the handle that stops it.
+    ///
+    /// Separate from [`start`] because a test of shutdown has to be able to end the wait, and a
+    /// signal is not something a test can send to itself without ending the test process too.
+    fn start_until(
+        sockets: &[CallerSocket],
+        state: &Path,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<crate::Result<()>>,
+    ) {
+        let config = Config::load(state).expect("configuration");
+        let upstream = config.upstream().expect("upstream");
+        let (stop, wait) = tokio::sync::oneshot::channel::<()>();
+        let (owned, state) = (sockets.to_vec(), state.to_path_buf());
+        let serving = tokio::spawn(async move {
+            serve_until(&owned, &state, &upstream, config.limits(), async {
+                let _ = wait.await;
+            })
+            .await
+        });
+        (stop, serving)
+    }
+
+    /// Waits until a socket answers.
+    ///
+    /// Connectability, not existence: a stale socket file from a previous run exists before this
+    /// sidecar has replaced it, so a test that waited for the file would race the replacement.
+    async fn await_socket(path: &Path) {
+        for _ in 0..200 {
+            if UnixStream::connect(path).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{} never accepted a connection", path.display());
     }
 
     /// Writes one line to a socket and reads the answer.
@@ -778,6 +922,114 @@ mod tests {
         );
 
         serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_socket_someone_is_answering_is_not_taken_over() {
+        let stub = Stub::start(200).await;
+        let (dir, _secret) = state_dir(&stub, 60_000, 8);
+        let path = dir.path().join("writer.sock");
+        let socket = CallerSocket {
+            agent: "writer".to_owned(),
+            path: path.clone(),
+        };
+        let serving = start(vec![socket.clone()], dir.path()).await;
+
+        // The same path, while the first sidecar is still answering on it. Two sidecars here would
+        // each take an arbitrary share of one caller's records.
+        let config = Config::load(dir.path()).expect("configuration");
+        let err = serve(&[socket], dir.path(), &config.upstream().unwrap())
+            .await
+            .expect_err("a live socket is a conflict, not litter");
+        assert!(
+            err.to_string().contains("already served"),
+            "the reason has to name the conflict: {err}"
+        );
+
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_answers_the_record_in_flight_and_removes_the_socket() {
+        let stub = Stub::start(200).await;
+        let (dir, secret) = state_dir(&stub, 60_000, 8);
+        let path = dir.path().join("sockets/writer.sock");
+        let sockets = vec![CallerSocket {
+            agent: "writer".to_owned(),
+            path: path.clone(),
+        }];
+
+        let (stop, serving) = start_until(&sockets, dir.path());
+        await_socket(&path).await;
+
+        assert_eq!(
+            round_trip(&path, &line("writer", "before the stop"))
+                .await
+                .trim(),
+            r#"{"status":"accepted"}"#
+        );
+        // Held open across the shutdown, which is what an idle caller does. A shutdown that waited
+        // for the last caller to hang up would never return.
+        let held = UnixStream::connect(&path).await.expect("connect");
+
+        stop.send(()).expect("the serve loop is still waiting");
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("shutdown must not wait for a caller to hang up")
+            .expect("join")
+            .expect("a clean shutdown");
+        drop(held);
+
+        assert!(
+            !path.exists(),
+            "a socket outliving its sidecar is a caller writing into nothing"
+        );
+        assert_eq!(stub.received().len(), 1);
+        assert!(
+            crate::envelope::open(&secret, &stub.received()[0]).is_ok(),
+            "the record went out sealed to the service"
+        );
+    }
+
+    /// "Drain what you can" is the shutdown promise, and it has to be more than a comment.
+    #[tokio::test]
+    async fn a_shutdown_drains_what_the_service_will_still_take() {
+        let stub = Stub::start(503).await;
+        // A retry interval long enough that only the shutdown drain can be what sends it.
+        let (dir, secret) = state_dir(&stub, 600_000, 8);
+        let path = dir.path().join("sockets/writer.sock");
+        let sockets = vec![CallerSocket {
+            agent: "writer".to_owned(),
+            path: path.clone(),
+        }];
+
+        let (stop, serving) = start_until(&sockets, dir.path());
+        await_socket(&path).await;
+        assert_eq!(
+            round_trip(&path, &line("writer", "held while the service was down"))
+                .await
+                .trim(),
+            r#"{"status":"spooled"}"#
+        );
+
+        // Every refused attempt is a body the stub also saw, so only what follows says anything.
+        let before = stub.received().len();
+        stub.respond_with(200);
+        stop.send(()).expect("the serve loop is still waiting");
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("a shutdown has to finish")
+            .expect("join")
+            .expect("a clean shutdown");
+
+        let posted = stub.received();
+        assert_eq!(
+            posted.len(),
+            before + 1,
+            "the record the sidecar was holding has to go out while it still can"
+        );
+        assert!(crate::envelope::open(&secret, &posted[before]).is_ok());
+        assert!(!path.exists());
     }
 
     #[tokio::test]

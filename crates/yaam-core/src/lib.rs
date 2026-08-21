@@ -33,6 +33,8 @@
 pub mod bundle;
 pub mod erase;
 pub mod error;
+pub mod health;
+pub mod paths;
 pub mod pipeline;
 pub mod reindex;
 pub mod resolve;
@@ -46,4 +48,5 @@ mod policy;
 mod testkit;
 
 pub use error::{Error, Result};
+pub use paths::Paths;
 pub use pipeline::Pipeline;

@@ -1,0 +1,56 @@
+[package]
+name = "yaam-cli"
+description = "The three entry points: the service, the sidecar, and the operator command line."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# One crate for all three binaries, because they have to agree about where the store is. Three
+# crates would be three argument parsers, and the first setting one of them spelled differently
+# would be a service reading an index nothing writes.
+[[bin]]
+name = "yaam"
+path = "src/bin/yaam.rs"
+
+[[bin]]
+name = "yaam-server"
+path = "src/bin/yaam-server.rs"
+
+[[bin]]
+name = "yaam-agent"
+path = "src/bin/yaam-agent.rs"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+hex.workspace = true
+yaam-agent = { path = "../yaam-agent" }
+yaam-contract = { path = "../yaam-contract" }
+yaam-core = { path = "../yaam-core" }
+yaam-crypto = { path = "../yaam-crypto" }
+yaam-server = { path = "../yaam-server" }
+yaam-store = { path = "../yaam-store" }
+# Argument parsing only: no colour or suggestion machinery, which is most of clap's dependency tree.
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+# A binary that emits none of the library's warnings is a binary that hides the sweeper telling it
+# something is wrong. `fmt` alone — filtering is one environment variable read by hand, which costs
+# no dependency and cannot be misconfigured into silence.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
+# Serving the router, and the runtime both long-running binaries need.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+axum = "0.8"
+
+[dev-dependencies]
+tempfile.workspace = true
+# Rendering one record straight into the tree, for the drift case a running service cannot produce.
+yaam-md = { path = "../yaam-md" }
+# Writing an index at a schema version this build cannot read. Nothing in the library can produce
+# that state — the writer refuses it — so the refusal is only testable by making the file by hand.
+rusqlite = { version = "0.37", features = ["bundled"] }
