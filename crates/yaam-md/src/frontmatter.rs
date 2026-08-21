@@ -27,7 +27,11 @@ use crate::Error;
 /// Order follows the declaration order of `ActionRecord`, so re-rendering an unchanged record is
 /// byte-identical and a new field has exactly one obvious place. `summary` is absent by design: it
 /// is prose, so it lives in the body.
-const KEYS: [&str; 19] = [
+///
+/// Public because it is one of the three shapes `yaam_contract::lockstep` compares. That check has
+/// to read the list this module actually uses; a copy of it kept for the check would be the fourth
+/// shape, and would drift the way the first three did.
+pub const KEYS: [&str; 19] = [
     "record_id",
     "schema_ver",
     "at",

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -11,7 +12,7 @@ use crate::{
 };
 
 /// How the outcome of an action is reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// The action did what it set out to do.
@@ -25,7 +26,7 @@ pub enum Outcome {
 }
 
 /// Who may read a record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
     /// The actor only.
@@ -60,7 +61,7 @@ impl Visibility {
 }
 
 /// Whether a record's body is erasable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DataClass {
     /// System and operational activity. Body stored in plaintext.
@@ -70,8 +71,10 @@ pub enum DataClass {
 }
 
 /// The part a subject plays in a record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// Renamed for the schema, as `entity::Role` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(rename = "SubjectRole")]
 pub enum Role {
     /// Acted, or was acted for.
     Principal,
@@ -83,7 +86,7 @@ pub enum Role {
 ///
 /// Unknown fields are refused for the reason [`ActionRecord`] refuses them: a field this type does
 /// not declare is one nothing downstream will ever read.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectRef {
     /// The keyed pseudonym.
@@ -98,13 +101,19 @@ pub struct SubjectRef {
 ///
 /// `action` and `outcome` are top-level and indexed because every useful query filters on them.
 ///
+/// The wire record, the Markdown frontmatter and the index columns are three projections of this
+/// type and cannot diverge. `summary` is the exception, being prose that becomes the record body.
+///
 /// Unknown fields are refused, for the reason [`WriteRequest`] refuses them one level up, and with
 /// more force: here the mistyped field *is* the record, so dropping it would store history the
 /// caller did not describe and cannot tell is missing. `attrs` stays open — it is a declared map,
 /// checked against `spec/attrs-schema.yaml` rather than against this struct.
 ///
 /// [`WriteRequest`]: crate::request::WriteRequest
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// Every other divergence between the three projections fails the build: `crate::lockstep` holds the
+// rule and the table of deliberate exceptions, and `xtask` hands it the three shapes. It was a
+// convention before that, and a convention missed it twice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActionRecord {
     /// Identity and idempotency key.
@@ -124,10 +133,15 @@ pub struct ActionRecord {
     /// Ties every stage of one interaction together.
     pub correlation_id: Option<String>,
     /// What was done.
+    #[schemars(length(min = 1))]
     pub action: String,
     /// How it went.
     pub outcome: Outcome,
     /// Declared, classified attributes.
+    ///
+    /// Deliberately open: the permitted keys are declared per action in `spec/attrs-schema.yaml`,
+    /// which is deployment configuration this type cannot see. Closing the map here would make the
+    /// contract carry one deployment's vocabulary.
     pub attrs: BTreeMap<String, attrs::Value>,
     /// Entities this record joins on.
     pub entities: Vec<EntityRef>,

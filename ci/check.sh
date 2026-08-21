@@ -7,6 +7,7 @@ cd "$(dirname "$0")/.."
 echo "── hygiene ──";  bash ci/hygiene.sh
 echo "── fmt ──";      cargo fmt --all --check
 echo "── clippy ──";   cargo clippy --workspace --all-targets -- -D warnings
+echo "── schemas ──";  cargo xtask check
 echo "── test ──";     cargo test --workspace
 echo "── coverage ──"; cargo llvm-cov --workspace --fail-under-lines 85 --summary-only
 echo "all gates passed"

@@ -1,0 +1,46 @@
+{
+  "$defs": {
+    "RecordId": {
+      "description": "A ULID, and the write's idempotency key. Crockford base32: uppercase, without `I`, `L`, `O` or `U`, so a transcription slip cannot turn one valid identifier into another.",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "type": "string"
+    }
+  },
+  "$id": "https://github.com/mysqto/yaam/blob/main/spec/schemas/bundle.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Context assembled for a caller.",
+  "properties": {
+    "degraded": {
+      "description": "`true` when a source was unavailable and the bundle is incomplete.",
+      "type": "boolean"
+    },
+    "omitted": {
+      "description": "What was left out, and why.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "records": {
+      "description": "Records judged relevant.",
+      "items": {
+        "$ref": "#/$defs/RecordId"
+      },
+      "type": "array"
+    },
+    "token_estimate": {
+      "description": "Rough token cost, advisory only.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "records",
+    "degraded",
+    "omitted",
+    "token_estimate"
+  ],
+  "title": "BundleResponse",
+  "type": "object"
+}

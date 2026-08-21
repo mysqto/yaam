@@ -1,0 +1,48 @@
+{
+  "$defs": {
+    "RecordId": {
+      "description": "A ULID, and the write's idempotency key. Crockford base32: uppercase, without `I`, `L`, `O` or `U`, so a transcription slip cannot turn one valid identifier into another.",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "type": "string"
+    },
+    "WriteStatus": {
+      "description": "What a write did.",
+      "oneOf": [
+        {
+          "const": "stored",
+          "description": "First time this identifier was seen.",
+          "type": "string"
+        },
+        {
+          "const": "duplicate",
+          "description": "Already present; nothing changed.",
+          "type": "string"
+        },
+        {
+          "const": "quarantined",
+          "description": "Held pending subject resolution.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/mysqto/yaam/blob/main/spec/schemas/result.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Answer to a write.",
+  "properties": {
+    "record_id": {
+      "$ref": "#/$defs/RecordId",
+      "description": "Identifier the record is addressable by."
+    },
+    "status": {
+      "$ref": "#/$defs/WriteStatus",
+      "description": "What happened to it."
+    }
+  },
+  "required": [
+    "record_id",
+    "status"
+  ],
+  "title": "WriteResponse",
+  "type": "object"
+}

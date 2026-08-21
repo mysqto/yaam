@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use regex::Regex;
 use saphyr::Yaml;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, spec_yaml};
@@ -33,7 +34,7 @@ const ESCAPES: [(char, char); 5] = [('~', '~'), ('/', 's'), (':', 'c'), ('#', 'h
 /// other than what was sent.
 ///
 /// [`ActionRecord`]: crate::ActionRecord
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EntityRef {
     /// The entity kind, e.g. `order_ref`.
@@ -43,12 +44,19 @@ pub struct EntityRef {
     /// How the entity relates to the record.
     pub role: Role,
     /// Extraction confidence. Below `1.0` means inferred from text rather than a structured field.
+    ///
+    /// The bound is published because `ActionRecord::validate` enforces it: a caller that can read
+    /// the schema can fail before sending rather than after.
+    #[schemars(range(min = 0.0, max = 1.0))]
     pub confidence: f32,
 }
 
 /// The part an entity plays in a record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// Renamed for the schema: a record names two kinds of role, and one `Role` in the published bundle
+// would leave a vendoring implementation to guess which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(rename = "EntityRole")]
 pub enum Role {
     /// The record is chiefly about this entity.
     Primary,
