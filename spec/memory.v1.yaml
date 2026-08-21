@@ -1,0 +1,1095 @@
+# The wire contract of the memory service, as the implementation in `crates/yaam-server` serves it.
+#
+# Part of the vendorable bundle: an integrator — including a second implementation in another
+# language — should be able to work from this file alone, without reading Rust.
+#
+# `crates/yaam-server/tests/spec_contract.rs` drives the real router and fails if this file and the
+# router disagree about a path, a method, a status code, a query parameter, a body field, a header
+# name or the sealed-body media type. A spec nobody checks gets believed after it stops being true.
+openapi: 3.1.0
+
+info:
+  title: yaam memory service
+  version: 1.0.0
+  summary: Signed HTTP surface over an agent memory store — five endpoints, no rebuild endpoint.
+  license:
+    name: MIT
+    identifier: MIT
+  description: |
+    Five endpoints. Markdown is the source of truth underneath; the index this service reads is
+    derived and disposable.
+
+    ## Every request is signed, reads included
+
+    Two headers on every request, on reads as much as on writes:
+
+    | Header | |
+    |---|---|
+    | `x-yaam-agent` | the agent identity the request is signed as |
+    | `x-yaam-signature` | lowercase hex of the tag below, 64 characters |
+
+    The tag is `HMAC-SHA256` over four fields, each of the first three followed by one `\n`:
+
+    ```text
+    method    e.g. GET, POST — as it appears on the request line
+    target    request target, query string included — e.g. /records?action=deploy&limit=5
+    agent     the value of x-yaam-agent
+    body      the request bytes, exactly as sent; empty for a GET
+    ```
+
+    ```text
+    tag = HMAC-SHA256(key, method + "\n" + target + "\n" + agent + "\n" + body)
+    ```
+
+    **The query string is inside the signature.** For a read the query *is* the request, so a
+    signature over the bare path alone would let one captured read be replayed as any other: strip
+    the filters and a narrow read becomes a read of everything the credential can see. Sign the
+    target you send, byte for byte — `/records` and `/records?limit=5` are two different requests,
+    and so are two spellings of the same filters in a different order.
+
+    The separator is `\n` because no field before the body can contain one — a method and a request
+    target come off the HTTP request line, and a header value cannot hold a newline — so no field
+    can be stuffed to look like the next.
+
+    Two keys are accepted per agent: the current one and the one most recently rolled away from, so
+    a key roll needs no synchronised restart. Tags are compared in constant time, and a malformed
+    signature is reported exactly like a wrong one.
+
+    Replay of a byte-identical request is deliberately not defended against here. Writes are
+    idempotent on `record_id` and reads mutate nothing, so a replayed message gains an attacker
+    nothing the captured response already gave them. Keeping the message secret in flight is the
+    transport's job.
+
+    ## Reads are scoped per caller, and fail closed
+
+    Visibility is decided from the credential the signature proved, never from the request. There is
+    no scope, team or visibility parameter, and adding one to a query is rejected as an unknown
+    parameter rather than honoured. A caller sees `org` records, `team` records for the teams its
+    credential names, `owner` records only where it is the record's own agent, and `operator`
+    records only with the operator role. A read whose entitlements cannot be established returns
+    nothing rather than everything.
+
+    ## Status codes carry meaning
+
+    | | |
+    |---|---|
+    | `200` | read answered; or a write whose identifier was already stored — nothing changed |
+    | `201` | write stored, first time this identifier was seen |
+    | `202` | write held in quarantine pending subject resolution; re-present it later |
+    | `400` | query string not understood — unknown parameter, or one that would not parse |
+    | `401` | signature missing, malformed, or wrong |
+    | `403` | authenticated, but not permitted this operation |
+    | `422` | **permanent.** Fix the record or the request; resending the same bytes cannot help |
+    | `500` | this service's own fault. Raise it; do not spin on it |
+    | `503` | **transient.** Retry — retrying is safe, because every write is idempotent |
+
+    `422` against `503` is the pair to get right, and it is the pair clients get backwards. `422`
+    says the bytes will never be accepted, so a client that retries burns its queue on a record that
+    cannot land. `503` says the record was fine and the service was not, so a client that discards
+    it loses audit history exactly when it matters. Neither mistake is visible from the service
+    side.
+
+    Retry on `503` freely: a write is keyed by `record_id`, so a redrive after an ambiguous failure
+    lands as `200 duplicate` rather than a second record. A replay is answered `200`, never `409` —
+    a conflict status would tell a client to stop doing the safe thing.
+
+    ## A sealed body is announced, not sniffed
+
+    `POST /records` accepts either plain JSON or an envelope sealed to the service's public key, and
+    the two are told apart by `Content-Type` alone — `application/vnd.yaam.envelope` means sealed.
+    Guessing from the first byte is a decision that can be wrong.
+
+    A sealed body that will not open is `503`, not `422`. From here a corrupt envelope and a service
+    holding the wrong key are indistinguishable, and a permanent refusal would have every sidecar
+    discard good records over an operator's misconfiguration. A wedged spool is visible and
+    recoverable; a dropped record is neither.
+
+    ## Unknown query parameters are rejected
+
+    Every query string is parsed against a closed set of names. A mistyped filter that got dropped
+    would widen the query to everything and hand the caller a plausible answer to a question it did
+    not ask, so `?actionn=deploy` is `400` rather than "all records".
+
+    ## There is deliberately no reindex endpoint
+
+    Rebuilding the index walks the whole tree. It stays a command-line operation (`yaam reindex`),
+    and no request — signed by an operator or not — can start one. "The index is derived" is then
+    something an operator asserts, not something a caller can trigger. Do not add a route for it.
+
+servers:
+  - url: /
+    description: |
+      Deployment-specific. The sidecar is configured with a base URL and posts origin-form targets
+      against it; the signed target is the path and query alone, never the absolute form.
+
+security:
+  - agentHeader: []
+    signatureHeader: []
+
+tags:
+  - name: records
+    description: Writing and querying action records.
+  - name: context
+    description: Reads that assemble history for a caller.
+  - name: erasure
+    description: Destroying a subject's keys. Operator only.
+
+paths:
+  /records:
+    post:
+      tags: [records]
+      operationId: writeRecord
+      summary: Write one record, attributed to the caller
+      description: |
+        Idempotent on `record.record_id`: the same identifier written twice stores once and is
+        answered `200 duplicate` the second time.
+
+        The caller may only file records under its own agent name. Attribution is the whole value of
+        the trail — a caller able to write as another agent can also write the record that explains
+        away what it did — so a mismatch is `403` and never reaches the store.
+
+        Bodies are capped at 1 MiB. The signature covers the whole body, so the body must be held in
+        memory before anything about it can be trusted; the cap is what stops that being a
+        memory-exhaustion lever. Oversize is `422`, because resending the same bytes cannot help.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WriteRequest'
+            examples:
+              deploy:
+                summary: An internal, org-visible record
+                value:
+                  record:
+                    record_id: 01ARZ3NDEKTSV4RRFFQ69G5FAV
+                    schema_ver: 1
+                    at: '2026-08-20T11:04:05Z'
+                    received_at: '2026-08-20T11:04:06Z'
+                    backfilled: false
+                    agent: agent_a
+                    agent_ver: 2.1.0
+                    correlation_id: c-8f21
+                    action: deploy
+                    outcome: success
+                    attrs:
+                      service: api
+                      environment: staging
+                      build: '412'
+                      duration_ms: 48210
+                    entities:
+                      - kind: deploy
+                        id: api/staging#412
+                        role: primary
+                        confidence: 1.0
+                      - kind: ticket
+                        id: PROJ-42
+                        role: related
+                        confidence: 0.7
+                    subjects: []
+                    visibility: org
+                    team: null
+                    data_class: internal
+                    redaction_policy: default-v1
+                    fields_masked: []
+                    tags: [rollout]
+                    summary: Rolled build 412 out to staging.
+                  body: |
+                    Rolled build 412 out to staging.
+
+                    Health checks passed on the second probe.
+          application/vnd.yaam.envelope:
+            schema:
+              $ref: '#/components/schemas/SealedEnvelope'
+      responses:
+        '201':
+          description: |
+            Stored. First time this identifier was seen.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteResponse'
+              example:
+                record_id: 01ARZ3NDEKTSV4RRFFQ69G5FAV
+                status: stored
+        '200':
+          description: |
+            Already stored under this identifier; nothing changed. The expected answer to a redrive,
+            not an error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteResponse'
+              example:
+                record_id: 01ARZ3NDEKTSV4RRFFQ69G5FAV
+                status: duplicate
+        '202':
+          description: |
+            Accepted into quarantine: a subject named by the record could not be resolved right now,
+            so the record is held sealed, unpublished and unindexed rather than rejected. Re-present
+            the same bytes later — the retry that succeeds is an ordinary write, and it settles the
+            quarantine.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteResponse'
+              example:
+                record_id: 01ARZ3NDEKTSV4RRFFQ69G5FAV
+                status: quarantined
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            The caller may read but not write, or tried to attribute the record to another agent.
+            Nothing was stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'forbidden: `agent_b` may not attribute a record to `agent_a`'
+        '422':
+          description: |
+            Permanent. The body is not JSON, carries a field the request type does not declare, is
+            larger than 1 MiB, or the record breaks a contract rule — an empty `action`, a timestamp
+            that cannot be read, a `subject_derived` record naming no subject, an `internal` record
+            naming one, a `team` visibility with no team, or an entity confidence outside `0.0..=1.0`.
+            Do not retry these bytes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'unprocessable: subject-derived record names no subject'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          description: |
+            Transient. The store or the index was briefly unavailable, or the sealed body would not
+            open. The record may well be good; retry it. Retrying is safe because the write is keyed
+            on `record_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'unavailable: sealed body would not open: authentication failed'
+    get:
+      tags: [records]
+      operationId: queryRecords
+      summary: Query records by action, outcome, agent, attribute or time window
+      description: |
+        Newest first, by the server-stamped time. Narrowed to what the calling credential may see;
+        there is no parameter that widens that.
+
+        Unknown parameters are `400`. A window needs both bounds: half a window is a different
+        question, not a narrower one, so supplying the missing bound here would answer something the
+        caller did not ask.
+      parameters:
+        - $ref: '#/components/parameters/action'
+        - $ref: '#/components/parameters/outcome'
+        - $ref: '#/components/parameters/agent'
+        - $ref: '#/components/parameters/attr'
+        - $ref: '#/components/parameters/from_ms'
+        - $ref: '#/components/parameters/to_ms'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          $ref: '#/components/responses/Records'
+        '400':
+          $ref: '#/components/responses/BadQuery'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          description: |
+            Permanent. `attr` is not `key=value`, or exactly one window bound was given.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'unprocessable: a window needs both `from_ms` and `to_ms`'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /entities/{kind}/{id}:
+    get:
+      tags: [context]
+      operationId: entityRecords
+      summary: Everything touching one entity
+      description: |
+        Entities are the join keys across records. Both path segments are taken as given and matched
+        against the index; `kind` must be one the deployment configures in `spec/entities.yaml`, and
+        `id` must already be in that kind's canonical form — this endpoint matches, it does not
+        canonicalise. An unknown kind or a non-canonical identifier is an empty result, not an error.
+
+        Scoped to the caller like every other read.
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          description: Configured entity kind, e.g. `order_ref`, `ticket`, `deploy`, `chat_user`.
+          schema:
+            type: string
+          example: ticket
+        - name: id
+          in: path
+          required: true
+          description: |
+            Canonical identifier within the kind. Percent-encode it — several configured kinds carry
+            `/`, `#` or `@` inside an identifier — and sign the encoded target, since the signature
+            covers the request target exactly as sent.
+          schema:
+            type: string
+          example: PROJ-42
+        - $ref: '#/components/parameters/min_confidence'
+      responses:
+        '200':
+          $ref: '#/components/responses/Records'
+        '400':
+          $ref: '#/components/responses/BadQuery'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /bundle:
+    get:
+      tags: [context]
+      operationId: composeBundle
+      summary: Compose context for a request
+      description: |
+        Gathers history for the named entities and actor into one capped, deduplicated set, and
+        degrades rather than fails when a source is slow.
+
+        Only references read out of a structured field reach a bundle — inferred ones are excluded
+        whatever `min_confidence` a direct entity read would accept, because a guess in a bundle is
+        a guess the caller cannot tell apart from a fact.
+
+        Sealed bodies are never opened here. A caller receives identifiers and structure, never
+        subject plaintext: plaintext handed to a caller reaches places key destruction cannot erase.
+
+        Check `degraded` before acting on a bundle. A partial bundle is safe to answer a question
+        from and unsafe to act on, and only the caller can make that call — which is why the flag is
+        explicit rather than implied by a short result.
+      parameters:
+        - $ref: '#/components/parameters/entity'
+        - $ref: '#/components/parameters/actor'
+        - $ref: '#/components/parameters/deadline_ms'
+      responses:
+        '200':
+          description: |
+            A bundle, possibly incomplete. `200` with `degraded: true` is the normal answer under
+            load, not an error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BundleResponse'
+              example:
+                records: [01ARZ3NDEKTSV4RRFFQ69G5FAV, 01ARZ3NDEKTSV4RRFFQ69G5FB0]
+                degraded: true
+                omitted: ['entity order_ref:a1b2c3d4: deadline reached']
+                token_estimate: 240
+        '400':
+          $ref: '#/components/responses/BadQuery'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          description: |
+            Permanent. An `entity` term is not `kind:id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'unprocessable: `entity` must be `kind:id`, got `ticket`'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /erase:
+    post:
+      tags: [erasure]
+      operationId: eraseSubject
+      summary: Destroy a subject's keys
+      description: |
+        Operator role only, and the role is checked before the body is read: erasure is
+        irreversible, so the gate is the first thing the request meets.
+
+        Destroying a subject's keys makes the sealed bodies of every record naming that subject
+        permanently unreadable — in this copy and in every other, backups included, because no
+        surviving copy holds the key. It does **not** delete records. Frontmatter, attributes, entity
+        references and timelines are retained, and the answer says so, so a caller cannot report
+        this as having deleted everything about the subject.
+
+        Expensive, and unavoidably so: the derived index holds a wrapped key share per subject and
+        no row can be un-written, so the whole index is rebuilt from the erased tree before the
+        answer comes back. Budget for that rather than putting this call anywhere a user waits.
+
+        This endpoint takes plain JSON only. The sealed media type is accepted on `POST /records`
+        alone; a sealed body sent here is parsed as JSON and fails `422`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EraseRequest'
+            example:
+              subject: s_9f2c4b8a1d6e0f37c5a49b2d8e71f036a4c8b5d29e7f13a06c4b8d5e29f7a13c0
+      responses:
+        '200':
+          description: |
+            Keys destroyed. Repeating the request for a subject already erased is safe — there are
+            no keys left to destroy — but each request writes its own tombstone line.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EraseResponse'
+              example:
+                bodies_sealed_off: 12
+                keys_destroyed: 3
+                quarantine_settled: 1
+                tombstone_id: tomb-01ARZ3NDEKTSV4RRFFQ69G5FC7
+                retained: frontmatter, attributes, entity references and timelines are retained
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            The caller is not an operator. No key was touched.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'forbidden: `agent_a` is not permitted this operation'
+        '422':
+          description: |
+            Permanent. The body is not JSON, carries an undeclared field, or `subject` is not a
+            well-formed keyed pseudonym.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'unprocessable: entity id `not-a-pseudonym` is not canonical for kind `subject`'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+components:
+
+  securitySchemes:
+    agentHeader:
+      type: apiKey
+      in: header
+      name: x-yaam-agent
+      description: |
+        The agent identity this request is signed as. A claim, not a grant — it selects which
+        credential the signature is checked against, and a write is refused unless the record is
+        attributed to this same agent.
+    signatureHeader:
+      type: apiKey
+      in: header
+      name: x-yaam-signature
+      description: |
+        Lowercase hex of `HMAC-SHA256(key, method + "\n" + target + "\n" + agent + "\n" + body)`,
+        64 characters. `target` includes the query string. Modelled here as an API key because
+        OpenAPI has no scheme for a per-request signature; it is not a bearer token and cannot be
+        reused across requests.
+
+  parameters:
+    action:
+      name: action
+      in: query
+      required: false
+      description: Exact match on one action.
+      schema:
+        type: string
+      example: deploy
+    outcome:
+      name: outcome
+      in: query
+      required: false
+      description: Spelled as the record serialises it.
+      schema:
+        $ref: '#/components/schemas/Outcome'
+    agent:
+      name: agent
+      in: query
+      required: false
+      description: |
+        Filters on the record's author, which is not the same as the caller — a credential's own
+        scope is applied on top and cannot be widened from here.
+      schema:
+        type: string
+      example: agent_a
+    attr:
+      name: attr
+      in: query
+      required: false
+      description: |
+        One structural attribute, as `key=value`. Compared as text: an integer matches its decimal
+        form and a boolean matches `true` or `false`. Sensitive attributes live in the sealed body
+        and are not queryable at all.
+      schema:
+        type: string
+        pattern: '^[^=]+=.*$'
+      example: environment=staging
+    from_ms:
+      name: from_ms
+      in: query
+      required: false
+      description: |
+        Inclusive start, in milliseconds of the server-stamped time — not the source-reported `at`,
+        which may be skewed and is never used for ordering. Requires `to_ms`.
+      schema:
+        type: integer
+        format: int64
+      example: 1755676800000
+    to_ms:
+      name: to_ms
+      in: query
+      required: false
+      description: Exclusive end, on the same clock as `from_ms`. Requires `from_ms`.
+      schema:
+        type: integer
+        format: int64
+      example: 1755763200000
+    limit:
+      name: limit
+      in: query
+      required: false
+      description: |
+        Caps the number of rows returned. Absent means no cap at all — every match. There is no
+        cursor, so page by narrowing the window rather than by walking an offset.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+      example: 50
+    min_confidence:
+      name: min_confidence
+      in: query
+      required: false
+      description: |
+        Tolerance for inferred references. `1.0` keeps only references read out of a structured
+        field. Defaults to `0.0` — the endpoint answers "everything about this entity", and a
+        default floor would silently drop history the caller cannot tell is missing. Tightening it
+        is the caller's decision.
+      schema:
+        type: number
+        format: float
+        minimum: 0
+        maximum: 1
+      example: 1.0
+    entity:
+      name: entity
+      in: query
+      required: false
+      description: |
+        Comma-separated `kind:id` terms. Each contributes its history to the bundle; duplicates
+        across terms are one record, counted once.
+      schema:
+        type: string
+        pattern: '^[^,]+:[^,]*(,[^,]+:[^,]*)*$'
+      example: ticket:PROJ-42,deploy:api/staging#412
+    actor:
+      name: actor
+      in: query
+      required: false
+      description: Agent whose recent activity is relevant, in addition to the named entities.
+      schema:
+        type: string
+      example: agent_a
+    deadline_ms:
+      name: deadline_ms
+      in: query
+      required: false
+      description: |
+        Budget for the whole composition, default `500`. A source not consulted before the deadline
+        names itself in `omitted` and sets `degraded`; it is never silently skipped, because "no
+        history" and "never asked" call for opposite decisions.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+      example: 250
+
+  responses:
+    Records:
+      description: Matching record identifiers, newest first by the server-stamped time.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RecordsResponse'
+          example:
+            records: [01ARZ3NDEKTSV4RRFFQ69G5FAV, 01ARZ3NDEKTSV4RRFFQ69G5FB0]
+    BadQuery:
+      description: |
+        The query string was not understood — an unknown parameter, or one that would not parse into
+        its type. Rejected rather than ignored, so a mistyped filter fails instead of quietly
+        widening the query to everything.
+
+        This one response is `text/plain`, not the JSON error shape: it is produced before the
+        request reaches a handler.
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: 'Failed to deserialize query string: actionn: unknown field `actionn`'
+    Unauthenticated:
+      description: |
+        Signature missing, malformed, or wrong — including a signature valid for a different method,
+        target, agent or body. The reason is not narrowed further: telling a prober which part it
+        got right is a hint it should not get.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: unauthenticated
+    Unavailable:
+      description: |
+        Transient. Retry. The index may be reopening, a worker may have failed, or a sealed body
+        would not open — none of which says the request was bad.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: 'unavailable: index reopening'
+    Internal:
+      description: |
+        This service's own fault — not the caller's, and not something a client fixes by resending.
+        Raise it rather than spinning on it.
+
+        The usual cause is a deployment whose index has not been built, or one whose index has
+        drifted from the tree. Both need `yaam reindex`, which is why they are not `503`: no amount
+        of patience fixes them.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: 'index drift on record `01ARZ3NDEKTSV4RRFFQ69G5FAV`'
+
+  schemas:
+
+    RecordId:
+      type: string
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      description: |
+        A ULID, and the write's idempotency key. Crockford base32: uppercase, without `I`, `L`, `O`
+        or `U`, so a transcription slip cannot turn one valid identifier into another.
+      example: 01ARZ3NDEKTSV4RRFFQ69G5FAV
+
+    SubjectHash:
+      type: string
+      pattern: '^s_[0-9a-f]{64}$'
+      description: |
+        Keyed pseudonym for an erasable data subject — an HMAC over a canonical subject identifier,
+        never a direct identifier, so it is safe in paths, indexes and tombstones. Pseudonymous, not
+        anonymous: whoever holds the keying secret can still relink it. Hex is lowercase, because one
+        spelling per hash is what lets it serve as both a map key and a path component with no
+        normalisation step a caller could forget.
+      example: s_9f2c4b8a1d6e0f37c5a49b2d8e71f036a4c8b5d29e7f13a06c4b8d5e29f7a13c0
+
+    Timestamp:
+      type: string
+      description: |
+        RFC 3339. Seconds are mandatory; a fractional part and an offset are optional, and `60`
+        seconds is accepted and folded into the same minute. The accepted grammar is contract, not
+        an implementation detail: the same text is read by the index and by the tree that derives a
+        record's directory from its date, and a stamp only one of them can read files a record under
+        a day that queries do not look at.
+      example: '2026-08-20T11:04:05Z'
+
+    Outcome:
+      type: string
+      enum: [success, failure, partial, declined]
+      description: |
+        `declined` is a refusal by this system or a downstream one — a decision that was taken, as
+        against `failure`, where the attempt broke.
+
+    Visibility:
+      type: string
+      enum: [owner, team, org, operator]
+      description: |
+        Who may read the record. `owner` is the writing agent alone, and is stored in a per-owner
+        subtree whose permissions admit nobody else, so the file system backs the query rather than
+        trusting it. `operator` is the audit trail.
+
+    DataClass:
+      type: string
+      enum: [internal, subject_derived]
+      description: |
+        Whether the body is erasable. `internal` bodies are plaintext and must name no subject.
+        `subject_derived` bodies are sealed under a key derived from *all* the record's subjects, and
+        must name at least one — a subject-derived record with no subjects would be sealed under a
+        key nobody can destroy, which is unerasable by construction.
+
+    SubjectRole:
+      type: string
+      enum: [principal, party]
+      description: |
+        `principal` acted or was acted for; `party` is named by the record without being its
+        subject.
+
+    EntityRole:
+      type: string
+      enum: [primary, context, related]
+      description: How central the entity is to the record, not what it is.
+
+    AttrValue:
+      description: |
+        Deliberately flat — `attrs` is an index surface, not a document store. Nesting a structure
+        here would put fields in plaintext frontmatter that no schema declared.
+      oneOf:
+        - type: string
+        - type: integer
+        - type: boolean
+
+    EntityRef:
+      type: object
+      description: |
+        A join key. Unknown fields are accepted and dropped here; only the request wrapper refuses
+        them.
+      required: [kind, id, role, confidence]
+      properties:
+        kind:
+          type: string
+          description: |
+            A kind the deployment configures in `spec/entities.yaml`. Kinds are configuration, never
+            a fixed vocabulary.
+          example: ticket
+        id:
+          type: string
+          description: |
+            Canonical form for the kind, after that kind's normalisation steps. The service
+            canonicalises on write and rejects an identifier the kind's pattern does not admit.
+          example: PROJ-42
+        role:
+          $ref: '#/components/schemas/EntityRole'
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: |
+            `1.0` means read out of a structured field. Anything lower was inferred from prose, and
+            a bundle excludes it entirely.
+          example: 1.0
+
+    SubjectRef:
+      type: object
+      description: |
+        Unknown fields are accepted and dropped here, as in `EntityRef`.
+      required: [hash, role, canon_ver]
+      properties:
+        hash:
+          $ref: '#/components/schemas/SubjectHash'
+        role:
+          $ref: '#/components/schemas/SubjectRole'
+        canon_ver:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Which canonicalisation ruleset produced `hash`. Stamped per subject rather than per
+            record, because one re-keyed record can legitimately carry subjects resolved under
+            different rulesets; lookups fan out across the live versions.
+          example: 1
+
+    ActionRecord:
+      type: object
+      description: |
+        One thing an agent did — the only thing this system stores. The wire record, the Markdown
+        frontmatter and the index columns are three projections of it and cannot diverge; `summary`
+        is the one exception, being prose that becomes the record body rather than a frontmatter key.
+
+        Unknown fields are accepted and dropped. The `WriteRequest` wrapper around it does refuse
+        them, so a typo at the top level fails while a typo *inside* `record` does not.
+      required:
+        - record_id
+        - schema_ver
+        - at
+        - received_at
+        - backfilled
+        - agent
+        - action
+        - outcome
+        - attrs
+        - entities
+        - subjects
+        - visibility
+        - data_class
+        - redaction_policy
+        - fields_masked
+        - tags
+        - summary
+      properties:
+        record_id:
+          $ref: '#/components/schemas/RecordId'
+        schema_ver:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Which record schema these bytes were written under.
+          example: 1
+        at:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Source-reported time. May be skewed or replayed, and is never used for ordering or
+            windowing.
+        received_at:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: |
+            Authoritative for ordering, windowing and the record's place in the tree. Stamped by the
+            service unless `backfilled` says otherwise.
+        backfilled:
+          type: boolean
+          description: |
+            `true` when `received_at` came from an upstream source rather than this service's clock —
+            an import, a replayed spool. It marks the one case where the authoritative timestamp was
+            not observed here, so a reader can tell an imported timeline from a live one.
+          example: false
+        agent:
+          type: string
+          description: |
+            Author. Must equal the `x-yaam-agent` the request was signed as; the service will not
+            file history under another agent's name.
+          example: agent_a
+        agent_ver:
+          type: [string, 'null']
+          description: |
+            Present so a behaviour change can be attributed to a release rather than argued about.
+          example: 2.1.0
+        correlation_id:
+          type: [string, 'null']
+          description: Ties every stage of one interaction together across agents.
+          example: c-8f21
+        action:
+          type: string
+          minLength: 1
+          description: |
+            Top-level and indexed, because every useful query filters on it. Must be declared in
+            `spec/attrs-schema.yaml` for the deployment to accept the record.
+          example: deploy
+        outcome:
+          $ref: '#/components/schemas/Outcome'
+        attrs:
+          type: object
+          description: |
+            Declared, classified attributes. Every key must be declared `structural` for this action
+            in `spec/attrs-schema.yaml`; an undeclared or `sensitive` key is refused rather than
+            stored, which is what keeps data that key destruction cannot reach out of plaintext
+            frontmatter and out of every derived copy.
+          additionalProperties:
+            $ref: '#/components/schemas/AttrValue'
+          example:
+            service: api
+            environment: staging
+        entities:
+          type: array
+          description: The join keys this record contributes.
+          items:
+            $ref: '#/components/schemas/EntityRef'
+        subjects:
+          type: array
+          description: |
+            Empty for `internal`; at least one entry for `subject_derived`. The body's key is derived
+            from all of them together, so no single share decrypts it and changing the set re-seals
+            under a fresh key.
+          items:
+            $ref: '#/components/schemas/SubjectRef'
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+        team:
+          type: [string, 'null']
+          description: Required when `visibility` is `team`, and meaningless otherwise.
+          example: platform
+        data_class:
+          $ref: '#/components/schemas/DataClass'
+        redaction_policy:
+          type: string
+          description: |
+            The policy version applied before the write, e.g. `default-v1` from
+            `spec/redaction/default.yaml`. Stored per record so a faulty policy's blast radius is
+            one query rather than a guess.
+          example: default-v1
+        fields_masked:
+          type: array
+          description: Which fields the policy touched. Informational; nothing keys off it.
+          items:
+            type: string
+        tags:
+          type: array
+          description: Free-form, unlike `attrs` — not declared, not classified, not query surface.
+          items:
+            type: string
+        summary:
+          type: string
+          description: |
+            Prose, and the fallback for the record body when `body` is absent. Not a frontmatter
+            key: it becomes the Markdown document's body, and is sealed along with it when
+            `data_class` is `subject_derived`.
+          example: Rolled build 412 out to staging.
+
+    WriteRequest:
+      type: object
+      description: |
+        Composed by the sidecar and parsed by the service from one declaration, so the two cannot
+        disagree. Unknown fields at this level are refused.
+      required: [record]
+      additionalProperties: false
+      properties:
+        record:
+          $ref: '#/components/schemas/ActionRecord'
+        body:
+          type: string
+          description: |
+            The prose stored as the record body. Absent means `record.summary` is used, which is the
+            case where the caller has nothing longer to add.
+
+    SealedEnvelope:
+      type: string
+      format: binary
+      description: |
+        A `WriteRequest` JSON document sealed to the service's public key, sent under
+        `application/vnd.yaam.envelope` — that media type is the only announcement of sealing, and a
+        sealed body sent under any other is parsed as JSON and fails.
+
+        Layout: version byte `1`, a
+        32-byte ephemeral X25519 public key, a 12-byte AES-GCM nonce, then AES-256-GCM ciphertext
+        and tag. Ephemeral-static X25519 with HKDF-SHA256, one fresh key pair per envelope whose
+        private half is dropped as soon as the shared secret is derived — so the sidecar that sealed
+        it cannot read it back, on its spool or anywhere else.
+
+    WriteStatus:
+      type: string
+      enum: [stored, duplicate, quarantined]
+      description: Pairs with the status code — `201`, `200`, `202` respectively.
+
+    WriteResponse:
+      type: object
+      required: [record_id, status]
+      properties:
+        record_id:
+          $ref: '#/components/schemas/RecordId'
+        status:
+          $ref: '#/components/schemas/WriteStatus'
+
+    RecordsResponse:
+      type: object
+      description: |
+        Identifiers only, and no endpoint here returns a record's content. A query that returned
+        bodies would hand out plaintext to anything that could name a filter, and plaintext handed
+        to a caller reaches copies key destruction cannot erase. Content is read from the Markdown
+        tree, by something with access to the tree.
+      required: [records]
+      properties:
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecordId'
+
+    BundleResponse:
+      type: object
+      required: [records, degraded, omitted, token_estimate]
+      properties:
+        records:
+          type: array
+          description: Deduplicated across sources and capped, newest-first within each source.
+          items:
+            $ref: '#/components/schemas/RecordId'
+        degraded:
+          type: boolean
+          description: |
+            `true` when a source was not consulted, so the bundle is incomplete. Act on this before
+            acting on the contents.
+          example: false
+        omitted:
+          type: array
+          description: |
+            One line per source that did not contribute, and why. Named rather than silent, because
+            a subject with no history and a source that never answered look identical otherwise and
+            call for opposite decisions.
+          items:
+            type: string
+        token_estimate:
+          type: integer
+          minimum: 0
+          description: |
+            Rough cost of the bundle's structure, advisory only. Not a billing figure and not a
+            promise about any particular tokeniser.
+          example: 240
+
+    EraseRequest:
+      type: object
+      required: [subject]
+      additionalProperties: false
+      properties:
+        subject:
+          $ref: '#/components/schemas/SubjectHash'
+
+    EraseResponse:
+      type: object
+      required:
+        - bodies_sealed_off
+        - keys_destroyed
+        - quarantine_settled
+        - tombstone_id
+        - retained
+      properties:
+        bodies_sealed_off:
+          type: integer
+          minimum: 0
+          description: Records whose bodies became permanently unreadable.
+          example: 12
+        keys_destroyed:
+          type: integer
+          minimum: 0
+          description: Keys destroyed across all epochs for this subject.
+          example: 3
+        quarantine_settled:
+          type: integer
+          minimum: 0
+          description: |
+            Quarantined records for this subject resolved or discarded as part of the erasure —
+            counted here because a record waiting in quarantine would otherwise outlive the key that
+            was supposed to erase it.
+          example: 1
+        tombstone_id:
+          type: string
+          description: |
+            The line to confirm against in the append-only tombstone log. Completion is a second
+            line for the same identifier rather than an edit of the first: an erasure record that can
+            be rewritten is one that can be unwritten.
+          example: tomb-01ARZ3NDEKTSV4RRFFQ69G5FC7
+        retained:
+          type: string
+          description: |
+            What key destruction does not reach, restated in every answer so a caller cannot report
+            this as having deleted everything about the subject.
+          example: frontmatter, attributes, entity references and timelines are retained
+
+    Error:
+      type: object
+      description: |
+        The shape of every failure except `400`, which is produced before a handler runs. The text
+        names the failure without naming internals — an unauthenticated caller learns that its
+        signature did not verify and nothing more.
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+          example: 'unprocessable: action is empty'
