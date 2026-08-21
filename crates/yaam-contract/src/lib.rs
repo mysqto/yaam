@@ -3,6 +3,11 @@
 //! [`request`] is here for the same reason: what a write request looks like and what a signature
 //! covers are wire rules, and a service and a sidecar that spell either differently cannot talk.
 //!
+//! [`mask`] is here for that reason too. The service only *checks* a body against the redaction
+//! policy and refuses one that still matches, so masking is the writer's job — and a writer masking
+//! against a different reading of the policy than the service checks against is exactly the failure
+//! worth designing out.
+//!
 //! Three shapes must agree: the wire record, the Markdown frontmatter, and the database columns.
 //! They are all projections of [`ActionRecord`], so divergence is a compile error rather than a
 //! runtime surprise. `summary` is the one deliberate exception — it is prose that becomes the
@@ -14,6 +19,7 @@ pub mod attrs;
 pub mod entity;
 pub mod error;
 pub mod ids;
+pub mod mask;
 pub mod record;
 pub mod request;
 mod spec_yaml;

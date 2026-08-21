@@ -22,13 +22,14 @@ index that makes it queryable in single-digit milliseconds.
 | **Crash-recoverable** | Write-ahead staging, atomic publish, a sweeper that converges. No claim of distributed atomicity. |
 | **Erasable bodies** | Per-record keys, per-subject key encryption. Deleting a subject's keys makes their record bodies permanently unreadable in every copy, including backups. |
 | **Idempotent** | Every write is keyed. Replays, retries and re-drives are safe. |
+| **Redacted at the source** | The writer masks, the service only checks and refuses what is still unmasked — so a record's `fields_masked` is the writer's own account. `yaam_contract::mask` is the one implementation of masking, reading the same policy file the service checks against. |
 | **Portable** | Any harness that speaks HTTP can participate; a local sidecar handles signing and sealing so callers hold no keys. |
 
 ## Layout
 
 ```
 crates/
-  yaam-contract   wire types, canonical entity IDs, schemas — the vendorable contract
+  yaam-contract   wire types, canonical entity IDs, schemas, writer-side masking — the vendorable contract
   yaam-crypto     per-record keys, per-subject key encryption, key store
   yaam-md         frontmatter and sealed-body serialisation
   yaam-store      SQLite schema, queries, full-text search
