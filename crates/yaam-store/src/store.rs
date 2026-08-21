@@ -98,6 +98,25 @@ pub struct Writer {
     conn: Connection,
 }
 
+/// One transaction spanning many writes.
+///
+/// The index runs `synchronous = FULL`, so every commit is a durability round trip — ~0.43 ms on
+/// the array the benchmark ran against. A rebuild that commits per record pays one each: two thirds
+/// of a 100,000-record rebuild's wall time was `fsync` and one third the parse-and-insert work it
+/// exists to do. One transaction over the whole rebuild pays it once.
+///
+/// It is also what makes a rebuild atomic. Nothing a batch wrote is visible until
+/// [`Batch::commit`], and a batch dropped without committing rolls back — so an interrupted rebuild
+/// leaves the index it started from rather than a truncated one that looks finished. That is why
+/// [`Batch::truncate_derived`] is here and not only on [`Writer`]: the truncate and the rows that
+/// replace it have to be one transaction, or there is a window in which the index is plausible and
+/// wrong.
+#[derive(Debug)]
+pub struct Batch<'a> {
+    /// Rolled back on drop, which is what leaves the failure path with no code of its own.
+    tx: Transaction<'a>,
+}
+
 /// Fan-out work every published record needs.
 const JOB_BUNDLE: &str = "bundle";
 /// Fan-out work only records naming subjects need.
@@ -201,64 +220,40 @@ impl Writer {
         Ok(Self { conn })
     }
 
+    /// Opens one transaction for many writes.
+    ///
+    /// IMMEDIATE, not DEFERRED: the write lock is taken up front, so a busy index fails here rather
+    /// than half way through the rows.
+    pub fn batch(&mut self) -> crate::Result<Batch<'_>> {
+        Ok(Batch {
+            tx: self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?,
+        })
+    }
+
     /// Inserts a record and everything derived from it, in one transaction.
     ///
-    /// Fan-out jobs are enqueued *inside* this transaction: enqueueing after commit loses them to
-    /// any crash in between, and nothing would notice.
-    ///
-    /// Replayable. The record insert turns on its unique id, every derived row is keyed, and the
-    /// entity counters are recomputed, so publishing the same record twice is a no-op.
+    /// A batch of one. The single-record path is what a live write wants — a record is durable when
+    /// the call returns — and [`Writer::batch`] is what a rebuild of a hundred thousand of them
+    /// wants.
     pub fn publish(&mut self, input: PublishInput<'_>) -> crate::Result<()> {
-        let doc = input.record;
-        // Checked here as well as by the table's own CHECK, so a caller that passes the prose of a
-        // sealed record gets told what it did wrong rather than a constraint violation.
-        if doc.data_class == DataClass::SubjectDerived && !input.searchable_body.is_empty() {
-            return Err(bad_input(
-                doc,
-                "a sealed record has no searchable body; pass \"\"",
-            ));
-        }
-        let frontmatter = frontmatter_json(doc)?;
-
-        // IMMEDIATE, not DEFERRED: the write lock is taken up front, so a busy index fails here
-        // rather than half way through the derived rows.
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let record_pk = insert_record(&tx, doc, &frontmatter, input.searchable_body)?;
-        let received_ms = tx.query_row(
-            "SELECT received_ms FROM records WHERE id = ?1",
-            params![record_pk],
-            |row| row.get::<_, i64>(0),
-        )?;
-        insert_attrs(&tx, record_pk, doc)?;
-        insert_entities(&tx, record_pk, doc)?;
-        insert_subjects(&tx, record_pk, &input)?;
-        enqueue_fanout(&tx, doc, received_ms)?;
-        tx.commit()?;
-        Ok(())
+        let mut batch = self.batch()?;
+        batch.publish(input)?;
+        batch.commit()
     }
 
     /// Records that a record is held back, unpublished, in a spool file.
     ///
     /// Idempotent, and deliberately keeps the *first* sighting: resetting the stamp on every retry
     /// would make a row that ages out never age out.
-    ///
-    /// This is the one write that reads the clock. It has to: the record is not in the tree yet, so
-    /// there is no server-stamped time to derive the sighting from.
     pub fn enqueue_quarantine(
         &mut self,
         id: &str,
         qkek_date: &str,
         spool_path: &str,
     ) -> crate::Result<()> {
-        self.conn.execute(
-            "INSERT INTO quarantine_pending (record_id, qkek_date, staging_path, first_seen_ms)
-             VALUES (?1, ?2, ?3, CAST(ROUND(unixepoch('now', 'subsec') * 1000) AS INTEGER))
-             ON CONFLICT (record_id) DO NOTHING",
-            params![id, qkek_date, spool_path],
-        )?;
-        Ok(())
+        enqueue_quarantine_in(&self.conn, id, qkek_date, spool_path)
     }
 
     /// Forgets that a record is held back.
@@ -375,22 +370,102 @@ impl Writer {
     }
 
     /// Drops every derived row so the index can be rebuilt from the tree.
+    ///
+    /// On its own this leaves an empty index, which is a state no reader should ever see: a rebuild
+    /// truncates and refills inside one [`Batch`] instead.
     pub fn truncate_derived(&mut self) -> crate::Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut batch = self.batch()?;
+        batch.truncate_derived()?;
+        batch.commit()
+    }
+}
+
+impl Batch<'_> {
+    /// Inserts a record and everything derived from it.
+    ///
+    /// Fan-out jobs are enqueued *inside* the transaction: enqueueing after commit loses them to any
+    /// crash in between, and nothing would notice.
+    ///
+    /// Replayable. The record insert turns on its unique id, every derived row is keyed, and the
+    /// entity counters are recomputed, so publishing the same record twice is a no-op.
+    pub fn publish(&mut self, input: PublishInput<'_>) -> crate::Result<()> {
+        let doc = input.record;
+        // Checked here as well as by the table's own CHECK, so a caller that passes the prose of a
+        // sealed record gets told what it did wrong rather than a constraint violation.
+        if doc.data_class == DataClass::SubjectDerived && !input.searchable_body.is_empty() {
+            return Err(bad_input(
+                doc,
+                "a sealed record has no searchable body; pass \"\"",
+            ));
+        }
+        let frontmatter = frontmatter_json(doc)?;
+
+        let record_pk = insert_record(&self.tx, doc, &frontmatter, input.searchable_body)?;
+        let received_ms = self.tx.query_row(
+            "SELECT received_ms FROM records WHERE id = ?1",
+            params![record_pk],
+            |row| row.get::<_, i64>(0),
+        )?;
+        insert_attrs(&self.tx, record_pk, doc)?;
+        insert_entities(&self.tx, record_pk, received_ms, doc)?;
+        insert_subjects(&self.tx, record_pk, &input)?;
+        enqueue_fanout(&self.tx, doc, received_ms)?;
+        Ok(())
+    }
+
+    /// Drops every derived row so the index can be rebuilt from the tree.
+    pub fn truncate_derived(&mut self) -> crate::Result<()> {
         // Deleting records cascades to attrs, entity refs, subjects and queued fan-out, and the
         // delete trigger unindexes each body. 'delete-all' then clears any full-text row whose
         // record went missing without a trigger firing — a rebuild must not inherit a phantom.
-        tx.execute_batch(
+        self.tx.execute_batch(
             "DELETE FROM records;
              DELETE FROM entities;
              DELETE FROM quarantine_pending;
              INSERT INTO records_fts (records_fts) VALUES ('delete-all');",
         )?;
-        tx.commit()?;
         Ok(())
     }
+
+    /// Records that a record is held back, unpublished, in a spool file.
+    ///
+    /// The batch-scoped [`Writer::enqueue_quarantine`]: a rebuild derives this register from the
+    /// spool directory, and it belongs in the same transaction as the rows it sits beside.
+    pub fn enqueue_quarantine(
+        &mut self,
+        id: &str,
+        qkek_date: &str,
+        spool_path: &str,
+    ) -> crate::Result<()> {
+        enqueue_quarantine_in(&self.tx, id, qkek_date, spool_path)
+    }
+
+    /// Makes everything this batch wrote visible, durably.
+    pub fn commit(self) -> crate::Result<()> {
+        self.tx.commit()?;
+        Ok(())
+    }
+}
+
+/// Registers a held-back record on whichever connection or transaction is given.
+///
+/// One statement, so it is atomic on its own; inside a [`Batch`] it joins that transaction instead.
+///
+/// This is the one write that reads the clock. It has to: the record is not in the tree yet, so
+/// there is no server-stamped time to derive the sighting from.
+fn enqueue_quarantine_in(
+    conn: &Connection,
+    id: &str,
+    qkek_date: &str,
+    spool_path: &str,
+) -> crate::Result<()> {
+    conn.execute(
+        "INSERT INTO quarantine_pending (record_id, qkek_date, staging_path, first_seen_ms)
+         VALUES (?1, ?2, ?3, CAST(ROUND(unixepoch('now', 'subsec') * 1000) AS INTEGER))
+         ON CONFLICT (record_id) DO NOTHING",
+        params![id, qkek_date, spool_path],
+    )?;
+    Ok(())
 }
 
 /// Serialises everything but the body.
@@ -468,21 +543,28 @@ fn attr_text(value: &attrs::Value) -> String {
 }
 
 /// Writes entity references, then recomputes the catalog rows they feed.
-fn insert_entities(tx: &Transaction<'_>, record_pk: i64, doc: &ActionRecord) -> crate::Result<()> {
+fn insert_entities(
+    tx: &Transaction<'_>,
+    record_pk: i64,
+    received_ms: i64,
+    doc: &ActionRecord,
+) -> crate::Result<()> {
     let mut insert = tx.prepare_cached(
-        "INSERT INTO entity_refs (record_pk, kind, entity_id, role, confidence)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO entity_refs (record_pk, kind, entity_id, role, confidence, received_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT (record_pk, kind, entity_id, role)
-             DO UPDATE SET confidence = excluded.confidence",
+             DO UPDATE SET confidence = excluded.confidence,
+                           received_ms = excluded.received_ms",
     )?;
     // Recomputed from entity_refs, never incremented: an incremented counter would double on
-    // replay, and there would be nothing to compare it against to notice.
+    // replay, and there would be nothing to compare it against to notice. Read out of the reference
+    // index alone rather than joined back to `records` — the time is in the index, so recomputing a
+    // hot entity's counters no longer costs one row lookup per reference it has ever had.
     let mut recount = tx.prepare_cached(
         "INSERT INTO entities (kind, entity_id, first_seen_ms, last_seen_ms, ref_count)
          SELECT er.kind, er.entity_id,
-                MIN(rec.received_ms), MAX(rec.received_ms), COUNT(*)
+                MIN(er.received_ms), MAX(er.received_ms), COUNT(*)
          FROM entity_refs AS er
-         JOIN records AS rec ON rec.id = er.record_pk
          WHERE er.kind = ?1 AND er.entity_id = ?2
          GROUP BY er.kind, er.entity_id
          ON CONFLICT (kind, entity_id) DO UPDATE SET
@@ -497,6 +579,7 @@ fn insert_entities(tx: &Transaction<'_>, record_pk: i64, doc: &ActionRecord) -> 
             entity.id,
             role_text(entity.role),
             f64::from(entity.confidence),
+            received_ms,
         ])?;
         recount.execute(params![entity.kind, entity.id])?;
     }

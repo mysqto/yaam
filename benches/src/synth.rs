@@ -142,6 +142,12 @@ const WORDS: &[&str] = &[
 /// The phrase measurement 6 searches for, planted in a small share of bodies.
 pub const PHRASE: &str = "rolling restart";
 
+/// One word out of [`WORDS`], which most bodies therefore carry.
+///
+/// The needle for the corpus-wide case: nothing stops a caller passing a word like this, and the
+/// cost of the search that answers it is the whole of measurement 6a.
+pub const COMMON_WORD: &str = WORDS[0];
+
 /// How often a body carries [`PHRASE`], as one in this many.
 const PHRASE_ONE_IN: u32 = 50;
 
@@ -544,6 +550,8 @@ pub struct Census {
     pub entities: BTreeMap<(String, String), usize>,
     /// Bodies carrying [`PHRASE`].
     pub with_phrase: usize,
+    /// Bodies carrying [`COMMON_WORD`].
+    pub with_common_word: usize,
 }
 
 impl Census {
@@ -552,10 +560,14 @@ impl Census {
     pub fn of(from: u64, to: u64, anchor_ms: i64) -> Self {
         let mut entities: BTreeMap<(String, String), usize> = BTreeMap::new();
         let mut with_phrase = 0;
+        let mut with_common_word = 0;
         for index in from..to {
             let generated = generate(index, anchor_ms);
             if generated.body.contains(PHRASE) {
                 with_phrase += 1;
+            }
+            if generated.body.contains(COMMON_WORD) {
+                with_common_word += 1;
             }
             for reference in &generated.record.entities {
                 if reference.confidence >= 1.0 {
@@ -568,6 +580,7 @@ impl Census {
         Self {
             entities,
             with_phrase,
+            with_common_word,
         }
     }
 

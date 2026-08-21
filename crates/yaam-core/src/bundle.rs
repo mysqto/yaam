@@ -17,7 +17,15 @@ use yaam_store::query::{self, Filter, Scope};
 const MIN_CONFIDENCE: f32 = 1.0;
 
 /// Records one entity or actor may contribute.
+///
+/// Applied to entity history as well as to the actor read, which it was not until a benchmark showed
+/// the busiest entity in its store paying for 1,672 records in order to contribute 500. One busy
+/// entity would otherwise decide both the cost of every bundle it appears in and how much of it the
+/// other sources get.
 const PER_SOURCE_LIMIT: u32 = 200;
+
+/// Page size each source is read at: one row past the cap, so a truncation can be detected.
+const OVER_SOURCE_CAP: u32 = PER_SOURCE_LIMIT + 1;
 
 /// Records a whole bundle may carry.
 ///
@@ -76,13 +84,17 @@ pub fn compose(store: &yaam_store::Store, request: &Request) -> crate::Result<Bu
             omit(&mut bundle, format!("entity {kind}:{id}: deadline reached"));
             continue;
         }
-        let found = query::by_entity(store, kind, id, MIN_CONFIDENCE, &request.scope)?;
-        take(
-            &mut bundle,
-            &mut seen,
-            found,
-            &format!("entity {kind}:{id}"),
-        );
+        let found = query::by_entity(
+            store,
+            kind,
+            id,
+            MIN_CONFIDENCE,
+            Some(OVER_SOURCE_CAP),
+            &request.scope,
+        )?;
+        let source = format!("entity {kind}:{id}");
+        let found = cap_source(&mut bundle, found, &source);
+        take(&mut bundle, &mut seen, found, &source);
     }
 
     if let Some(actor) = &request.actor {
@@ -91,17 +103,35 @@ pub fn compose(store: &yaam_store::Store, request: &Request) -> crate::Result<Bu
         } else {
             let filter = Filter {
                 agent: Some(actor.clone()),
-                limit: Some(PER_SOURCE_LIMIT),
+                limit: Some(OVER_SOURCE_CAP),
                 scope: request.scope.clone(),
                 ..Filter::default()
             };
             let found = query::by_filter(store, &filter)?;
-            take(&mut bundle, &mut seen, found, &format!("actor {actor}"));
+            let source = format!("actor {actor}");
+            let found = cap_source(&mut bundle, found, &source);
+            take(&mut bundle, &mut seen, found, &source);
         }
     }
 
     bundle.token_estimate = bundle.records.len() * TOKENS_PER_RECORD;
     Ok(bundle)
+}
+
+/// Trims one source to [`PER_SOURCE_LIMIT`], saying so when there was more.
+///
+/// The read asks for [`OVER_SOURCE_CAP`] and this throws the extra row away, which is what makes
+/// "there is more history than this" a fact rather than a guess: a source that returned exactly the
+/// cap is otherwise indistinguishable from one whose history is exactly that long.
+fn cap_source(bundle: &mut Bundle, mut found: Vec<RecordId>, source: &str) -> Vec<RecordId> {
+    if found.len() >= OVER_SOURCE_CAP as usize {
+        found.truncate(PER_SOURCE_LIMIT as usize);
+        omit(
+            bundle,
+            format!("{source}: newest {PER_SOURCE_LIMIT} of a longer history"),
+        );
+    }
+    found
 }
 
 /// Adds a source's records, up to the whole-bundle cap.
@@ -139,7 +169,10 @@ mod tests {
 
     use yaam_contract::RecordId;
 
-    use super::{Bundle, MAX_RECORDS, Request, Scope, TOKENS_PER_RECORD, compose, take};
+    use super::{
+        Bundle, MAX_RECORDS, OVER_SOURCE_CAP, PER_SOURCE_LIMIT, Request, Scope, TOKENS_PER_RECORD,
+        cap_source, compose, take,
+    };
     use crate::testkit::{self, BODY, Harness};
 
     /// A store with two records on the same ticket, one of them also about a subject.
@@ -246,6 +279,40 @@ mod tests {
             bundle.records.is_empty(),
             "an unscoped bundle must not assemble history"
         );
+    }
+
+    #[test]
+    fn a_source_with_more_history_than_the_cap_says_so() {
+        // The read asks for one row past the cap so that this is a fact and not a guess. A source
+        // that filled the cap exactly and one that had more to give are different answers, and only
+        // the extra row tells them apart.
+        let mut bundle = Bundle::default();
+        let found: Vec<RecordId> = (0..OVER_SOURCE_CAP).map(|_| RecordId::generate()).collect();
+
+        let kept = cap_source(&mut bundle, found, "entity ticket:PROJ-42");
+        assert_eq!(kept.len(), PER_SOURCE_LIMIT as usize);
+        assert!(
+            bundle.degraded,
+            "a truncated source is an incomplete bundle"
+        );
+        assert_eq!(bundle.omitted.len(), 1);
+        assert!(
+            bundle.omitted[0].contains("of a longer history"),
+            "{:?}",
+            bundle.omitted
+        );
+
+        // A source that fits says nothing.
+        let mut bundle = Bundle::default();
+        let found: Vec<RecordId> = (0..PER_SOURCE_LIMIT)
+            .map(|_| RecordId::generate())
+            .collect();
+        assert_eq!(
+            cap_source(&mut bundle, found, "entity ticket:PROJ-42").len(),
+            PER_SOURCE_LIMIT as usize
+        );
+        assert!(!bundle.degraded);
+        assert!(bundle.omitted.is_empty());
     }
 
     #[test]

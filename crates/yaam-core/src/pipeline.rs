@@ -569,12 +569,9 @@ impl Pipeline {
     /// Second on purpose. The file is authoritative, so a crash here leaves a published record the
     /// sweeper indexes; the reverse order would leave an index row pointing at nothing.
     pub(crate) fn commit(&mut self, document: &Document) -> Result<()> {
-        let keys = subject_keys(document);
-        self.writer.publish(PublishInput {
-            record: &document.record,
-            searchable_body: document.searchable_text(),
-            subject_keys: &keys,
-        })?;
+        let mut batch = self.writer.batch()?;
+        publish_document(&mut batch, document)?;
+        batch.commit()?;
         Ok(())
     }
 
@@ -764,6 +761,23 @@ fn already_listed(head: &Path, part: Option<&Path>, link: &str) -> Result<bool> 
         }
     }
     Ok(false)
+}
+
+/// Indexes one document into an open transaction.
+///
+/// The one place a document becomes [`PublishInput`], so a live write and a rebuild cannot disagree
+/// about what the index gets — they differ only in how many of these go into one transaction.
+pub(crate) fn publish_document(
+    batch: &mut yaam_store::Batch<'_>,
+    document: &Document,
+) -> Result<()> {
+    let keys = subject_keys(document);
+    batch.publish(PublishInput {
+        record: &document.record,
+        searchable_body: document.searchable_text(),
+        subject_keys: &keys,
+    })?;
+    Ok(())
 }
 
 /// The wrapped shares a publish should carry, taken from the sealed body itself.

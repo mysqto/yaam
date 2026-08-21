@@ -339,7 +339,7 @@ paths:
     get:
       tags: [context]
       operationId: entityRecords
-      summary: Everything touching one entity
+      summary: One page of what touches one entity
       description: |
         Entities are the join keys across records. `kind` must be one the deployment configures in
         `spec/entities.yaml`, and `id` is canonicalised by that kind's normalisation steps before it
@@ -352,7 +352,10 @@ paths:
         entity has no history", and a caller cannot tell a bug of its own from a fact about the
         store.
 
-        Scoped to the caller like every other read.
+        Scoped to the caller like every other read, and paged like every other read: the answer is
+        one page of the entity's history, newest first, capped at `limit` rows. An entity's history
+        is as long as that entity is busy, so there is no spelling of this request that returns all
+        of it — the busiest identifier in a store would otherwise decide what every reader pays.
       parameters:
         - name: kind
           in: path
@@ -372,6 +375,7 @@ paths:
             type: string
           example: PROJ-42
         - $ref: '#/components/parameters/min_confidence'
+        - $ref: '#/components/parameters/limit'
       responses:
         '200':
           $ref: '#/components/responses/Records'
@@ -608,7 +612,8 @@ components:
         Caps the number of rows returned. Absent means the service's default cap of `1000` rows, not
         every match: a page size with no default and no cursor is a trap, and the first caller to
         omit it would read the whole index into memory. A value given here is honoured as given.
-        There is no cursor, so page by narrowing the window rather than by walking an offset.
+        There is no cursor, so page by narrowing the request — a window on `GET /records`, a
+        confidence floor on an entity's history — rather than by walking an offset.
       schema:
         type: integer
         format: int32

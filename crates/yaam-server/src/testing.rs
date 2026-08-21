@@ -142,9 +142,10 @@ impl Service for Fake {
         kind: &str,
         id: &str,
         min_confidence: f32,
+        limit: Option<u32>,
     ) -> Result<Vec<RecordId>> {
         self.called(format!(
-            "entity {} {kind} {id} {min_confidence}",
+            "entity {} {kind} {id} {min_confidence} {limit:?}",
             caller.agent
         ))?;
         Ok(self.records.clone())
