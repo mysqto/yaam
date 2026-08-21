@@ -574,11 +574,17 @@ mod tests {
             !plan.contains("SCAN"),
             "range join fell back to a scan:\n{plan}"
         );
-        assert_eq!(
-            plan.matches("USING INDEX records_action_outcome_time")
-                .count(),
-            2,
-            "both sides should use the covering index:\n{plan}"
+        // Each side wants the index that matches what it pins. The left pins action and outcome;
+        // the right pins action alone, and asking it to use the outcome-leading index leaves a gap
+        // mid-key that turns the range into a per-row filter. Measured, that was 25x.
+        assert!(
+            plan.contains("USING INDEX records_action_outcome_time"),
+            "the side pinning action and outcome should use the index covering both:\n{plan}"
+        );
+        assert!(
+            plan.contains("USING INDEX records_action_time"),
+            "the side pinning action alone should use the action-leading index, not the one with \
+             outcome mid-key:\n{plan}"
         );
     }
 
