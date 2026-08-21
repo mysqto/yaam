@@ -114,6 +114,7 @@ impl Service for Fake {
         _kind: &str,
         _id: &str,
         _min_confidence: f32,
+        _limit: Option<u32>,
     ) -> yaam_server::Result<Vec<RecordId>> {
         self.gate()?;
         Ok(Vec::new())

@@ -126,7 +126,7 @@ impl AppState {
 /// |---|---|
 /// | `POST /records` | Write a record. Idempotent on its identifier. |
 /// | `GET /records` | Filtered query. |
-/// | `GET /entities/{kind}/{id}` | Everything about one entity. |
+/// | `GET /entities/{kind}/{id}` | One page of an entity's history, newest first. |
 /// | `GET /bundle` | Compose context for a request. |
 /// | `POST /erase` | Destroy a subject's keys. Operator only, and rebuilds the index. |
 ///
@@ -243,6 +243,10 @@ impl RecordQuery {
 pub struct EntityQuery {
     /// Tolerance for inferred references. `1.0` keeps only references read from a structured field.
     pub min_confidence: Option<f32>,
+    /// Page size. Absent means the index's default cap, not every reference — the same rule the
+    /// filtered query follows, for the same reason: a busy entity's history is unbounded, and this
+    /// endpoint used to answer with all of it.
+    pub limit: Option<u32>,
 }
 
 /// What a bundle should cover.
@@ -398,7 +402,7 @@ async fn query_records(
     Ok(Json(RecordsResponse { records }))
 }
 
-/// Answers everything touching one entity.
+/// Answers one page of what touches one entity.
 async fn entity_records(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
@@ -406,8 +410,10 @@ async fn entity_records(
     Query(params): Query<EntityQuery>,
 ) -> Result<Json<RecordsResponse>> {
     let min_confidence = params.min_confidence.unwrap_or(DEFAULT_MIN_CONFIDENCE);
+    let limit = params.limit;
     let service = state.service();
-    let records = blocking(move || service.entity(&caller, &kind, &id, min_confidence)).await?;
+    let records =
+        blocking(move || service.entity(&caller, &kind, &id, min_confidence, limit)).await?;
     Ok(Json(RecordsResponse { records }))
 }
 
@@ -775,13 +781,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entity_history_defaults_to_every_reference() {
+    async fn entity_history_defaults_to_every_reference_and_one_page() {
         let fake = Arc::new(Fake::new().holding(vec![RecordId::generate()]));
         let (status, body) = serve(&fake, get("/entities/ticket/T-1", Some(READER))).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["records"].as_array().unwrap().len(), 1);
-        assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 0");
+        // Every *reference*, but not every row: an absent `limit` reaches the index as `None`, which
+        // is its default cap and not the unbounded read.
+        assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 0 None");
     }
 
     #[tokio::test]
@@ -794,7 +802,16 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 1");
+        assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 1 None");
+    }
+
+    #[tokio::test]
+    async fn entity_history_takes_a_page_size() {
+        let fake = Arc::new(Fake::new());
+        let (status, _) = serve(&fake, get("/entities/ticket/T-1?limit=5", Some(READER))).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 0 Some(5)");
     }
 
     #[tokio::test]

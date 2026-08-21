@@ -143,10 +143,21 @@ CREATE TABLE entity_refs (
     entity_id  TEXT    NOT NULL,
     role       TEXT    NOT NULL,
     confidence REAL    NOT NULL,
+    -- The record's server time, copied so the index below can carry the order this table is read
+    -- in. Derived like everything else here: a rebuild takes it from the same record.
+    received_ms INTEGER NOT NULL,
     PRIMARY KEY (record_pk, kind, entity_id, role)
 ) STRICT, WITHOUT ROWID;
 
-CREATE INDEX entity_refs_lookup ON entity_refs (kind, entity_id, confidence, record_pk);
+-- Entity history is read newest first and a page at a time, so the order is in the index. Under
+-- (kind, entity_id, confidence, record_pk) the rows came out in record order and every one of them
+-- had to be sorted before the page could be taken, which made the page size a cap on the answer and
+-- not on the work: measured over an entity with 20,000 references, `LIMIT 10` cost 28 ms — the same
+-- as no limit at all — and 0.07 ms with this. `confidence` sits after `received_ms` because it is a
+-- range test, and a range mid-key ends the ordered walk; it stays in the index so the filter is
+-- still covered.
+CREATE INDEX entity_refs_recent
+    ON entity_refs (kind, entity_id, received_ms, confidence, record_pk);
 
 -- A record may name several subjects, each with its own role, key epoch and wrapped key share.
 CREATE TABLE record_subjects (

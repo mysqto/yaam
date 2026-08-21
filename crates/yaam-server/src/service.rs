@@ -31,18 +31,23 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
     /// Answers a filtered query.
     fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordId>>;
 
-    /// Answers everything touching one entity.
+    /// Answers one page of what touches one entity.
     ///
     /// An implementation must canonicalise `kind` and `id` the way the write path does before
     /// matching them, and refuse what it cannot canonicalise. Matching an identifier as sent is how
     /// a caller asking for `proj-42` where the store holds `PROJ-42` gets an empty answer it reads
     /// as "no history".
+    ///
+    /// `limit` is the page size, `None` meaning the index's own default cap. Not optional in the
+    /// sense of unbounded: an entity's history grows with how busy the entity is, and a request
+    /// answering with all of it hands the busiest identifier in the store a lever on every reader.
     fn entity(
         &self,
         caller: &Caller,
         kind: &str,
         id: &str,
         min_confidence: f32,
+        limit: Option<u32>,
     ) -> Result<Vec<RecordId>>;
 
     /// Composes context for a request.
@@ -154,12 +159,18 @@ impl Service for CoreService {
         kind: &str,
         id: &str,
         min_confidence: f32,
+        limit: Option<u32>,
     ) -> Result<Vec<RecordId>> {
         let id = self.canonical(kind, id)?;
-        Ok(
-            query::by_entity(self.store()?, kind, &id, min_confidence, &caller.scope())
-                .map_err(yaam_core::Error::from)?,
+        Ok(query::by_entity(
+            self.store()?,
+            kind,
+            &id,
+            min_confidence,
+            limit,
+            &caller.scope(),
         )
+        .map_err(yaam_core::Error::from)?)
     }
 
     fn bundle(&self, caller: &Caller, request: &bundle::Request) -> Result<Bundle> {

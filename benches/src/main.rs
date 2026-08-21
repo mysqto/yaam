@@ -264,6 +264,8 @@ struct Targets {
     tail: [(String, String, usize); 3],
     /// Bodies carrying the searched-for phrase.
     with_phrase: usize,
+    /// Bodies carrying the single common word measurement 6a searches for.
+    with_common_word: usize,
 }
 
 impl Targets {
@@ -281,14 +283,17 @@ impl Targets {
             hot.0, hot.1, tail[0].2, tail[1].2, tail[2].2
         );
         println!(
-            "- phrase `{}` appears in {} of {total} bodies\n",
+            "- phrase `{}` appears in {} of {total} bodies; the common word `{}` in {}\n",
             synth::PHRASE,
-            census.with_phrase
+            census.with_phrase,
+            synth::COMMON_WORD,
+            census.with_common_word
         );
         Self {
             hot,
             tail,
             with_phrase: census.with_phrase,
+            with_common_word: census.with_common_word,
         }
     }
 }
@@ -404,21 +409,45 @@ fn single_table_reads(
         Row {
             tag: "1",
             what: format!(
-                "point lookup: everything on one entity (`order_ref` tail, {tail_count} records)"
+                "point lookup: one entity's history (`order_ref` tail, {tail_count} records)"
             ),
             estimate: "<1 ms",
             timings: measure(index, iterations, |store| {
-                query::by_entity(store, "order_ref", tail_id, 1.0, &reader())
+                query::by_entity(store, "order_ref", tail_id, 1.0, None, &reader())
                     .expect("by entity")
                     .len()
             }),
         },
         Row {
             tag: "1a",
-            what: format!("as 1, but the busiest entity ({hot_count} records)"),
+            what: format!(
+                "as 1, the busiest entity ({hot_count} records) at the default page size"
+            ),
             estimate: "—",
             timings: measure(index, iterations / 3, |store| {
-                query::by_entity(store, "order_ref", hot_id, 1.0, &reader())
+                query::by_entity(store, "order_ref", hot_id, 1.0, None, &reader())
+                    .expect("by entity")
+                    .len()
+            }),
+        },
+        Row {
+            tag: "1b",
+            what: format!("as 1a, the busiest entity ({hot_count} records), asking for 10"),
+            estimate: "—",
+            timings: measure(index, iterations, |store| {
+                query::by_entity(store, "order_ref", hot_id, 1.0, Some(10), &reader())
+                    .expect("by entity")
+                    .len()
+            }),
+        },
+        Row {
+            tag: "1c",
+            what: format!(
+                "as 1a, the busiest entity ({hot_count} records), the unbounded verification read"
+            ),
+            estimate: "—",
+            timings: measure(index, iterations / 3, |store| {
+                query::by_entity_unbounded(store, "order_ref", hot_id, 1.0)
                     .expect("by entity")
                     .len()
             }),
@@ -529,6 +558,20 @@ fn composed_reads(
             }),
         },
         Row {
+            tag: "6a",
+            what: format!(
+                "full-text single common word `{}`, first 10 of {} matching bodies",
+                synth::COMMON_WORD,
+                targets.with_common_word
+            ),
+            estimate: "—",
+            timings: measure(index, iterations, |store| {
+                query::search(store, synth::COMMON_WORD, 10, &reader())
+                    .expect("search")
+                    .len()
+            }),
+        },
+        Row {
             tag: "7",
             what: "bundle composition, typical: three tail entities and one actor".to_owned(),
             estimate: "~10-40 ms",
@@ -560,7 +603,14 @@ fn plans(index: &Path, targets: &Targets, queries: &Queries) -> String {
     let steps = [
         (
             "1",
-            explain::by_entity(&store, "order_ref", &targets.tail[0].1, 1.0, &reader()),
+            explain::by_entity(
+                &store,
+                "order_ref",
+                &targets.tail[0].1,
+                1.0,
+                None,
+                &reader(),
+            ),
         ),
         (
             "2",
@@ -587,6 +637,10 @@ fn plans(index: &Path, targets: &Targets, queries: &Queries) -> String {
         (
             "6",
             explain::search(&store, &queries.phrase, 100, &reader()),
+        ),
+        (
+            "6a",
+            explain::search(&store, synth::COMMON_WORD, 10, &reader()),
         ),
     ];
     let mut out = String::new();

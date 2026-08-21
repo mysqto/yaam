@@ -17,6 +17,20 @@ use yaam_contract::{RecordId, Visibility};
 /// narrowing the window — there is deliberately no offset to walk.
 pub const DEFAULT_LIMIT: u32 = 1_000;
 
+/// How many full-text matches [`search`] may examine per row it returns.
+///
+/// The scope test runs after the match, so the candidate set has to be wider than the page or a
+/// scoped caller would never fill one. Twenty covers a caller entitled to a twentieth of what
+/// matched; beyond that the page comes back short, which is the stated cost of bounding this read at
+/// all.
+pub const SCOPE_HEADROOM: u32 = 20;
+
+/// Most full-text matches [`search`] will examine, whatever the page size.
+///
+/// Without this, a page size of a million would buy back the unbounded read the headroom exists to
+/// prevent.
+pub const MAX_CANDIDATES: u32 = 5_000;
+
 /// The predicate for a read that may return nothing.
 ///
 /// A predicate rather than an early return, so a scope that admits no record takes the same path as
@@ -80,20 +94,71 @@ pub struct Filter {
     pub scope: Scope,
 }
 
-/// Everything touching one entity, newest first.
+/// One entity's history, newest first, one page of it.
 ///
 /// `min_confidence` is the caller's tolerance for inferred references: `1.0` keeps only the ones
-/// read out of a structured field.
+/// read out of a structured field. `limit` is the page size; `None` means [`DEFAULT_LIMIT`], never
+/// unbounded — an entity's history is as long as the entity is busy, and the busiest identifier in
+/// a store decides the cost of what the API calls a point lookup. Measured over a synthetic 200,000
+/// record store: 0.039 ms for a tail identifier against 1.514 ms for the busiest one, and a real
+/// store's hot entity is bigger than a synthetic store's.
+///
+/// A caller that has to see *every* reference — a rebuild verifying its own output, a sweep — reads
+/// [`by_entity_unbounded`] and says so at the call site.
 pub fn by_entity(
     store: &crate::Store,
     kind: &str,
     id: &str,
     min_confidence: f32,
+    limit: Option<u32>,
     scope: &Scope,
 ) -> crate::Result<Vec<RecordId>> {
-    let (sql, binds) = by_entity_sql(kind, id, min_confidence, scope);
+    let (sql, binds) = by_entity_sql(kind, id, min_confidence, Extent::Page(limit), scope);
+    run_ids(store, &sql, binds)
+}
+
+/// Every record touching one entity, with no row cap and no scope.
+///
+/// The read a rebuild's own verification needs. Capping *that* would let a hot entity fail
+/// verification silently, which is why the page size went on the endpoint rather than on the query.
+///
+/// It takes no [`Scope`], and that is the guard rather than an omission: unbounded and unrestricted
+/// are the same decision, so a request-driven path cannot reach for this one without also handing
+/// back rows nobody checked entitlements against. Cost is linear in the entity's history and
+/// bounded by nothing — do not answer a request from it.
+pub fn by_entity_unbounded(
+    store: &crate::Store,
+    kind: &str,
+    id: &str,
+    min_confidence: f32,
+) -> crate::Result<Vec<RecordId>> {
+    let (sql, binds) = by_entity_sql(
+        kind,
+        id,
+        min_confidence,
+        Extent::Everything,
+        &Scope::Unrestricted,
+    );
+    run_ids(store, &sql, binds)
+}
+
+/// How much of an entity's history one read may take.
+///
+/// Spelled out rather than left as an optional page size, because the two cases are not "a number or
+/// the default" but "a page or all of it", and the second is not something a caller should be able to
+/// ask for by leaving a field out.
+#[derive(Clone, Copy)]
+enum Extent {
+    /// One page: `Some(n)` rows, or [`DEFAULT_LIMIT`] when the caller named none.
+    Page(Option<u32>),
+    /// Every reference there is. The rebuild's verification read, and nothing request-driven.
+    Everything,
+}
+
+/// Runs a statement whose one column is a record id.
+fn run_ids(store: &crate::Store, sql: &str, binds: Vec<SqlValue>) -> crate::Result<Vec<RecordId>> {
     let lease = store.lease()?;
-    let mut stmt = lease.prepare(&sql)?;
+    let mut stmt = lease.prepare(sql)?;
     let rows = stmt.query_map(params_from_iter(binds), one_id)?;
     collect(rows)
 }
@@ -102,10 +167,12 @@ pub fn by_entity(
 ///
 /// Separate from running it for the reason [`filter_sql`] is: the plan is the only thing that says
 /// whether the entity index was used, and it can only be asked of the statement text.
+///
 fn by_entity_sql(
     kind: &str,
     id: &str,
     min_confidence: f32,
+    extent: Extent,
     scope: &Scope,
 ) -> (String, Vec<SqlValue>) {
     let mut binds: Vec<SqlValue> = vec![
@@ -122,7 +189,13 @@ fn by_entity_sql(
         sql.push_str(" AND ");
         sql.push_str(&predicate);
     }
-    sql.push_str(" ORDER BY rec.received_ms DESC, rec.id DESC");
+    // Ordered on the reference's own copy of the time, not on the record's: the two are the same
+    // value, and only this one is in the index the seek uses — which is what lets the page size stop
+    // the walk instead of capping a set that was sorted in full first.
+    sql.push_str(" ORDER BY er.received_ms DESC, er.record_pk DESC");
+    if let Extent::Page(page) = extent {
+        push_limit(&mut sql, &mut binds, page);
+    }
     (sql, binds)
 }
 
@@ -151,10 +224,7 @@ pub fn exists(store: &crate::Store, id: &str, scope: &Scope) -> crate::Result<bo
 /// attribute index instead of testing JSON per row.
 pub fn by_filter(store: &crate::Store, filter: &Filter) -> crate::Result<Vec<RecordId>> {
     let (sql, binds) = filter_sql(filter);
-    let lease = store.lease()?;
-    let mut stmt = lease.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(binds), one_id)?;
-    collect(rows)
+    run_ids(store, &sql, binds)
 }
 
 /// Builds the filtered query and its bindings.
@@ -246,12 +316,39 @@ fn correlate_sql(left: &Filter, right: &Filter, within_ms: i64) -> (String, Vec<
     (sql, binds)
 }
 
-/// Full-text search over plaintext bodies only.
+/// Full-text search over plaintext bodies only, best match first.
 ///
 /// `needle` is an FTS5 query expression, so prefix and phrase syntax reach the caller; a malformed
 /// one is reported rather than silently matching nothing. Sealed records hold an empty body and so
 /// index no text; the explicit predicate says so at the query too, because "it cannot happen" is
 /// not the same as "it is refused".
+///
+/// # What this costs, and what it buys
+///
+/// A `LIMIT` cannot be pushed into an FTS match, and every hit needs its `records` row for the scope
+/// and sealed tests, so the obvious spelling of this query costs whatever the *corpus* matches
+/// rather than whatever the caller asked for: 0.24 ms for a needle matching nothing, 6.9 ms for
+/// 3,908 matching bodies, 583 ms for one common word matching 138,485 of them. So the candidates are
+/// capped before the join, by [`candidate_ceiling`], and taken from the most recently indexed end of
+/// the match. Descending row id is the only order the full-text index walks without visiting every
+/// hit: measured over 137,995 matches, 200 candidates in row-id order cost 0.2 ms and the same 200
+/// by rank cost 195 ms, because a global ranking has to score every hit to find the best few. Ranked
+/// candidates would keep the better matches and give back the bound.
+///
+/// Row id is insertion order, which is arrival order: a live write takes the next id, and a rebuild
+/// walks the tree in arrival order for this reason rather than by chance — `yaam_core`'s rebuild
+/// sorts by it and has a test that says so. A backfilled record is the exception, arriving late with
+/// an older stamp, so "newest" here means newest to the store rather than newest by claimed time. The
+/// page itself is then ordered properly, by relevance and then server-stamped time, over whatever the
+/// ceiling admitted.
+///
+/// The price is paid by a narrowly scoped caller. The ceiling is applied *before* the scope test,
+/// because a scope predicate cannot be pushed into the match either, so a caller who may read only
+/// a small share of the store can get a short page — up to and including an empty one — while
+/// records it is entitled to sit just past the ceiling. It is a real loss of recall, deliberately
+/// preferred to an unbounded read: the alternative is a page size that says nothing about the work
+/// behind it. The ceiling leaves [`SCOPE_HEADROOM`]× the page for the scope test to discard, which
+/// covers a caller who can read a twentieth of what matched, and no more than that.
 pub fn search(
     store: &crate::Store,
     needle: &str,
@@ -259,25 +356,48 @@ pub fn search(
     scope: &Scope,
 ) -> crate::Result<Vec<RecordId>> {
     let (sql, binds) = search_sql(needle, limit, scope);
-    let lease = store.lease()?;
-    let mut stmt = lease.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(binds), one_id)?;
-    collect(rows)
+    run_ids(store, &sql, binds)
+}
+
+/// Matches the full-text index is allowed to hand to the scope test, for a page of `limit`.
+///
+/// Headroom for the scope predicate, capped so that a corpus-wide needle cannot buy an unbounded
+/// read, and never below the page itself — a ceiling under the page size would cap the answer twice.
+fn candidate_ceiling(limit: u32) -> u32 {
+    limit
+        .saturating_mul(SCOPE_HEADROOM)
+        .min(MAX_CANDIDATES)
+        .max(limit)
 }
 
 /// Builds the full-text query and its bindings.
 fn search_sql(needle: &str, limit: u32, scope: &Scope) -> (String, Vec<SqlValue>) {
-    let mut binds: Vec<SqlValue> = vec![needle.to_owned().into()];
-    let mut sql = "SELECT rec.record_id
-         FROM records_fts
-         JOIN records AS rec ON rec.id = records_fts.rowid
-         WHERE records_fts MATCH ? AND rec.sealed = 0"
+    let mut binds: Vec<SqlValue> = vec![
+        needle.to_owned().into(),
+        i64::from(candidate_ceiling(limit)).into(),
+    ];
+    // The candidate set is its own statement so the ceiling applies to the match itself. Ordering
+    // it by rowid descending is what lets the full-text index stop early: rowid is its own scan
+    // order, so nothing is sorted and nothing past the ceiling is visited. `rank` comes out with
+    // each candidate — best-match order among the candidates is still worth having, and it costs
+    // only the rows already read.
+    let mut sql = "WITH candidates AS (
+             SELECT rowid AS record_pk, rank AS relevance
+             FROM records_fts
+             WHERE records_fts MATCH ?
+             ORDER BY rowid DESC
+             LIMIT ?
+         )
+         SELECT rec.record_id
+         FROM candidates
+         JOIN records AS rec ON rec.id = candidates.record_pk
+         WHERE rec.sealed = 0"
         .to_owned();
     if let Some(predicate) = scope_predicate(scope, "rec", &mut binds) {
         sql.push_str(" AND ");
         sql.push_str(&predicate);
     }
-    sql.push_str(" ORDER BY records_fts.rank, rec.received_ms DESC LIMIT ?");
+    sql.push_str(" ORDER BY candidates.relevance, rec.received_ms DESC LIMIT ?");
     binds.push(i64::from(limit).into());
     (sql, binds)
 }
@@ -398,7 +518,7 @@ fn collect(rows: impl Iterator<Item = rusqlite::Result<String>>) -> crate::Resul
 /// explained from a second, hand-copied spelling of the SQL is a plan for a query nobody executes.
 #[cfg(feature = "explain")]
 pub mod explain {
-    use super::{Filter, Scope, by_entity_sql, correlate_sql, filter_sql, search_sql};
+    use super::{Extent, Filter, Scope, by_entity_sql, correlate_sql, filter_sql, search_sql};
 
     /// How [`super::by_entity`] would run.
     pub fn by_entity(
@@ -406,9 +526,10 @@ pub mod explain {
         kind: &str,
         id: &str,
         min_confidence: f32,
+        limit: Option<u32>,
         scope: &Scope,
     ) -> crate::Result<String> {
-        let (sql, binds) = by_entity_sql(kind, id, min_confidence, scope);
+        let (sql, binds) = by_entity_sql(kind, id, min_confidence, Extent::Page(limit), scope);
         plan(store, &sql, binds)
     }
 
@@ -478,7 +599,8 @@ mod tests {
     use yaam_contract::Visibility;
 
     use super::{
-        DEFAULT_LIMIT, Filter, Scope, SqlValue, Window, correlate_sql, filter_sql, scope_predicate,
+        DEFAULT_LIMIT, Extent, Filter, MAX_CANDIDATES, SCOPE_HEADROOM, Scope, SqlValue, Window,
+        by_entity_sql, candidate_ceiling, correlate_sql, filter_sql, scope_predicate, search_sql,
     };
 
     /// What a reader on one team is entitled to.
@@ -589,6 +711,70 @@ mod tests {
     }
 
     #[test]
+    fn a_page_of_entity_history_is_taken_in_index_order() {
+        // The row cap on its own would be cosmetic. Under an index that could not supply the order,
+        // every reference was sorted before the page was taken, so `LIMIT 10` over an entity with
+        // 20,000 references cost 28 ms — the same as no limit at all — and 0.07 ms once the order
+        // came out of the index. Only the plan tells those two apart.
+        let (sql, binds) =
+            by_entity_sql("ticket", "PROJ-42", 0.0, Extent::Page(Some(10)), &reader());
+        let plan = plan(&sql, binds);
+        assert!(
+            plan.contains("entity_refs_recent"),
+            "the entity index must supply the order:\n{plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "sorting the whole history before taking the page is what the index avoids:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn the_unbounded_entity_read_is_the_only_one_without_a_cap() {
+        let (bounded, _) = by_entity_sql("ticket", "PROJ-42", 0.0, Extent::Page(None), &reader());
+        assert!(bounded.contains("LIMIT ?"), "{bounded}");
+        let (unbounded, binds) = by_entity_sql(
+            "ticket",
+            "PROJ-42",
+            0.0,
+            Extent::Everything,
+            &Scope::Unrestricted,
+        );
+        assert!(!unbounded.contains("LIMIT"), "{unbounded}");
+        assert_eq!(binds.len(), 3, "no scope and no cap to bind: {binds:?}");
+    }
+
+    #[test]
+    fn a_full_text_read_caps_its_candidates_before_the_join() {
+        let (sql, binds) = search_sql("shards", 10, &reader());
+        let plan = plan(&sql, binds.clone());
+        assert!(
+            plan.contains("records_fts"),
+            "the match must still be served by the full-text index:\n{plan}"
+        );
+        // The candidate set is materialised on its own, ahead of the join, which is the whole of the
+        // bound: the join and the sort then see the ceiling and never the corpus.
+        assert!(
+            plan.contains("CO-ROUTINE") || plan.contains("SUBQUERY"),
+            "the candidate cap must be its own step:\n{plan}"
+        );
+        assert!(
+            binds.contains(&SqlValue::from(i64::from(candidate_ceiling(10)))),
+            "the ceiling has to be bound, not implied: {binds:?}"
+        );
+    }
+
+    #[test]
+    fn the_candidate_ceiling_leaves_headroom_for_the_scope_and_stops() {
+        assert_eq!(candidate_ceiling(10), 10 * SCOPE_HEADROOM);
+        assert_eq!(candidate_ceiling(0), 0);
+        // A page size large enough to reach the ceiling stops there, and one larger than the ceiling
+        // is still served in full — a candidate set under the page would cap the answer twice.
+        assert_eq!(candidate_ceiling(MAX_CANDIDATES), MAX_CANDIDATES);
+        assert_eq!(candidate_ceiling(u32::MAX), u32::MAX);
+    }
+
+    #[test]
     fn the_default_scope_matches_nothing() {
         // A filter nobody scoped is a read whose entitlements are unknown, and the only safe answer
         // to that is no rows.
@@ -693,9 +879,9 @@ mod tests {
 
         // Every helper answers, and the join names both sides.
         assert!(
-            super::explain::by_entity(&store, "ticket", "PROJ-42", 1.0, &reader())
+            super::explain::by_entity(&store, "ticket", "PROJ-42", 1.0, None, &reader())
                 .expect("a plan")
-                .contains("entity_refs_lookup")
+                .contains("entity_refs_recent")
         );
         assert!(
             super::explain::search(&store, "shards", 10, &reader())

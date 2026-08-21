@@ -516,7 +516,7 @@ fn every_read_path_applies_the_scope() {
     let hidden = docs[2].record_id.as_str();
 
     // Entity history: every record here names the same ticket, so only the scope can narrow it.
-    let rows = query::by_entity(&store, "ticket", "TCK-1", 1.0, &scope).expect("by_entity");
+    let rows = query::by_entity(&store, "ticket", "TCK-1", 1.0, None, &scope).expect("by_entity");
     let history = ids(&rows);
     assert!(!history.contains(&hidden), "{history:?}");
     assert!(history.contains(&docs[1].record_id.as_str()));
@@ -557,7 +557,7 @@ fn a_read_with_no_scope_returns_nothing_rather_than_everything() {
             .is_empty()
     );
     assert!(
-        query::by_entity(&store, "ticket", "TCK-1", 1.0, &Scope::default())
+        query::by_entity(&store, "ticket", "TCK-1", 1.0, None, &Scope::default())
             .expect("by_entity")
             .is_empty()
     );
@@ -666,16 +666,17 @@ fn by_entity_is_newest_first_and_honours_confidence() {
     publish(&mut writer, &inferred).expect("publish");
 
     let store = Store::open_read(&path).expect("open read");
-    let all = query::by_entity(&store, "ticket", "TCK-77", 0.0, &ALL).expect("by_entity");
+    let all = query::by_entity(&store, "ticket", "TCK-77", 0.0, None, &ALL).expect("by_entity");
     assert_eq!(
         ids(&all),
         vec![inferred.record_id.as_str(), certain.record_id.as_str()]
     );
 
-    let confident = query::by_entity(&store, "ticket", "TCK-77", 0.9, &ALL).expect("by_entity");
+    let confident =
+        query::by_entity(&store, "ticket", "TCK-77", 0.9, None, &ALL).expect("by_entity");
     assert_eq!(ids(&confident), vec![certain.record_id.as_str()]);
     assert!(
-        query::by_entity(&store, "ticket", "TCK-99", 0.0, &ALL)
+        query::by_entity(&store, "ticket", "TCK-99", 0.0, None, &ALL)
             .expect("by_entity")
             .is_empty()
     );
@@ -1383,4 +1384,134 @@ fn a_stored_id_the_contract_would_reject_reads_as_drift() {
         writer.claim_fanout(10, NOW),
         Err(yaam_store::Error::Drift(_))
     ));
+}
+
+/// A store where one entity carries a long history, oldest first.
+fn busy_entity(references: usize) -> (tempfile::TempDir, std::path::PathBuf, Vec<ActionRecord>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    let mut docs = Vec::with_capacity(references);
+    for minute in 0..references {
+        let mut doc = record(
+            "deploy",
+            Outcome::Success,
+            &format!("2026-08-20T10:{minute:02}:00Z"),
+        );
+        doc.entities = vec![entity_ref("ticket", "TCK-HOT", 1.0)];
+        publish(&mut writer, &doc).expect("publish");
+        docs.push(doc);
+    }
+    (dir, path, docs)
+}
+
+#[test]
+fn a_hot_entity_is_paged_through_the_query_and_whole_through_the_verification_read() {
+    let (_dir, path, docs) = busy_entity(40);
+    let store = Store::open_read(&path).expect("open read");
+
+    // What a request gets: the page it asked for, newest first.
+    let page = query::by_entity(&store, "ticket", "TCK-HOT", 1.0, Some(10), &ALL).expect("page");
+    assert_eq!(page.len(), 10);
+    assert_eq!(
+        ids(&page)[0],
+        docs[39].record_id.as_str(),
+        "a page of entity history is the newest end of it"
+    );
+
+    // What a rebuild's verification gets: all of it, however busy the entity is.
+    let everything =
+        query::by_entity_unbounded(&store, "ticket", "TCK-HOT", 1.0).expect("unbounded");
+    assert_eq!(everything.len(), 40);
+    assert_eq!(ids(&everything)[..10], ids(&page)[..]);
+}
+
+/// A store where `count` records all carry the same common word in their bodies.
+fn common_word_corpus(count: usize, team: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    for minute in 0..count {
+        let mut doc = record(
+            "deploy",
+            Outcome::Success,
+            &format!("2026-08-20T10:{minute:02}:00Z"),
+        );
+        doc.visibility = Visibility::Team;
+        doc.team = Some(team.to_owned());
+        doc.summary = format!("commonword body number {minute}");
+        publish(&mut writer, &doc).expect("publish");
+    }
+    (dir, path)
+}
+
+#[test]
+fn a_search_for_a_corpus_wide_word_examines_the_page_and_not_the_corpus() {
+    let (_dir, path) = common_word_corpus(60, "platform");
+    let store = Store::open_read(&path).expect("open read");
+
+    let page = query::search(
+        &store,
+        "commonword",
+        5,
+        &reader("deploy_bot", &["platform"]),
+    )
+    .expect("search");
+    assert_eq!(page.len(), 5, "the page the caller asked for, and no more");
+    // That the *work* is capped too is a property of the statement, and is asserted on the plan in
+    // `query`'s own tests: only the plan can tell a bounded read from one that was fast today.
+}
+
+#[test]
+fn a_narrowly_scoped_search_can_come_back_short_of_its_page() {
+    // The stated cost of bounding this read. The ceiling is applied before the scope test, because
+    // neither a limit nor a scope predicate can be pushed into a full-text match, so a caller who
+    // may read only the older end of what matched sees a short page rather than a slow one.
+    let (_dir, path) = common_word_corpus(60, "support");
+    let store = Store::open_read(&path).expect("open read");
+    let outsider = reader("deploy_bot", &["platform"]);
+
+    // Ceiling of 20 candidates for a page of one: the newest 20 matches belong to another team, and
+    // the query stops there rather than reading on to the 40 this caller might have been shown.
+    assert!(
+        query::search(&store, "commonword", 1, &outsider)
+            .expect("search")
+            .is_empty(),
+        "a caller entitled to none of the newest matches gets a short page, not a long read"
+    );
+    // Nothing is wrong with the corpus or the needle: the unscoped read finds them.
+    assert_eq!(
+        query::search(&store, "commonword", 1, &ALL)
+            .expect("search")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_batch_dropped_without_committing_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    let first = record("deploy", Outcome::Success, T10);
+    publish(&mut writer, &first).expect("publish");
+
+    // What an interrupted rebuild does: truncate, write, and never reach the commit.
+    let mut batch = writer.batch().expect("batch");
+    batch.truncate_derived().expect("truncate");
+    batch
+        .publish(PublishInput {
+            record: &record("deploy", Outcome::Failure, T11),
+            searchable_body: "",
+            subject_keys: &[],
+        })
+        .expect("publish");
+    drop(batch);
+
+    let store = Store::open_read(&path).expect("open read");
+    assert_eq!(
+        ids(&query::by_filter(&store, &unfiltered()).expect("filter")),
+        vec![first.record_id.as_str()],
+        "a batch that never committed must leave the index exactly as it was"
+    );
 }

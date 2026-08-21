@@ -182,6 +182,22 @@ impl Harness {
             .expect("age claims")
     }
 
+    /// Every record's server-stamped time, in row-id order.
+    ///
+    /// Row id is the order the full-text index can be walked in, so "row ids follow the clock" is
+    /// load-bearing rather than incidental: it is what makes a capped full-text candidate set the
+    /// newest matches rather than an arbitrary corner of the store.
+    pub(crate) fn received_ms_by_row_id(&self) -> Vec<i64> {
+        let conn = self.index();
+        let mut stmt = conn
+            .prepare("SELECT received_ms FROM records ORDER BY id")
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("query");
+        rows.map(|row| row.expect("row")).collect()
+    }
+
     /// State and attempt count of the one queued job, for the retry tests.
     pub(crate) fn fanout_row(&self) -> (String, u32) {
         self.index()
@@ -275,7 +291,8 @@ const SNAPSHOT_QUERIES: [(&str, &str); 7] = [
     ),
     (
         "entity_ref",
-        "SELECT r.record_id, e.kind, e.entity_id, e.role, e.confidence FROM entity_refs AS e
+        "SELECT r.record_id, e.kind, e.entity_id, e.role, e.confidence, e.received_ms
+         FROM entity_refs AS e
          JOIN records AS r ON r.id = e.record_pk
          ORDER BY r.record_id, e.kind, e.entity_id, e.role",
     ),
