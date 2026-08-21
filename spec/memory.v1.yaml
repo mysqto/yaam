@@ -1263,12 +1263,22 @@ components:
 
         The answer to `GET /records` and to `GET /entities/{kind}/{id}` alike: what a read returns is
         a property of this service, not of which read was made.
-      required: [records]
+      required: [records, token_estimate]
       properties:
         records:
           type: array
           items:
             $ref: '#/components/schemas/RecordStructure'
+        token_estimate:
+          type: integer
+          minimum: 0
+          description: |
+            Rough token cost of this answer, measured over the structures actually returned.
+            Advisory, and not a promise about any tokeniser.
+        
+            Present for the same reason it is on a bundle: these reads hand back the same rows,
+            and a caller paging them had no way to size an answer before consuming it.
+          example: 158
 
     BundleResponse:
       type: object

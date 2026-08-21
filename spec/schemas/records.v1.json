@@ -332,10 +332,17 @@
         "$ref": "#/$defs/RecordStructure"
       },
       "type": "array"
+    },
+    "token_estimate": {
+      "description": "Rough token cost of this answer, advisory only.\n\nHere for the same reason it is on a bundle: these reads return the same rows, and a caller\npaging them had no way to size an answer before consuming it.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
     }
   },
   "required": [
-    "records"
+    "records",
+    "token_estimate"
   ],
   "title": "RecordsResponse",
   "type": "object"
