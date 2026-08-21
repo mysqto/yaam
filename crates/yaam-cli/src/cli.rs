@@ -74,8 +74,10 @@ pub struct AgentArgs {
     pub state_dir: Option<PathBuf>,
     /// Serve one caller, as `agent=path`. Repeat for several.
     ///
-    /// Defaults to one socket per agent the configuration holds a signing key for, under
-    /// `<state-dir>/sockets/<agent>.sock`.
+    /// Defaults to one caller per agent the configuration holds a signing key for, under
+    /// `<state-dir>/sockets/<agent>.sock`. Each caller also gets a read socket, at the same path
+    /// with `.read.sock` for its extension: records go to the first, signed HTTP reads to the
+    /// second.
     #[arg(long = "socket", value_name = "AGENT=PATH")]
     pub sockets: Vec<String>,
     /// Entries the spool holds before it refuses writes. Overrides the configuration file.

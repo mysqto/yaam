@@ -22,11 +22,14 @@ yaam-contract = { path = "../yaam-contract" }
 # service rather than spelled out again here.
 yaam-crypto = { path = "../yaam-crypto" }
 # HTTP without a TLS stack: the payload is already sealed to the service key, so the transport is
-# not what protects it.
-hyper = { version = "1", features = ["client", "http1"] }
+# not what protects it. The server half serves the read socket, where a caller's own HTTP request
+# arrives to be signed.
+hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 
 [dev-dependencies]
 tempfile.workspace = true
+# A paused clock, so the attempt timeout can be tested without waiting ten seconds for it.
+tokio = { version = "1", features = ["test-util"] }

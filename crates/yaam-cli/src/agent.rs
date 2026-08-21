@@ -4,9 +4,14 @@
 //! retries and shuts down. What is here is the two decisions a process has to make — which sockets
 //! to serve, and where they go — and the refusals that belong before anything is listening.
 //!
-//! The default is one socket per agent the configuration holds a signing key for. That is not a
+//! The default is one caller per agent the configuration holds a signing key for. That is not a
 //! convenience: the sidecar refuses to bind a socket it cannot sign as, so deriving the socket list
 //! from the key list makes the two impossible to configure out of step.
+//!
+//! Each caller gets two sockets: `<agent>.sock` for records and `<agent>.read.sock` for reads.
+//! `--socket agent=path` names the first, and the second is derived from it — one flag, one
+//! identity, no way to point a caller's reads and its records at different agents. The startup log
+//! names both and says which serves what.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -95,7 +100,7 @@ where
     .map_err(|error| failed("serving the caller sockets", &error))
 }
 
-/// One socket per configured signing key, under the state directory.
+/// One caller per configured signing key, under the state directory.
 fn default_sockets(state_dir: &Path, configured: &Config) -> Result<Vec<CallerSocket>> {
     if configured.signing_keys.is_empty() {
         return Err(config(format!(
@@ -118,12 +123,23 @@ fn default_sockets(state_dir: &Path, configured: &Config) -> Result<Vec<CallerSo
 ///
 /// Agent names and paths. No key material and no service URL secrets: an agent name is a configured
 /// identity, which is exactly what a caller has to know to use its own socket.
+///
+/// Both of a caller's sockets are named, and each says what it carries: a caller reading the log to
+/// find where to connect must not have to know the derivation rule to find its read socket.
 fn announce(sockets: &[CallerSocket], limits: &Limits) {
     for socket in sockets {
         tracing::info!(
             setting = "socket",
             agent = %socket.agent,
+            serves = "records",
             value = %socket.path.display(),
+            "configuration"
+        );
+        tracing::info!(
+            setting = "socket",
+            agent = %socket.agent,
+            serves = "reads",
+            value = %socket.read_path().display(),
             "configuration"
         );
     }
@@ -202,6 +218,32 @@ mod tests {
     }
 
     #[test]
+    fn the_read_socket_sits_beside_the_record_socket() {
+        let dir = state(&upstream_json());
+        let planned = plan(&settings(dir.path(), Vec::new())).expect("planned");
+        let sockets = dir.path().join(SOCKET_DIR);
+
+        assert_eq!(planned.sockets[0].path, sockets.join("agent_a.sock"));
+        assert_eq!(
+            planned.sockets[0].read_path(),
+            sockets.join("agent_a.read.sock"),
+            "a caller that knows its record socket knows its read socket"
+        );
+
+        // And a named socket carries its read socket with it, rather than needing a second flag.
+        let named = dir.path().join("elsewhere/a.sock");
+        let planned = plan(&settings(
+            dir.path(),
+            vec![("agent_a".to_owned(), named.clone())],
+        ))
+        .expect("planned");
+        assert_eq!(
+            planned.sockets[0].read_path(),
+            dir.path().join("elsewhere/a.read.sock")
+        );
+    }
+
+    #[test]
     fn a_named_socket_wins_over_the_default() {
         let dir = state(&upstream_json());
         let named = dir.path().join("elsewhere/a.sock");
@@ -275,18 +317,24 @@ mod tests {
             .iter()
             .map(|socket| socket.path.clone())
             .collect();
+        let read_paths: Vec<_> = planned
+            .sockets
+            .iter()
+            .map(yaam_agent::listener::CallerSocket::read_path)
+            .collect();
 
         let (stop, wait) = tokio::sync::oneshot::channel::<()>();
         let serving = tokio::spawn(serve(planned, async move {
             let _ = wait.await;
         }));
-        for path in &paths {
+        for path in paths.iter().chain(&read_paths) {
             for _ in 0..200 {
                 if tokio::net::UnixStream::connect(path).await.is_ok() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
+            assert!(path.exists(), "{} never appeared", path.display());
         }
 
         stop.send(()).expect("still serving");
@@ -296,6 +344,9 @@ mod tests {
             .expect("join")
             .expect("a clean shutdown");
         for path in &paths {
+            assert!(!path.exists(), "{} outlived its sidecar", path.display());
+        }
+        for path in &read_paths {
             assert!(!path.exists(), "{} outlived its sidecar", path.display());
         }
     }
