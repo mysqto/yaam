@@ -1,0 +1,285 @@
+# Labelled corpus for entity extraction from free text.
+#
+# Format: expected TAB text. `expected` is `-` for a text that references no entity, or a
+# comma-separated list of `kind:canonical_id`. Blank lines and `#` lines are ignored.
+#
+# Labelling rule: the label is what a careful reader would conclude from this text alone. Labels
+# were written before the extractor was run against them, and no label has been changed since. What
+# changed in response to what the extractor got wrong is `spec/extractors.yaml` — which is the point
+# of measuring, and is only honest as long as the corpus is the thing that does not move.
+#
+#   - A distinctive identifier is labelled even where nothing anchors it. `PROJ-42` is a tracker
+#     key to anyone who reads it, so a text naming one references a ticket whether or not the
+#     extractor can tell. Those lines are recall, and the extractor is expected to miss some.
+#   - An opaque token nobody could classify is not labelled. `ab12cd34` alone could be an order
+#     reference, a hash prefix or a coupon; a reader cannot say, so neither can this file.
+#   - Near-misses are `-`: ordinary words that satisfy a loose pattern, digit runs that are
+#     timestamps or quantities, standards names shaped like tracker keys.
+#
+# Grow it. A false positive found in the wild belongs here as a `-` line before it is fixed.
+
+# Anchored order references.
+order_ref:ab12cd34	The order ab12cd34 was confirmed this morning.
+order_ref:x7k29fq4	Refunded order x7k29fq4 after the buyer asked us to.
+order_ref:q4r7s9t2	See reference q4r7s9t2 for the earlier attempt.
+order_ref:a1b2c3d4e5	The order for a1b2c3d4e5 shipped a day late.
+order_ref:7hq2m4t8	Cart 7hq2m4t8 was abandoned before payment.
+order_ref:zz01aa55	The basket zz01aa55 held three items.
+order_ref:n3v8b1c6	Checkout completed for n3v8b1c6 at the second attempt.
+order_ref:ord9931xy,order_ref:ord4412ab	Orders ord9931xy and ord4412ab were both delayed.
+order_ref:4kk92wp1	The refund on order 4kk92wp1 cleared overnight.
+order_ref:b8x4n2m6	Reference: b8x4n2m6 covers the second attempt.
+order_ref:9wq3z7k5	The order ref 9wq3z7k5 is the one to use.
+order_ref:5mn8q2r7	Someone looked up the order 5mn8q2r7 twice.
+order_ref:t3k8w2n9	Order t3k8w2n9, raised yesterday, is still open.
+order_ref:h4j7l2p8	The order (h4j7l2p8) was split across two shipments.
+order_ref:m2n4b6v8	Referenced order m2n4b6v8 in the handover note.
+order_ref:ab12cd34	The order ab12cd34 appears twice: ab12cd34 in both exports.
+
+# Anchored tracker keys.
+ticket:PROJ-42	Closed ticket PROJ-42 after the fix landed.
+ticket:CORE-1	Filed CORE-1 for the missing column.
+ticket:OPS-118	The issue OPS-118 is still open.
+ticket:WEB-7	Reopened WEB-7 because the report came back.
+ticket:DATA-2049	Bug DATA-2049 traced to a stale cache.
+ticket:PLAT-88	The tracker key PLAT-88 was wrong on the record.
+ticket:QA-15	The issue qa-15 covers the flaky check.
+ticket:SEC-9,ticket:NET-3	Tickets SEC-9 and NET-3 were folded into one.
+ticket:CMS-14	The story CMS-14 needs an estimate.
+ticket:INFRA-77	Closes INFRA-77 once the migration finishes.
+ticket:OPS-4	Bugs like OPS-4 tend to come back.
+ticket:WEB-31	The ticket, WEB-31, was closed by mistake.
+
+# Anchored pull requests.
+pull_request:owner/repo#7	Merged owner/repo#7 into the release branch.
+pull_request:group/library#33	The pull request group/library#33 is ready for review.
+pull_request:org/site#5	PR org/site#5 fixes the broken link.
+pull_request:owner/tools#128	Reverted owner/tools#128 after the check failed.
+pull_request:group/utils#9	The patch in group/utils#9 covers both cases.
+pull_request:owner/repo#64	Backport owner/repo#64 to the previous line.
+pull_request:org/site#11,pull_request:org/site#12	Two PRs, org/site#11 and org/site#12, landed together.
+pull_request:group/library#40	The diff on group/library#40 is mostly generated.
+
+# Anchored commits.
+commit:owner/repo@a1b2c3d	Commit owner/repo@a1b2c3d fixed the regression.
+commit:group/library@9f8e7d6c5b4a	The revision group/library@9f8e7d6c5b4a is the culprit.
+commit:org/site@0123abc	Committed org/site@0123abc without a review.
+commit:owner/tools@deadbee	The sha owner/tools@deadbee is what actually shipped.
+commit:group/utils@abc1234	Cherry-picked group/utils@abc1234 onto the branch.
+commit:owner/repo@fedcba9	Reverts owner/repo@fedcba9 and nothing else.
+
+# Anchored deploys.
+deploy:api/prod#12	Deployed api/prod#12 at the end of the window.
+deploy:web/staging#412	The rollout web/staging#412 finished cleanly.
+deploy:worker/canary#7	Released worker/canary#7 to a small slice of traffic.
+deploy:api/staging#88	Promoted api/staging#88 after the checks passed.
+deploy:queue/prod#31	The deploy for queue/prod#31 was rolled back.
+deploy:db/prod#4	Rolled db/prod#4 forward again.
+deploy:api/prod#13	Deployment api/prod#13 is queued behind this one.
+
+# Anchored chat threads.
+chat_thread:general/1700000000.0001	The thread general/1700000000.0001 has the details.
+chat_thread:support/1699999999.4321	Replied in support/1699999999.4321 with the workaround.
+chat_thread:releases/1700003600.0007	The conversation releases/1700003600.0007 says otherwise.
+chat_thread:incidents/1700007200.0002	Discussion incidents/1700007200.0002 covers the same fault.
+chat_thread:general/1700010800.0009	Thread general/1700010800.0009 was archived early.
+
+# More than one reference in one text.
+deploy:api/prod#12,ticket:PROJ-42	Deployed api/prod#12 for ticket PROJ-42 after the check.
+pull_request:owner/repo#7,deploy:api/prod#12	Merged owner/repo#7 and deployed api/prod#12 in one go.
+order_ref:ab12cd34,chat_thread:general/1700000000.0001	The order ab12cd34 came up in thread general/1700000000.0001.
+commit:owner/repo@a1b2c3d,ticket:DATA-2049	Commit owner/repo@a1b2c3d closes DATA-2049 as well.
+pull_request:org/site#5	Reverted org/site#5 because the numbers looked wrong.
+ticket:OPS-118,order_ref:x7k29fq4	Issue OPS-118 was raised against order x7k29fq4.
+deploy:web/staging#412,chat_thread:support/1699999999.4321	Rollout web/staging#412 was discussed in thread support/1699999999.4321.
+
+# Ordinary words that satisfy the order_ref pattern.
+-	The order was refundable under the older terms.
+-	Order processing runs in the background overnight.
+-	The order form uses javascript for validation.
+-	A reference implementation shipped in the container image.
+-	The order sits above the threshold we agreed on.
+-	Order status showed everything as unresolved.
+-	Reference the dashboard before the standup.
+-	The order line was duplicated by the retry.
+-	Checkout timestamps drifted by about a second.
+-	The cart contents survived the redeployment.
+-	Order confirmation went out immediately.
+-	The reference documentation is out of date.
+-	Refs pointing at the deleted branch were pruned.
+-	The basket total included the adjustment.
+-	Order volumes were unremarkable last quarter.
+-	The reference here is deliberately ambiguous.
+-	Checkout behaviour changed after the migration.
+-	Order handling moved to the newer scheduler.
+
+# Digit runs: timestamps, quantities, build numbers.
+-	The order was placed at 1700000000 by the sidecar.
+-	Reference 20240115 in the daily export.
+-	The order covered 250000 units in total.
+-	Build 4127781 was cut from the same branch.
+-	The deploy took 1700000000 milliseconds, apparently.
+-	Order quantity 100000 looks like a typo.
+-	The reference clock read 1699999999 at the time.
+-	Ticket volume hit 120000 over the weekend.
+-	The rollout paged 12025551234 by mistake.
+-	Cart size 30000 is above anything seen before.
+
+# Technical vocabulary that mixes letters and digits.
+-	The reference sha256sum did not match the manifest.
+-	Order payloads are base64encoded on the wire.
+-	The reference iso8601format was wrong in the header.
+-	Refs to the md5checksum were dropped in transit.
+-	The order id and the base64url form differ.
+-	Reference the sha1hash rather than the tag.
+-	Order records keep an iso8601stamp for the audit.
+-	The reference http2upgrade path is untested.
+-	Checkout still sends a utf8encoded body.
+-	The order log line held a sha256digest and nothing else.
+
+# Standards and encoding names shaped like tracker keys.
+-	The issue was UTF-8 handling in the importer.
+-	A bug in the ISO-8601 parser lost the timezone.
+-	The ticket about SHA-256 rotation is stale.
+-	Filed under RFC-3339 compliance.
+-	The bug only shows on X86-64 hosts.
+-	Issues with AES-256 keys were resolved.
+-	The story mentioned HTTP-2 upgrades.
+-	The issue is UTF-16 surrogate pairs again.
+-	Bug reports blamed TLS-1 downgrades.
+-	The issue in Q3-2024 planning was scope, not effort.
+-	The ticket quotes RFC-7231 at length.
+-	A bug in SHA-1 verification slipped through.
+
+# Thread-shaped text that is not a thread.
+-	The thread had a 50/50 split on the naming.
+-	Replies since 2024/12 are archived.
+-	The conversation moved to general/latest instead.
+-	Thread volume rose 3/4 of the way through the quarter.
+-	The discussion covered 1/2 of the agenda.
+-	Replied on the 12/31 rota instead.
+
+# Anchors that belong to nothing nearby.
+-	The deploy went out without incident.
+-	Merged everything that was ready.
+-	The ticket was closed as a duplicate.
+-	Committed the change and moved on.
+-	Rolled the release forward by a day.
+-	The pull request was withdrawn.
+-	Order and reference are both overloaded words here.
+-	Threads about the release were merged together.
+
+# Opaque tokens nobody could classify.
+-	ab12cd34 turned up twice in the export.
+-	The fix landed, x7k29fq4 notwithstanding.
+-	Someone pasted 5mn8q2r7 into the channel.
+-	Two values, zz01aa55 and n3v8b1c6, were logged.
+-	It printed 7hq2m4t8 and stopped.
+-	The header carried b8x4n2m6 verbatim.
+
+# Distinctive identifiers with no anchor: recall, not precision.
+ticket:PROJ-42	PROJ-42 again.
+ticket:CORE-1	CORE-1 is where this started.
+pull_request:owner/repo#7	owner/repo#7 was mentioned without any context.
+deploy:api/prod#12	api/prod#12 appears in the log line.
+commit:owner/repo@a1b2c3d	owner/repo@a1b2c3d sits in the history.
+chat_thread:general/1700000000.0001	general/1700000000.0001 is quoted verbatim.
+ticket:OPS-118	Everyone had already read OPS-118.
+pull_request:group/library#33	Nobody reviewed group/library#33.
+
+# The anchor follows the identifier.
+ticket:PROJ-42	PROJ-42 is the ticket everyone is waiting on.
+order_ref:ab12cd34	ab12cd34 is the order in question.
+deploy:api/prod#12	api/prod#12 was the deploy that broke it.
+commit:owner/repo@a1b2c3d	owner/repo@a1b2c3d is the commit to revert.
+pull_request:org/site#5	org/site#5 is the pull request that fixed it.
+chat_thread:support/1699999999.4321	support/1699999999.4321 was the thread about it.
+
+# The anchor is out of window.
+order_ref:ab12cd34	The order was raised last week and the id is ab12cd34 somewhere.
+ticket:PROJ-42	Ticket triage happened on Monday, and the key everyone quoted was PROJ-42.
+deploy:api/prod#12	The deploy notes were long, and near the end someone wrote api/prod#12.
+order_ref:q4r7s9t2	Reference numbers were handed out in batches, so this one is q4r7s9t2.
+
+# Digits only, so the shape guards refuse it: recall, not precision.
+order_ref:12345678	Order 12345678 was refunded in full.
+order_ref:98765432	The order 98765432 never reached the warehouse.
+
+# Shapes that collide, separated by the nearer anchor.
+deploy:api/prod#12	The pull request landed, and then we deployed api/prod#12.
+pull_request:owner/repo#7	After the release froze, someone merged owner/repo#7 anyway.
+deploy:web/staging#412,pull_request:owner/repo#64	Deployed web/staging#412, then merged owner/repo#64.
+
+# Punctuation, casing and quoting around a real reference.
+ticket:PROJ-42	Closed ticket "PROJ-42" this morning.
+order_ref:ab12cd34	The order [ab12cd34] is the one.
+deploy:api/prod#12	Deployed *api/prod#12* and watched the graphs.
+ticket:PROJ-42	Reopened ticket proj-42; the fix regressed.
+pull_request:owner/repo#7	Merged (owner/repo#7).
+commit:owner/repo@a1b2c3d	Commit owner/repo@A1B2C3D reads the same either way.
+order_ref:ab12cd34	Order    ab12cd34   had extra whitespace around it.
+
+# Prose with no identifier-shaped text at all.
+-	The change was reviewed and merged without comment.
+-	Nothing about this needs a follow-up.
+-	The report went out to everyone on the list.
+-	A short note, written after the fact.
+-	Nobody could reproduce it on the second attempt.
+-	The meeting ran over and the decision slipped.
+-	It works now, for reasons nobody has established.
+-	The queue drained on its own after ten minutes.
+-	Two people looked at it and reached opposite conclusions.
+-	The retry succeeded, which is the whole story.
+
+# Labels that share the tracker-key shape.
+-	The bug was a Sev-1 and stayed one all night.
+-	The issue is Priority-1 until someone says otherwise.
+-	Tickets came in at Sev-2 and nobody escalated.
+-	The issue was closed at Priority-3 without comment.
+
+# Quantities written with the unit attached.
+-	Cart totals over 1000items break the report.
+-	The order totalled 1250items across three shipments.
+
+# Text near an identifier-shaped thing that is not canonical for any kind.
+-	The commit hash a1b2c3d is in the log.
+-	Deployed to api/prod without a build number.
+-	The ticket count reached 15 by Friday.
+-	Merged into the main line and left it there.
+-	The issue is well-known and still unfixed.
+-	Order lines beyond 20 are truncated in the view.
+-	The thread is long and nobody read it.
+-	Referenced in passing, then forgotten entirely.
+-	The release was cut from owner/repo without a number.
+-	Replied on the thread about general and nothing else.
+
+# Layout around a real reference: bullets, tables, dashes.
+pull_request:group/utils#12	The pull-request group/utils#12 is small enough to read in one go.
+deploy:api/prod#14	| deploy | api/prod#14 | done |
+pull_request:owner/repo#71	- Merged owner/repo#71 after review.
+ticket:PROJ-99	Ticket PROJ-99 — reopened after the rollback.
+chat_thread:general/1700014400.0011	Thread general/1700014400.0011 was pinned by someone.
+
+# More anchored references, to keep the measurement on solid ground.
+order_ref:b8x4n2m6,order_ref:q4r7s9t2	Reference b8x4n2m6 and reference q4r7s9t2 both appear.
+order_ref:k9j3h5g7	The reference k9j3h5g7 appears in the manifest.
+order_ref:ab12ef56,order_ref:cd34gh78	Order ab12ef56 was folded into order cd34gh78.
+ticket:OPS-201,ticket:OPS-118	Filed OPS-201 and closed OPS-118 the same day.
+ticket:NET-12	Ticket NET-12 was closed by the reporter.
+ticket:OPS-77,ticket:OPS-4	The bug OPS-77 is a duplicate of OPS-4.
+deploy:api/prod#15,deploy:web/prod#15	Deployed api/prod#15 and web/prod#15 together.
+deploy:api/canary#3	Rolled api/canary#3 back after the alert.
+deploy:web/prod#22	Promoted web/prod#22 at the end of the day.
+commit:group/library@abcdef1,commit:org/site@1234567	Commit group/library@abcdef1 and commit org/site@1234567 differ.
+commit:owner/repo@9876543	Reverted commit owner/repo@9876543 as well.
+pull_request:group/tools#48	PR group/tools#48 was approved quickly.
+chat_thread:general/1700018000.0003	Replied in general/1700018000.0003 twice before giving up.
+
+# Shapes the tokeniser does not reach: recall, not precision.
+pull_request:owner/repo#7	See https://example.invalid/owner/repo#7 for the diff.
+ticket:PROJ-42	The ticket PROJ-42's status changed overnight.
+order_ref:ab12cd34	The order id (ab12cd34, as written) is on the invoice.
+
+# Interleaved letters and digits that no shape closes: the residual, kept unfixed and measured.
+-	Reference the v2migration script before the cutover.
+-	The order path still uses base32hex internally.

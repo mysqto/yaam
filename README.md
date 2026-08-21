@@ -24,6 +24,7 @@ index that makes it queryable in single-digit milliseconds.
 | **Idempotent** | Every write is keyed. Replays, retries and re-drives are safe. |
 | **Redacted at the source** | The writer masks, the service only checks and refuses what is still unmasked — so a record's `fields_masked` is the writer's own account. `yaam_contract::mask` is the one implementation of masking, reading the same policy file the service checks against. |
 | **Portable** | Any harness that speaks HTTP can participate; a local sidecar handles signing and sealing so callers hold no keys. |
+| **Inferred references are marked as such** | An entity reference read out of a structured field carries `confidence: 1.0`; one inferred from prose carries less and is stored without being joined on by default. Which text counts as evidence is configuration (`spec/extractors.yaml`), and the precision of the answer is measured against a labelled corpus rather than asserted. |
 
 ## Layout
 
@@ -40,6 +41,10 @@ xtask/            repository chores: generates spec/schemas, checks the shapes b
 spec/             the contract bundle other implementations vendor
   memory.v1.yaml    the wire contract as OpenAPI 3.1, checked against the router and the types
   schemas/          the same shapes as JSON Schema 2020-12, generated — never edit by hand
+  entities.yaml     entity kinds and their canonical ID forms
+  extractors.yaml   when text is evidence that a kind was meant — anchors, guards, confidence
+  attrs-schema.yaml declared attributes per action, and which of them may sit in plaintext
+  redaction/        the redaction policies the writer masks against and the service checks
 ```
 
 ## The three shapes
@@ -55,6 +60,27 @@ three shapes as the crates that own them actually spell them.
 cargo xtask emit     # regenerate spec/schemas from the types
 cargo xtask check    # the shapes agree, and the committed schemas are current
 ```
+
+## Inferring references from text
+
+`spec/entities.yaml` says what an identifier *is*. `spec/extractors.yaml` says when a run of
+characters in prose is evidence that one was meant — which is a different question, because
+`background` is a canonical `order_ref`, `UTF-8` is a canonical `ticket`, and a twelve-digit run is a
+canonical anything that admits digits.
+
+So shape is never enough. A candidate has to clear the kind's own pattern, the configured shape
+guards, and a configured keyword within a few words in front of it; a word two kinds claim equally
+is dropped rather than guessed at. What comes out is `confidence` below the `0.9` a high-confidence
+query asks for — stored, searchable, and not joined on until someone asks for it.
+
+The bar is precision, not recall, because the two failures cost different things. A missed reference
+costs one query one fact and is bought back by adding an anchor. A wrong reference is a join key: it
+answers every question that touches it, wrongly, and nobody reads the entity graph looking for it.
+
+That claim is measured, not asserted. `crates/yaam-contract/testdata/entity-extraction.tsv` holds a
+labelled corpus of short neutral texts — genuine references in context, ordinary words that satisfy a
+loose pattern, digit runs that are timestamps or quantities, identifiers with nothing vouching for
+them — and the test beside it fails below 0.95 precision.
 
 ## Deployment seams
 

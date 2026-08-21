@@ -1,0 +1,142 @@
+# When a run of characters in prose may be believed to be an entity reference.
+#
+# `spec/entities.yaml` says what an identifier *is*. This file says when text is evidence that one
+# was meant. The two are separate because shape alone is not evidence: `background` satisfies the
+# `order_ref` pattern, `UTF-8` satisfies the `ticket` pattern, and a twelve-digit run satisfies any
+# pattern that admits digits.
+#
+# The bar is precision, not recall. A reference inferred wrongly becomes a join key, and a wrong
+# join key is a wrong answer to every question that touches it — silently, because nobody reads the
+# entity graph looking for one. A reference missed costs a single query a single fact, and is bought
+# back later by adding an anchor here.
+#
+# What a rule may say, and what each part is for:
+#
+#   anchors    keywords that vouch for a candidate, matched whole and case-folded against a word
+#              within `window` words in front of it. At least one is required — a rule without any
+#              would match on shape alone, which is the failure this file exists to prevent.
+#   window     how many preceding words are searched. Inherited from `defaults` when unstated.
+#   require    unanchored regexes, all of which the canonical identifier must match.
+#   refuse     unanchored regexes, none of which it may match.
+#   stopwords  canonical identifiers this kind never accepts, compared case-folded. Each must be
+#              something the kind could otherwise match, so a stale entry fails at load rather than
+#              reading as protection while protecting nothing.
+#   confidence what a match carries. Inherited from `defaults`; must stay under 0.9 either way.
+#
+# Configuration, like everything under `spec/`: the kinds are the ones `spec/entities.yaml`
+# configures, and the vocabulary below is a neutral example rather than a fixed list.
+version: 1
+
+defaults:
+  # Preceding tokens searched for an anchor. Small on purpose: the further an anchor sits from a
+  # candidate, the weaker the claim that it is talking about that candidate.
+  window: 4
+  # Confidence carried by anything inferred here. Must stay below the 0.9 floor a high-confidence
+  # query applies, so an inferred reference is stored and searchable but never joined on by default.
+  # A reference read out of a structured field is 1.0 and is not this file's business.
+  confidence: 0.7
+
+# Kinds `spec/entities.yaml` configures and this file deliberately says nothing about:
+#
+#   chat_user, chat_channel — the configured pattern admits any single ordinary word, so no anchor
+#     rescues it: `the user reported the fault` would mint `chat_user:reported`. These arrive from a
+#     structured field or not at all.
+#   record, subject — minted by this system, never typed into prose. A reference to either travels
+#     in a field that already knows the kind, so inferring one could only add risk.
+#
+# A kind absent here is never inferred. That is the safe direction to fail in.
+kinds:
+  order_ref:
+    # The loosest pattern in `spec/entities.yaml`: eight to twenty-four lowercase alphanumerics,
+    # which is also the shape of a great many ordinary words. Nothing here is safe on shape alone.
+    anchors: [order, orders, ordered, reference, referenced, ref, refs, cart, basket, checkout]
+    require:
+      # A letter and a digit both. Refuses ordinary words in one line, and refuses bare digit runs
+      # — timestamps, quantities, build numbers — in the other, before any anchor is consulted.
+      - '[a-z]'
+      - '[0-9]'
+    refuse:
+      # A quantity with its unit attached: digits, then letters, and nothing interleaved. A
+      # `1250items` beside an `order` anchor is the commonest thing this kind gets wrong. The cost
+      # is a reference of exactly that shape, which this refusal will now silently miss — stated so
+      # that a deployment whose references look like that knows to remove the line.
+      - '^[0-9]+[a-z]+$'
+    # What survives `require` and still is not a reference: technical vocabulary that mixes letters
+    # and digits and turns up near a `reference` anchor in an ordinary engineering note.
+    stopwords:
+      - sha1hash
+      - sha256sum
+      - sha256digest
+      - md5checksum
+      - base64url
+      - base64encoded
+      - iso8601format
+      - iso8601stamp
+      - http2upgrade
+      - utf8encoded
+    # Lower than the default: this kind clears its pattern on the strength of a denylist, and a
+    # denylist over an open class is the weakest evidence in this file.
+    confidence: 0.6
+
+  ticket:
+    anchors: [ticket, tickets, issue, issues, bug, bugs, story, tracker, filed, reopened, closes,
+              closed, closing]
+    refuse:
+      # A period label is a pinned shape — a quarter or half, then a four-digit year — so refusing
+      # it costs no plausible tracker key. Contrast the stopwords below: the standards names have no
+      # shape that separates them from a project code, so they can only be named one at a time.
+      # A refusal on their prefixes alone would refuse a real project called `MD` or `TLS` too, and
+      # would do it silently, which is the one failure mode worse than the one it prevents.
+      - '^Q[1-4]-[0-9]{4}$'
+      - '^H[1-2]-[0-9]{4}$'
+      # Severity and priority labels, same argument: the digit range pins the shape, and a tracker
+      # whose project code is `SEV` is a cost worth paying against a mislabelled severity.
+      - '^SEV-[0-9]$'
+      - '^PRIORITY-[0-9]$'
+    # An uppercase prefix, a hyphen and digits is not a shape English produces — but it is exactly
+    # the shape of a standards or encoding name, and those turn up beside an `issue` anchor often.
+    # An open class: a deployment meets one this list does not name, adds it, and moves on.
+    stopwords:
+      - utf-8
+      - utf-16
+      - utf-32
+      - iso-8601
+      - rfc-3339
+      - rfc-7231
+      - rfc-9110
+      - sha-1
+      - sha-2
+      - sha-3
+      - sha-256
+      - sha-512
+      - aes-128
+      - aes-256
+      - rsa-2048
+      - rsa-4096
+      - tls-1
+      - http-1
+      - http-2
+      - http-3
+      - x86-64
+      - md-5
+      - crc-32
+      - base-64
+
+  pull_request:
+    anchors: [pull, pull-request, pr, prs, request, requests, merged, merge, merges, patch, diff,
+              revert, reverted, backport]
+
+  commit:
+    anchors: [commit, commits, committed, sha, revision, rev, cherry-picked, reverts]
+
+  deploy:
+    # Shares `pull_request`'s shape exactly, so the anchor is the only thing that tells them apart.
+    # Where both are anchored at the same distance the reference is dropped rather than guessed.
+    anchors: [deploy, deploys, deployed, deployment, release, released, rollout, rolled, promoted]
+
+  chat_thread:
+    anchors: [thread, threads, reply, replies, replied, conversation, discussion]
+    require:
+      # The locator after the channel is a timestamp. Without this, `a 50/50 split` and `2024/12`
+      # are both admissible threads.
+      - '/[0-9]{6}'
