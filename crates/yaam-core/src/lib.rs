@@ -35,6 +35,7 @@ pub mod erase;
 pub mod error;
 pub mod pipeline;
 pub mod reindex;
+pub mod resolve;
 pub mod sweeper;
 
 mod fsutil;

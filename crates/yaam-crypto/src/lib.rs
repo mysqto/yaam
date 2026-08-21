@@ -14,6 +14,11 @@
 //! the service can open it. It lives here, with the primitives, because the sealing and the opening
 //! sides are two crates and one format.
 //!
+//! Key material at rest is the deployment's to protect: [`keystore::FsKeyStore`] puts every subject
+//! key through a [`keystore::KeyWrapper`] on its way to disk, so a recovered key file is inert
+//! without whatever holds the master key. This crate ships only [`keystore::Passthrough`], which
+//! wraps nothing and says so.
+//!
 //! Every seal and unseal needs a [`keystore::KeyStore`] to wrap and unwrap the shares, and takes
 //! one as an argument. There is deliberately no ambient store: the consumers are async, so a store
 //! installed in a thread-local would disappear the moment an `.await` moved the task to another

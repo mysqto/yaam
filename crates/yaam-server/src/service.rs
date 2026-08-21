@@ -67,12 +67,20 @@ impl CoreService {
     /// The index is a separate argument rather than a path derived from `root`, so a deployment can
     /// keep the disposable half on faster or more local storage than the authoritative half.
     pub fn open(root: &Path, index: &Path) -> Result<Self> {
-        let pipeline = yaam_core::Pipeline::new(root)?;
-        Ok(Self {
+        Ok(Self::with_pipeline(yaam_core::Pipeline::new(root)?, index))
+    }
+
+    /// The same service over a pipeline the deployment configured itself.
+    ///
+    /// How the plug-in seams reach the shipped service: a key wrapper and a subject resolver are set
+    /// on the pipeline, so a deployment that uses either builds the pipeline and hands it over
+    /// instead of passing a root and getting the defaults.
+    pub fn with_pipeline(pipeline: yaam_core::Pipeline, index: &Path) -> Self {
+        Self {
             pipeline: Mutex::new(pipeline),
             index: index.to_path_buf(),
             store: OnceLock::new(),
-        })
+        }
     }
 
     /// The write pipeline, recovering a lock a panicking request poisoned.

@@ -41,24 +41,100 @@ pub trait KeyStore {
     fn tombstone(&self, subject: &SubjectHash) -> crate::Result<()>;
 }
 
+/// Protection for key material at rest.
+///
+/// [`FsKeyStore`] writes what [`KeyWrapper::wrap`] returns and reads back through
+/// [`KeyWrapper::unwrap`]. A deployment points this at whatever holds its master key — a KMS, an
+/// HSM, a sealed enclave — so a key file recovered from a snapshot, a stale volume or a decommissioned
+/// disk is inert without a call to that service. With no such layer the file *is* the key, and
+/// "encrypted at rest" is a claim with no mechanism behind it.
+///
+/// Not the same wrapping as [`crate::seal`]'s: that wraps a record's shares *under* a subject key and
+/// travels inside the sealed body. This wraps the subject key itself and never leaves the key store's
+/// disk.
+///
+/// No client for any key service ships here: the deployment that has the key service is the one that
+/// can talk to it, and a stub in this crate would be a dependency for everybody and a working
+/// implementation for nobody. [`Passthrough`] is the development stand-in.
+pub trait KeyWrapper: Send + Sync {
+    /// Wraps key material for storage.
+    fn wrap(&self, key: &[u8]) -> crate::Result<Vec<u8>>;
+
+    /// Reverses [`KeyWrapper::wrap`].
+    ///
+    /// Failure must be an error. Key material this cannot recover is not key material that was
+    /// erased, and the store keeps those two apart on the strength of this contract.
+    fn unwrap(&self, wrapped: &[u8]) -> crate::Result<Vec<u8>>;
+}
+
+/// A [`KeyWrapper`] that stores key material exactly as handed to it.
+///
+/// For development and tests, and nothing else. There is no protection here whatsoever: a key file
+/// written under this wrapper is a usable key to anyone who can read the file, which is the state
+/// [`KeyWrapper`] exists to get a deployment out of.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Passthrough;
+
+impl KeyWrapper for Passthrough {
+    fn wrap(&self, key: &[u8]) -> crate::Result<Vec<u8>> {
+        Ok(key.to_vec())
+    }
+
+    fn unwrap(&self, wrapped: &[u8]) -> crate::Result<Vec<u8>> {
+        Ok(wrapped.to_vec())
+    }
+}
+
 /// Filesystem key store.
 ///
-/// Layout under the root: `keys/<subject>/<epoch>` holds one raw key, `tombstones/<subject>` marks a
-/// subject erased. Both trees are `0700`, every file `0600`, and a key file is written with
-/// `create_new` so a replayed mint can never overwrite the key an existing record depends on.
-#[derive(Debug)]
+/// Layout under the root: `keys/<subject>/<epoch>` holds one key as its [`KeyWrapper`] wrote it,
+/// `tombstones/<subject>` marks a subject erased. Both trees are `0700`, every file `0600`, and a key
+/// file is written with `create_new` so a replayed mint can never overwrite the key an existing
+/// record depends on.
 pub struct FsKeyStore {
     root: PathBuf,
+    /// Applied on the way to disk and reversed on the way back.
+    wrapper: Box<dyn KeyWrapper>,
+}
+
+/// Written by hand because the wrapper is a trait object: demanding `Debug` of every deployment's
+/// key service client would be a real constraint bought for a derive.
+impl std::fmt::Debug for FsKeyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsKeyStore")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FsKeyStore {
-    /// Opens a key store rooted at `root`, creating it if absent.
-    pub fn open(root: impl Into<PathBuf>) -> crate::Result<Self> {
+    /// Opens a key store rooted at `root`, creating it if absent, wrapping key material with
+    /// `wrapper`.
+    ///
+    /// The wrapper is chosen once, at open. A key already on disk was wrapped by whatever was in
+    /// force when it was written, so opening the same root under a different wrapper makes those keys
+    /// unreadable rather than migrating them — which is why this seam goes in before real keys exist.
+    pub fn new(
+        root: impl Into<PathBuf>,
+        wrapper: impl KeyWrapper + 'static,
+    ) -> crate::Result<Self> {
         let root = root.into();
         for dir in [&root, &root.join("keys"), &root.join("tombstones")] {
             create_private_dir(dir)?;
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            wrapper: Box::new(wrapper),
+        })
+    }
+
+    /// Opens a key store that writes key material in the clear.
+    ///
+    /// The name is the point. Unwrapped key storage is right for development and for tests and wrong
+    /// everywhere else, so reaching it costs a caller the word `unwrapped` at the call site, where a
+    /// reviewer sees it.
+    pub fn unwrapped(root: impl Into<PathBuf>) -> crate::Result<Self> {
+        Self::new(root, Passthrough)
     }
 
     /// Path of a subject's key directory, rejecting anything that could escape the root.
@@ -93,12 +169,20 @@ impl KeyStore for FsKeyStore {
             return Ok(None);
         }
         match fs::read(self.key_path(subject, epoch)?) {
-            Ok(bytes) if bytes.len() == KEK_LEN => Ok(Some(bytes)),
-            Ok(bytes) => Err(Error::MalformedBlock(format!(
-                "subject key for `{}` is {} bytes",
-                subject.as_str(),
-                bytes.len()
-            ))),
+            // A file that will not unwrap is a failure, never an absence. `Ok(None)` here reads as
+            // "already erased", and a caller acting on that would report data destroyed when the
+            // wrapping key is merely out of reach.
+            Ok(stored) => {
+                let key = self.wrapper.unwrap(&stored)?;
+                if key.len() != KEK_LEN {
+                    return Err(Error::MalformedBlock(format!(
+                        "subject key for `{}` unwrapped to {} bytes",
+                        subject.as_str(),
+                        key.len()
+                    )));
+                }
+                Ok(Some(key))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::Io(e)),
         }
@@ -116,7 +200,16 @@ impl KeyStore for FsKeyStore {
         create_private_dir(&dir)?;
         let mut key = vec![0u8; KEK_LEN];
         crate::seal::fill_random(&mut key);
-        match write_private_new(&self.key_path(subject, epoch)?, &key) {
+        let wrapped = match self.wrapper.wrap(&key) {
+            Ok(wrapped) => wrapped,
+            // Nothing is written, so a key service that cannot answer leaves the store exactly as it
+            // was and the caller free to try again.
+            Err(e) => {
+                key.zeroize();
+                return Err(e);
+            }
+        };
+        match write_private_new(&self.key_path(subject, epoch)?, &wrapped) {
             Ok(()) => Ok(key),
             // Lost a race with a concurrent mint: the winner's key is the one records were sealed
             // under, so adopt it and discard ours.
@@ -241,8 +334,58 @@ mod tests {
 
     fn store() -> (TempDir, FsKeyStore) {
         let dir = TempDir::new().unwrap();
-        let store = FsKeyStore::open(dir.path()).unwrap();
+        let store = FsKeyStore::unwrapped(dir.path()).unwrap();
         (dir, store)
+    }
+
+    /// A stand-in for a key service: reversible, and refuses material another instance wrote.
+    ///
+    /// The label is what makes the tests meaningful. A wrapper that merely scrambled bytes would
+    /// unwrap anything into garbage, and "wrapped under a key this deployment does not have" is the
+    /// case that has to surface as a failure rather than as a plausible-looking key.
+    struct Labelled(u8);
+
+    impl KeyWrapper for Labelled {
+        fn wrap(&self, key: &[u8]) -> crate::Result<Vec<u8>> {
+            let mut out = vec![self.0];
+            out.extend(key.iter().map(|byte| byte ^ self.0));
+            Ok(out)
+        }
+
+        fn unwrap(&self, wrapped: &[u8]) -> crate::Result<Vec<u8>> {
+            match wrapped.split_first() {
+                Some((label, body)) if *label == self.0 => {
+                    Ok(body.iter().map(|byte| byte ^ self.0).collect())
+                }
+                _ => Err(Error::Authentication),
+            }
+        }
+    }
+
+    /// A wrapper whose unwrap succeeds with the wrong number of bytes.
+    struct Lossy;
+
+    impl KeyWrapper for Lossy {
+        fn wrap(&self, key: &[u8]) -> crate::Result<Vec<u8>> {
+            Ok(key.to_vec())
+        }
+
+        fn unwrap(&self, wrapped: &[u8]) -> crate::Result<Vec<u8>> {
+            Ok(wrapped[..wrapped.len() / 2].to_vec())
+        }
+    }
+
+    /// A wrapper that cannot reach its key service.
+    struct Offline;
+
+    impl KeyWrapper for Offline {
+        fn wrap(&self, _key: &[u8]) -> crate::Result<Vec<u8>> {
+            Err(Error::Authentication)
+        }
+
+        fn unwrap(&self, _wrapped: &[u8]) -> crate::Result<Vec<u8>> {
+            Err(Error::Authentication)
+        }
     }
 
     #[test]
@@ -329,12 +472,12 @@ mod tests {
     #[test]
     fn reopening_an_existing_store_keeps_its_keys() {
         let dir = TempDir::new().unwrap();
-        let key = FsKeyStore::open(dir.path())
+        let key = FsKeyStore::unwrapped(dir.path())
             .unwrap()
             .mint(&subject(0), &epoch())
             .unwrap();
 
-        let reopened = FsKeyStore::open(dir.path()).unwrap();
+        let reopened = FsKeyStore::unwrapped(dir.path()).unwrap();
         assert_eq!(reopened.get(&subject(0), &epoch()).unwrap().unwrap(), key);
     }
 
@@ -349,6 +492,118 @@ mod tests {
             store.get(&subject, &epoch()),
             Err(Error::MalformedBlock(_))
         ));
+    }
+
+    #[test]
+    fn a_wrapped_key_round_trips_and_is_not_on_disk_in_the_clear() {
+        let dir = TempDir::new().unwrap();
+        let store = FsKeyStore::new(dir.path(), Labelled(0x5a)).unwrap();
+        let subject = subject(0);
+
+        let key = store.mint(&subject, &epoch()).unwrap();
+        assert_eq!(key.len(), KEK_LEN);
+        assert_eq!(store.get(&subject, &epoch()).unwrap().unwrap(), key);
+        assert_eq!(store.mint(&subject, &epoch()).unwrap(), key);
+
+        // The whole point of the seam: the bytes at rest are not the key.
+        let stored = fs::read(store.key_path(&subject, &epoch()).unwrap()).unwrap();
+        assert_ne!(stored, key);
+    }
+
+    #[test]
+    fn a_key_wrapped_by_another_wrapper_is_an_error_not_a_missing_key() {
+        let dir = TempDir::new().unwrap();
+        let subject = subject(0);
+        FsKeyStore::new(dir.path(), Labelled(0x11))
+            .unwrap()
+            .mint(&subject, &epoch())
+            .unwrap();
+
+        // Same root, a wrapper that cannot open what is there. Reporting `None` would tell the caller
+        // the key was erased, and a caller acting on that would report data destroyed that is not.
+        let other = FsKeyStore::new(dir.path(), Labelled(0x22)).unwrap();
+        assert!(matches!(
+            other.get(&subject, &epoch()),
+            Err(Error::Authentication)
+        ));
+        assert!(other.mint(&subject, &epoch()).is_err());
+    }
+
+    #[test]
+    fn a_key_that_unwraps_to_the_wrong_length_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let store = FsKeyStore::new(dir.path(), Lossy).unwrap();
+        let subject = subject(0);
+        store.mint(&subject, &epoch()).unwrap();
+
+        // Short by half rather than corrupt, which is the case worth refusing: a weak key that
+        // works is worse than a read that fails.
+        assert!(matches!(
+            store.get(&subject, &epoch()),
+            Err(Error::MalformedBlock(_))
+        ));
+    }
+
+    #[test]
+    fn a_wrapper_that_cannot_answer_writes_nothing_and_hides_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = FsKeyStore::new(dir.path(), Offline).unwrap();
+        let subject = subject(0);
+
+        assert!(store.mint(&subject, &epoch()).is_err());
+        // Nothing on disk, so the next attempt is a first attempt rather than a collision with a
+        // key nobody can read.
+        assert!(!store.key_path(&subject, &epoch()).unwrap().exists());
+
+        create_private_dir(&store.subject_dir(&subject).unwrap()).unwrap();
+        fs::write(store.key_path(&subject, &epoch()).unwrap(), [0u8; KEK_LEN]).unwrap();
+        // A key service that is down must not look like an erasure that happened.
+        assert!(store.get(&subject, &epoch()).is_err());
+    }
+
+    #[test]
+    fn the_store_prints_its_root_and_reaches_no_further() {
+        let (dir, store) = store();
+        let printed = format!("{store:?}");
+
+        assert!(printed.contains("FsKeyStore"), "{printed}");
+        assert!(
+            printed.contains(&dir.path().display().to_string()),
+            "{printed}"
+        );
+        // The wrapper is left out on purpose: diagnostics are one more place key material surfaces,
+        // and a deployment's key service client is under no obligation to be careful in `Debug`.
+        assert!(printed.ends_with(".. }"), "{printed}");
+    }
+
+    #[test]
+    fn unwrapped_and_an_explicit_passthrough_are_the_same_store() {
+        let dir = TempDir::new().unwrap();
+        let first = subject(0);
+        let key = FsKeyStore::unwrapped(dir.path())
+            .unwrap()
+            .mint(&first, &epoch())
+            .unwrap();
+
+        let explicit = FsKeyStore::new(dir.path(), Passthrough).unwrap();
+        assert_eq!(explicit.get(&first, &epoch()).unwrap().unwrap(), key);
+        assert_eq!(explicit.mint(&first, &epoch()).unwrap(), key);
+        // And in the other direction, so neither constructor is the odd one out.
+        let other = subject(1);
+        let minted = explicit.mint(&other, &epoch()).unwrap();
+        assert_eq!(
+            FsKeyStore::unwrapped(dir.path())
+                .unwrap()
+                .get(&other, &epoch())
+                .unwrap()
+                .unwrap(),
+            minted
+        );
+        // Passthrough is exactly what it says: the key file is the key.
+        assert_eq!(
+            fs::read(explicit.key_path(&other, &epoch()).unwrap()).unwrap(),
+            minted
+        );
     }
 
     #[test]
@@ -386,7 +641,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        FsKeyStore::open(dir.path()).unwrap();
+        FsKeyStore::unwrapped(dir.path()).unwrap();
 
         let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
