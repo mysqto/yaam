@@ -74,6 +74,27 @@ pub struct RecordStructure {
     pub tags: Vec<String>,
 }
 
+/// Bytes of compact JSON per token, as a rough conventional ratio.
+///
+/// Not a promise about any tokeniser. It is here rather than at each call site so two reads
+/// returning the same rows cannot report costs computed differently.
+pub const BYTES_PER_TOKEN: usize = 4;
+
+/// The rough token cost of returning `records`.
+///
+/// Measured over the structures actually being returned, after any capping and de-duplication, so
+/// the figure describes this answer rather than an answer of this many records. Two records of the
+/// same shape can differ several-fold once their attributes, entities and tags are counted, which is
+/// why this is measured bytes and not a count times a constant.
+#[must_use]
+pub fn estimate_tokens(records: &[RecordStructure]) -> usize {
+    records
+        .iter()
+        .map(RecordStructure::wire_bytes)
+        .sum::<usize>()
+        .div_ceil(BYTES_PER_TOKEN)
+}
+
 impl RecordStructure {
     /// Bytes this structure takes on the wire.
     ///

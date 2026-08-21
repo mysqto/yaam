@@ -52,14 +52,6 @@ const MAX_RECORDS: usize = 100;
 /// when this stops holding.
 const _: () = assert!((PER_SOURCE_LIMIT as usize) * 2 <= MAX_RECORDS);
 
-/// Bytes of returned structure per token, for the advisory estimate.
-///
-/// A divisor rather than a per-record figure, because records are not the same size: `attrs`,
-/// `entities`, `subjects` and `tags` are where the bytes are, and a fixed cost per record told a
-/// caller the same number for a bundle twice the size. Four bytes per token is the conventional rough
-/// ratio for compact JSON; the estimate is advisory and is not a promise about any tokeniser.
-const BYTES_PER_TOKEN: usize = 4;
-
 /// Context assembled for one request.
 #[derive(Debug, Default)]
 pub struct Bundle {
@@ -140,12 +132,7 @@ pub fn compose(store: &yaam_store::Store, request: &Request) -> crate::Result<Bu
 
     // Measured over what is actually being returned, after the caps and the de-duplication, so the
     // figure describes this bundle rather than a bundle of this many records.
-    bundle.token_estimate = bundle
-        .records
-        .iter()
-        .map(RecordStructure::wire_bytes)
-        .sum::<usize>()
-        .div_ceil(BYTES_PER_TOKEN);
+    bundle.token_estimate = yaam_contract::structure::estimate_tokens(&bundle.records);
     Ok(bundle)
 }
 
@@ -210,8 +197,8 @@ mod tests {
     use yaam_contract::{ActionRecord, DataClass, RecordStructure};
 
     use super::{
-        BYTES_PER_TOKEN, Bundle, MAX_RECORDS, OVER_SOURCE_CAP, PER_SOURCE_LIMIT, Request, Scope,
-        cap_source, compose, take,
+        Bundle, MAX_RECORDS, OVER_SOURCE_CAP, PER_SOURCE_LIMIT, Request, Scope, cap_source,
+        compose, take,
     };
     use crate::testkit::{self, BODY, Harness};
 
@@ -357,7 +344,10 @@ mod tests {
 
         let bundle = compose(&store, &request).expect("composed");
         let bytes: usize = bundle.records.iter().map(RecordStructure::wire_bytes).sum();
-        assert_eq!(bundle.token_estimate, bytes.div_ceil(BYTES_PER_TOKEN));
+        assert_eq!(
+            bundle.token_estimate,
+            bytes.div_ceil(yaam_contract::structure::BYTES_PER_TOKEN)
+        );
         assert!(bundle.token_estimate > 0, "{bundle:?}");
         // A record with more in it costs more, which a per-record constant could not say.
         assert!(

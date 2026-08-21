@@ -179,6 +179,22 @@ pub struct WriteResponse {
 pub struct RecordsResponse {
     /// Matching records, newest first.
     pub records: Vec<RecordStructure>,
+    /// Rough token cost of this answer, advisory only.
+    ///
+    /// Here for the same reason it is on a bundle: these reads return the same rows, and a caller
+    /// paging them had no way to size an answer before consuming it.
+    pub token_estimate: usize,
+}
+
+impl RecordsResponse {
+    /// Wraps records and measures what returning them costs.
+    fn new(records: Vec<RecordStructure>) -> Self {
+        let token_estimate = yaam_contract::structure::estimate_tokens(&records);
+        Self {
+            records,
+            token_estimate,
+        }
+    }
 }
 
 /// Filters for a record query.
@@ -404,7 +420,7 @@ async fn query_records(
     let filter = params.into_filter()?;
     let service = state.service();
     let records = blocking(move || service.query(&caller, &filter)).await?;
-    Ok(Json(RecordsResponse { records }))
+    Ok(Json(RecordsResponse::new(records)))
 }
 
 /// Answers one page of what touches one entity.
@@ -419,7 +435,7 @@ async fn entity_records(
     let service = state.service();
     let records =
         blocking(move || service.entity(&caller, &kind, &id, min_confidence, limit)).await?;
-    Ok(Json(RecordsResponse { records }))
+    Ok(Json(RecordsResponse::new(records)))
 }
 
 /// Composes context for a caller.
@@ -485,6 +501,7 @@ where
 
 #[cfg(test)]
 mod tests {
+
     use axum::http::{Method, header};
     use tower::ServiceExt;
 
@@ -799,6 +816,24 @@ mod tests {
         // Every *reference*, but not every row: an absent `limit` reaches the index as `None`, which
         // is its default cap and not the unbounded read.
         assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 0 None");
+    }
+
+    #[tokio::test]
+    async fn a_query_reports_what_its_answer_costs() {
+        // A bundle says what it costs; these reads hand back the same rows and used to say nothing,
+        // so a caller paging them could not size an answer before consuming it.
+        let held = [testing::record(WRITER)];
+        let fake = Arc::new(Fake::new().holding(&held));
+        let (_, body) = serve(&fake, get("/records", Some(READER))).await;
+
+        let records: Vec<RecordStructure> =
+            serde_json::from_value(body["records"].clone()).unwrap();
+        assert_eq!(
+            body["token_estimate"].as_u64().unwrap(),
+            yaam_contract::structure::estimate_tokens(&records) as u64,
+            "the estimate must measure the rows actually returned"
+        );
+        assert!(body["token_estimate"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]
