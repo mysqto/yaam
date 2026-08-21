@@ -1,80 +1,54 @@
 //! The redaction policy, as `spec/redaction/` configures it.
 //!
-//! The policy is checked, never applied. Masking a body here would leave the caller believing it
-//! wrote what it sent, and the record's `fields_masked` would disagree with the writer's own
-//! account of what it redacted. So a body that still matches a policy pattern is refused, and the
+//! The policy is checked here, never applied. Masking a body in the service would leave the caller
+//! believing it wrote what it sent, and the record's `fields_masked` would disagree with the
+//! writer's own account of what it redacted. So a body that still matches is refused, and the
 //! writer — which knows what the value was — is the one that masks it.
 //!
-//! Patterns are configuration, so nothing in this module names anything a policy might match.
+//! The patterns, and the rule about which matches count, come from [`yaam_contract::mask`]: the
+//! same policy a writer masks with. One parser, two callers. Two parsers produced a service that
+//! refused a digit run no masker would touch, which left the writer with nothing to do about it.
 
 use std::path::Path;
 
-use regex::Regex;
-use saphyr::{LoadableYamlNode as _, Yaml};
+use yaam_contract::mask::Policy;
 
 use crate::fsutil;
 
 /// A loaded redaction policy.
 #[derive(Debug, Clone)]
 pub(crate) struct Redaction {
-    /// Policy name, as records must declare it.
-    name: String,
-    /// Named patterns a body may not match.
-    patterns: Vec<(String, Regex)>,
+    /// `None` when the deployment configures no policy at all.
+    policy: Option<Policy>,
 }
 
 impl Redaction {
     /// Loads the policy file, or reports the deployment as configuring none.
     ///
     /// An absent file is not an error: a deployment that declares no policy declares no patterns.
-    /// It is logged at warning level, because the difference between "no policy" and "the policy
-    /// file is not where this build looks for it" is invisible from the outcome.
+    /// It is logged, because the difference between "no policy" and "the policy file is not where
+    /// this build looks for it" is invisible from the outcome.
     pub(crate) fn load(path: &Path) -> crate::Result<Self> {
         let Some(text) = fsutil::read_to_string_opt(path)? else {
             tracing::warn!(
                 path = %path.display(),
                 "no redaction policy configured; bodies are written unchecked"
             );
-            return Ok(Self {
-                name: String::new(),
-                patterns: Vec::new(),
-            });
+            return Ok(Self { policy: None });
         };
         Self::parse(&text)
     }
 
     /// Parses policy YAML.
     pub(crate) fn parse(text: &str) -> crate::Result<Self> {
-        let docs = Yaml::load_from_str(text).map_err(|e| spec(format!("not valid YAML: {e}")))?;
-        let doc = docs
-            .first()
-            .ok_or_else(|| spec("policy file is empty".to_owned()))?;
-        let name = doc
-            .as_mapping_get("policy")
-            .and_then(Yaml::as_str)
-            .ok_or_else(|| spec("policy file has no string `policy`".to_owned()))?
-            .to_owned();
-
-        let mut patterns = Vec::new();
-        if let Some(Yaml::Sequence(items)) = doc.as_mapping_get("patterns") {
-            for item in items {
-                // A pattern with no `mask` action describes something the policy tolerates.
-                if item.as_mapping_get("action").and_then(Yaml::as_str) != Some("mask") {
-                    continue;
-                }
-                let label = field(item, "name")?;
-                let source = field(item, "regex")?;
-                let compiled = Regex::new(source)
-                    .map_err(|e| spec(format!("pattern `{label}` is not a usable regex: {e}")))?;
-                patterns.push((label.to_owned(), compiled));
-            }
-        }
-        Ok(Self { name, patterns })
+        Ok(Self {
+            policy: Some(Policy::from_yaml(text)?),
+        })
     }
 
     /// The policy name records must declare.
     pub(crate) fn name(&self) -> &str {
-        &self.name
+        self.policy.as_ref().map_or("", Policy::name)
     }
 
     /// The first pattern `text` matches, if any.
@@ -82,23 +56,8 @@ impl Redaction {
     /// Applied to every body, sealed or not: a secret in a sealed body is still a secret retained
     /// for as long as the subject's key lives, and sealing is not a reason to keep one.
     pub(crate) fn first_match(&self, text: &str) -> Option<&str> {
-        self.patterns
-            .iter()
-            .find(|(_, pattern)| pattern.is_match(text))
-            .map(|(label, _)| label.as_str())
+        self.policy.as_ref()?.first_match(text)
     }
-}
-
-/// Reads a required string field of a pattern entry.
-fn field<'a>(item: &'a Yaml<'_>, key: &str) -> crate::Result<&'a str> {
-    item.as_mapping_get(key)
-        .and_then(Yaml::as_str)
-        .ok_or_else(|| spec(format!("a pattern has no string `{key}`")))
-}
-
-/// A malformed policy file means this deployment is misconfigured, not that a record is bad.
-fn spec(detail: String) -> crate::Error {
-    crate::Error::Invalid(yaam_contract::Error::Spec { detail })
 }
 
 #[cfg(test)]
@@ -170,5 +129,30 @@ mod tests {
                 "{text:?}: {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_policy {
+    use super::Redaction;
+
+    /// The repository's own policy, so this test fails if the shipped file and the service diverge.
+    fn shipped() -> Redaction {
+        Redaction::parse(include_str!("../../../spec/redaction/default.yaml")).expect("policy")
+    }
+
+    #[test]
+    fn a_digit_run_that_is_not_a_card_is_not_refused() {
+        // The dead end this delegation closes: the service used to refuse any long digit run while
+        // no masker would touch a Luhn-invalid one, leaving the writer nothing to do about it.
+        assert_eq!(shipped().first_match("order_ref: 1234567890123"), None);
+    }
+
+    #[test]
+    fn a_card_shaped_run_that_passes_luhn_is_still_refused() {
+        assert_eq!(
+            shipped().first_match("card 4111 1111 1111 1111"),
+            Some("card_like")
+        );
     }
 }
