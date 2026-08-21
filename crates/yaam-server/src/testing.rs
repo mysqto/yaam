@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 
 use yaam_contract::{
-    ActionRecord, DataClass, Outcome, RecordId, SchemaVer, SubjectHash, Visibility,
+    ActionRecord, DataClass, Outcome, RecordId, RecordStructure, SchemaVer, SubjectHash, Visibility,
 };
 use yaam_core::bundle::{self, Bundle};
 use yaam_core::erase::EraseReport;
@@ -57,7 +57,7 @@ pub fn subject() -> SubjectHash {
 pub struct Fake {
     calls: Mutex<Vec<String>>,
     answer: Mutex<Option<Accepted>>,
-    records: Vec<RecordId>,
+    records: Vec<RecordStructure>,
     refusal: Option<String>,
     panics: bool,
 }
@@ -80,9 +80,12 @@ impl Fake {
         self
     }
 
-    /// Returns `records` from every read.
-    pub fn holding(mut self, records: Vec<RecordId>) -> Self {
-        self.records = records;
+    /// Returns the structure of `records` from every read.
+    ///
+    /// Takes whole records rather than structures so a test can say what it wrote, and the fake
+    /// projects them the way a real read does — including dropping the body.
+    pub fn holding(mut self, records: &[ActionRecord]) -> Self {
+        self.records = records.iter().map(RecordStructure::from).collect();
         self
     }
 
@@ -131,7 +134,7 @@ impl Service for Fake {
         Ok(answer.unwrap_or(Accepted::Stored(record.record_id)))
     }
 
-    fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordId>> {
+    fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordStructure>> {
         self.called(format!("query {} {filter:?}", caller.agent))?;
         Ok(self.records.clone())
     }
@@ -143,7 +146,7 @@ impl Service for Fake {
         id: &str,
         min_confidence: f32,
         limit: Option<u32>,
-    ) -> Result<Vec<RecordId>> {
+    ) -> Result<Vec<RecordStructure>> {
         self.called(format!(
             "entity {} {kind} {id} {min_confidence} {limit:?}",
             caller.agent

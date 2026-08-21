@@ -7,17 +7,22 @@
 
 use yaam_contract::schema::{Document, document};
 
-use crate::routes::{BundleResponse, WriteResponse};
+use crate::routes::{BundleResponse, RecordsResponse, WriteResponse};
 
 /// The schemas this crate publishes.
 ///
 /// `result.v1.json` is the answer to a write: which identifier the record is addressable by, and
 /// whether the write stored, was a replay, or was held pending subject resolution. A caller that
 /// cannot tell those apart cannot tell a successful retry from a lost record.
+///
+/// `records.v1.json` and `bundle.v1.json` are the two read answers. Both are published because both
+/// now carry record structure rather than identifiers, and a shape a caller parses with nothing
+/// describing it is a shape it has to guess at.
 #[must_use]
 pub fn documents() -> Vec<Document> {
     vec![
         document::<WriteResponse>("result.v1.json"),
+        document::<RecordsResponse>("records.v1.json"),
         document::<BundleResponse>("bundle.v1.json"),
     ]
 }
@@ -28,9 +33,38 @@ mod tests {
     use serde_json::Value as Json;
 
     #[test]
-    fn both_answers_are_published() {
+    fn every_answer_is_published() {
         let files: Vec<&str> = documents().iter().map(|d| d.file).collect();
-        assert_eq!(files, ["result.v1.json", "bundle.v1.json"]);
+        assert_eq!(
+            files,
+            ["result.v1.json", "records.v1.json", "bundle.v1.json"]
+        );
+    }
+
+    /// Both read answers carry structure, and the shape of it travels with them.
+    #[test]
+    fn a_read_answer_publishes_the_structure_it_returns() {
+        for document in documents()
+            .into_iter()
+            .filter(|d| d.file != "result.v1.json")
+        {
+            let schema = &document.schema;
+            assert_eq!(
+                schema["properties"]["records"]["items"]["$ref"], "#/$defs/RecordStructure",
+                "{}: {schema:#}",
+                document.file
+            );
+            let structure = &schema["$defs"]["RecordStructure"];
+            assert!(
+                structure["properties"].get("summary").is_none(),
+                "{}: a read answer must not describe a body: {structure:#}",
+                document.file
+            );
+            assert!(
+                structure["properties"]["action"].is_object(),
+                "{structure:#}"
+            );
+        }
     }
 
     /// A write's three outcomes are the whole point of the answer, so the schema has to name them
@@ -52,7 +86,7 @@ mod tests {
 
     #[test]
     fn a_bundle_says_when_it_is_incomplete() {
-        let schema = &documents()[1].schema;
+        let schema = &documents()[2].schema;
         for field in ["records", "degraded", "omitted", "token_estimate"] {
             assert!(
                 schema["properties"][field].is_object(),

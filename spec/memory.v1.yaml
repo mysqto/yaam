@@ -60,6 +60,24 @@ info:
     nothing the captured response already gave them. Keeping the message secret in flight is the
     transport's job.
 
+    ## A read returns structure, and never a body
+
+    Every read — `GET /records`, `GET /entities/{kind}/{id}`, `GET /bundle` — answers with each
+    matching record's stored frontmatter: identifiers, timestamps, agent, action, outcome, declared
+    attributes, entity references, subject pseudonyms, visibility, data class and tags. That is a
+    `RecordStructure`, and it is the whole of what a read hands back.
+
+    The body is never in it. Not for a sealed record and not for a plaintext one: the rule does not
+    branch on `data_class`, because a read that returned prose for `internal` records would be
+    returning structure *except sometimes*, and the exception is the thing that leaks. `summary` is
+    prose, so it is not a frontmatter key and does not appear. Frontmatter is plaintext already and
+    survives in copies key destruction cannot reach, so nothing here is data erasure was meant to
+    reach; a body is, which is why reading one is a tree-level operation and not a request.
+
+    Reads answered with bare record identifiers until version 1.0.0 of this document. They no longer
+    do, because an identifier was not answerable: the caller had nothing to resolve it with, and the
+    only endpoint that opens a record needs the operator role by design.
+
     ## Reads are scoped per caller, and fail closed
 
     Visibility is decided from the credential the signature proved, never from the request. There is
@@ -126,7 +144,8 @@ info:
 
     ## The schemas below have a generated twin
 
-    `spec/schemas/{action-record,envelope,result,bundle}.v1.json` are JSON Schema 2020-12 documents
+    `spec/schemas/{action-record,envelope,record-structure,result,records,bundle}.v1.json` are JSON
+    Schema 2020-12 documents
     generated from the implementation's own types, and are the copy to vendor if your tooling reads
     JSON Schema rather than OpenAPI. The schemas *here* are written by hand, and a test compares the
     two: every shape both name has to agree on its fields, its required fields, its enum values and
@@ -304,8 +323,11 @@ paths:
         question, not a narrower one, so supplying the missing bound here would answer something the
         caller did not ask.
 
-        Bounded whether or not `limit` says so: an omitted `limit` is the default cap of `1000` rows,
-        so a short answer is not proof that nothing else matched.
+        Bounded whether or not `limit` says so: an omitted `limit` is the default cap of `200` rows,
+        so a short answer is not proof that nothing else matched. Two hundred and not the thousand
+        this endpoint defaulted to while it answered with identifiers — a row is now a record's
+        frontmatter rather than a 26-byte name, and a thousand of those is most of a megabyte in one
+        answer.
       parameters:
         - $ref: '#/components/parameters/action'
         - $ref: '#/components/parameters/outcome'
@@ -356,6 +378,10 @@ paths:
         one page of the entity's history, newest first, capped at `limit` rows. An entity's history
         is as long as that entity is busy, so there is no spelling of this request that returns all
         of it — the busiest identifier in a store would otherwise decide what every reader pays.
+
+        Answers the same `RecordsResponse` as `GET /records`, so both reads hand back structure and
+        neither hands back a body. One shape for both, because "what a read returns" is a property of
+        this service and not of which read it was.
       parameters:
         - name: kind
           in: path
@@ -412,8 +438,13 @@ paths:
         whatever `min_confidence` a direct entity read would accept, because a guess in a bundle is
         a guess the caller cannot tell apart from a fact.
 
-        Sealed bodies are never opened here. A caller receives identifiers and structure, never
-        subject plaintext: plaintext handed to a caller reaches places key destruction cannot erase.
+        Sealed bodies are never opened here, and plaintext ones are not returned either. A caller
+        receives each record's structure and no body at all: prose handed to a caller reaches copies
+        key destruction cannot erase, and that is as true of an `internal` body as of a sealed one.
+
+        A bundle carries at most 100 records, and at most 50 from any one source, so no single busy
+        entity decides the size of a caller's context. Those were 500 and 200 while a bundle carried
+        identifiers; 500 records of frontmatter is 300–750 KB, which is not context but a flood.
 
         Check `degraded` before acting on a bundle. A partial bundle is safe to answer a question
         from and unsafe to act on, and only the caller can make that call — which is why the flag is
@@ -432,10 +463,35 @@ paths:
               schema:
                 $ref: '#/components/schemas/BundleResponse'
               example:
-                records: [01ARZ3NDEKTSV4RRFFQ69G5FAV, 01ARZ3NDEKTSV4RRFFQ69G5FB0]
+                records:
+                  - record_id: 01ARZ3NDEKTSV4RRFFQ69G5FAV
+                    schema_ver: 1
+                    at: '2026-08-20T11:04:05Z'
+                    received_at: '2026-08-20T11:04:06Z'
+                    backfilled: false
+                    agent: agent_a
+                    agent_ver: 2.1.0
+                    correlation_id: c-8f21
+                    action: deploy
+                    outcome: success
+                    attrs:
+                      service: api
+                      environment: staging
+                    entities:
+                      - kind: ticket
+                        id: PROJ-42
+                        role: primary
+                        confidence: 1.0
+                    subjects: []
+                    visibility: org
+                    team: null
+                    data_class: internal
+                    redaction_policy: default-v1
+                    fields_masked: []
+                    tags: [release]
                 degraded: true
                 omitted: ['entity order_ref:a1b2c3d4: deadline reached']
-                token_estimate: 240
+                token_estimate: 158
         '400':
           $ref: '#/components/responses/BadQuery'
         '401':
@@ -609,11 +665,15 @@ components:
       in: query
       required: false
       description: |
-        Caps the number of rows returned. Absent means the service's default cap of `1000` rows, not
+        Caps the number of rows returned. Absent means the service's default cap of `200` rows, not
         every match: a page size with no default and no cursor is a trap, and the first caller to
         omit it would read the whole index into memory. A value given here is honoured as given.
         There is no cursor, so page by narrowing the request — a window on `GET /records`, a
         confidence floor on an entity's history — rather than by walking an offset.
+
+        The default is a property of what a row costs. Each row is a record's frontmatter, 600 to
+        1,500 bytes depending on how many attributes, entities and tags it carries, so a page of 200
+        is 120–300 KB. A caller that names a large `limit` gets it, and pays for it.
       schema:
         type: integer
         format: int32
@@ -671,13 +731,40 @@ components:
 
   responses:
     Records:
-      description: Matching record identifiers, newest first by the server-stamped time.
+      description: |
+        Matching records, newest first by the server-stamped time, each as its stored structure.
+        Structure and never a body — see "A read returns structure, and never a body" above.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/RecordsResponse'
           example:
-            records: [01ARZ3NDEKTSV4RRFFQ69G5FAV, 01ARZ3NDEKTSV4RRFFQ69G5FB0]
+            records:
+              - record_id: 01ARZ3NDEKTSV4RRFFQ69G5FAV
+                schema_ver: 1
+                at: '2026-08-20T11:04:05Z'
+                received_at: '2026-08-20T11:04:06Z'
+                backfilled: false
+                agent: agent_a
+                agent_ver: 2.1.0
+                correlation_id: c-8f21
+                action: deploy
+                outcome: success
+                attrs:
+                  service: api
+                  environment: staging
+                entities:
+                  - kind: ticket
+                    id: PROJ-42
+                    role: primary
+                    confidence: 1.0
+                subjects: []
+                visibility: org
+                team: null
+                data_class: internal
+                redaction_policy: default-v1
+                fields_masked: []
+                tags: [release]
     BadQuery:
       description: |
         The query string was not understood — an unknown parameter, or one that would not parse into
@@ -998,6 +1085,130 @@ components:
             `data_class` is `subject_derived`.
           example: Rolled build 412 out to staging.
 
+    RecordStructure:
+      type: object
+      description: |
+        One record as a read returns it: every frontmatter key, and no body. The shape of
+        `GET /records`, `GET /entities/{kind}/{id}` and each entry of a bundle.
+
+        It is `ActionRecord` without `summary`, and that is the whole difference — the key set is the
+        Markdown frontmatter's, checked against it in the implementation's own build rather than kept
+        in step by hand. There is no field for prose here and no endpoint that adds one: a body is
+        read from the Markdown tree, by something with access to the tree.
+
+        `data_class` is worth reading. It says whether the body this answer omits was sealed and
+        erasable or plaintext, which is how a caller knows what it is *not* being given.
+
+        Unknown fields are refused, so a `summary` smuggled into a stored projection is an error
+        rather than a passenger.
+      additionalProperties: false
+      required:
+        - record_id
+        - schema_ver
+        - at
+        - received_at
+        - backfilled
+        - agent
+        - action
+        - outcome
+        - attrs
+        - entities
+        - subjects
+        - visibility
+        - data_class
+        - redaction_policy
+        - fields_masked
+        - tags
+      properties:
+        record_id:
+          $ref: '#/components/schemas/RecordId'
+        schema_ver:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Which record schema these bytes were written under.
+          example: 1
+        at:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Source-reported time. May be skewed; never used for ordering.
+        received_at:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: Authoritative for ordering, windowing and the record's place in the tree.
+        backfilled:
+          type: boolean
+          description: |
+            `true` when `received_at` came from an upstream source rather than this service's clock,
+            so a reader can tell an imported timeline from a live one.
+          example: false
+        agent:
+          type: string
+          description: The record's author, which is not the caller that read it.
+          example: agent_a
+        agent_ver:
+          type: [string, 'null']
+          description: Lets a behaviour change be attributed to a release.
+          example: 2.1.0
+        correlation_id:
+          type: [string, 'null']
+          description: |
+            Ties every stage of one interaction together across agents. The join a caller reaches for
+            when one bundled record is only half the story.
+          example: c-8f21
+        action:
+          type: string
+          minLength: 1
+          description: What was done.
+          example: deploy
+        outcome:
+          $ref: '#/components/schemas/Outcome'
+        attrs:
+          type: object
+          description: |
+            Declared attributes. Structural keys only: a `sensitive` key is refused on write, so it
+            is not in frontmatter to be read back here.
+          additionalProperties:
+            $ref: '#/components/schemas/AttrValue'
+          example:
+            service: api
+            environment: staging
+        entities:
+          type: array
+          description: The join keys this record contributes.
+          items:
+            $ref: '#/components/schemas/EntityRef'
+        subjects:
+          type: array
+          description: |
+            Data subjects named by this record, as keyed pseudonyms — never a direct identifier. Two
+            records naming the same pseudonym are about the same subject, which is what a pseudonym
+            is for; the identity behind it needs the keying secret, which no caller holds.
+          items:
+            $ref: '#/components/schemas/SubjectRef'
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+        team:
+          type: [string, 'null']
+          description: Present when `visibility` is `team`.
+          example: platform
+        data_class:
+          $ref: '#/components/schemas/DataClass'
+        redaction_policy:
+          type: string
+          description: The policy version applied before the write.
+          example: default-v1
+        fields_masked:
+          type: array
+          description: Which fields the policy touched. Informational.
+          items:
+            type: string
+        tags:
+          type: array
+          description: Free-form, unlike `attrs` — not declared, not classified, not query surface.
+          items:
+            type: string
+
     WriteRequest:
       type: object
       description: |
@@ -1045,16 +1256,19 @@ components:
     RecordsResponse:
       type: object
       description: |
-        Identifiers only, and no endpoint here returns a record's content. A query that returned
-        bodies would hand out plaintext to anything that could name a filter, and plaintext handed
-        to a caller reaches copies key destruction cannot erase. Content is read from the Markdown
-        tree, by something with access to the tree.
+        Structure, and no endpoint here returns a record's body. A query that returned bodies would
+        hand out prose to anything that could name a filter, and prose handed to a caller reaches
+        copies key destruction cannot erase. A body is read from the Markdown tree, by something with
+        access to the tree.
+
+        The answer to `GET /records` and to `GET /entities/{kind}/{id}` alike: what a read returns is
+        a property of this service, not of which read was made.
       required: [records]
       properties:
         records:
           type: array
           items:
-            $ref: '#/components/schemas/RecordId'
+            $ref: '#/components/schemas/RecordStructure'
 
     BundleResponse:
       type: object
@@ -1062,9 +1276,11 @@ components:
       properties:
         records:
           type: array
-          description: Deduplicated across sources and capped, newest-first within each source.
+          description: |
+            Deduplicated across sources and capped, newest-first within each source. Each entry is
+            the record's structure, as on every other read.
           items:
-            $ref: '#/components/schemas/RecordId'
+            $ref: '#/components/schemas/RecordStructure'
         degraded:
           type: boolean
           description: |
@@ -1083,9 +1299,13 @@ components:
           type: integer
           minimum: 0
           description: |
-            Rough cost of the bundle's structure, advisory only. Not a billing figure and not a
-            promise about any particular tokeniser.
-          example: 240
+            Rough cost of the structure this answer carries: the serialised bytes of `records`,
+            divided by four and rounded up. Measured over what is actually being returned — after the
+            caps and the de-duplication — so a bundle of two large records costs more than a bundle
+            of two small ones, which a per-record constant could not say. Advisory: four bytes per
+            token is the conventional rough ratio for compact JSON, and this is not a promise about
+            any particular tokeniser.
+          example: 158
 
     EraseRequest:
       type: object

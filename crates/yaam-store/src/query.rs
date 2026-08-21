@@ -5,17 +5,35 @@
 //! function: "now" arrives as a bound parameter, which keeps a query reproducible under test and
 //! keeps its plan free of a non-deterministic term. And every read carries a [`Scope`] — what a
 //! caller may see is a predicate, not a convention, and the one it defaults to is *nothing*.
+//!
+//! Two projections, one query each. A read returns either the matching identifiers or their stored
+//! frontmatter, and the second is the *same* statement with a wider select list — not a second query
+//! over the ids the first returned. That is deliberate: a follow-up read is a place the scope
+//! predicate can be forgotten, and the `body` column is never in either select list, so no read here
+//! can return prose whether it was sealed or not.
 
 use rusqlite::{Row, params_from_iter, types::Value as SqlValue};
-use yaam_contract::{RecordId, Visibility};
+use yaam_contract::{RecordId, RecordStructure, Visibility};
 
-/// Rows a filtered read returns when the caller names no page size.
+/// Rows a read of identifiers returns when the caller names no page size.
 ///
 /// A cap rather than everything. "Page size" with no default and no cursor is a trap: the first
 /// caller to omit it reads the whole index into memory, and it works until the index is large. A
 /// caller that wants a different number says so, and one that wants more than this pages by
 /// narrowing the window — there is deliberately no offset to walk.
 pub const DEFAULT_LIMIT: u32 = 1_000;
+
+/// Rows a read of *structure* returns when the caller names no page size.
+///
+/// Lower than [`DEFAULT_LIMIT`], because the row got thirty times bigger. An identifier is 26 bytes;
+/// a record's stored frontmatter is 600 to 1,500 depending on how many attributes, entities and tags
+/// it carries. A thousand of those is most of a megabyte in one answer, which is not a page — so the
+/// default page size follows the projection rather than being one number for both.
+pub const DEFAULT_STRUCTURE_LIMIT: u32 = 200;
+
+/// A structure page must not default to the identifier page size. Checked at compile time, because
+/// the two numbers are only meaningful relative to each other.
+const _: () = assert!(DEFAULT_STRUCTURE_LIMIT < DEFAULT_LIMIT);
 
 /// How many full-text matches [`search`] may examine per row it returns.
 ///
@@ -88,7 +106,8 @@ pub struct Filter {
     pub attr: Option<(String, String)>,
     /// Restrict to a time window.
     pub window: Option<Window>,
-    /// Page size. `None` means [`DEFAULT_LIMIT`], never unbounded.
+    /// Page size. `None` means the default for what the read returns — [`DEFAULT_LIMIT`] for
+    /// identifiers, [`DEFAULT_STRUCTURE_LIMIT`] for structure — never unbounded.
     pub limit: Option<u32>,
     /// What the reader is entitled to see.
     pub scope: Scope,
@@ -113,8 +132,40 @@ pub fn by_entity(
     limit: Option<u32>,
     scope: &Scope,
 ) -> crate::Result<Vec<RecordId>> {
-    let (sql, binds) = by_entity_sql(kind, id, min_confidence, Extent::Page(limit), scope);
+    let (sql, binds) = by_entity_sql(
+        kind,
+        id,
+        min_confidence,
+        Extent::Page(limit),
+        scope,
+        Select::Id,
+    );
     run_ids(store, &sql, binds)
+}
+
+/// One entity's history as structure, newest first, one page of it.
+///
+/// [`by_entity`] with the wider select list: the same predicate, the same scope test, the same page
+/// — and every matched row's stored frontmatter instead of its bare identifier. What a caller asking
+/// an entity's history actually wanted, since an identifier is only answerable by another read this
+/// service does not offer to a caller.
+pub fn by_entity_structures(
+    store: &crate::Store,
+    kind: &str,
+    id: &str,
+    min_confidence: f32,
+    limit: Option<u32>,
+    scope: &Scope,
+) -> crate::Result<Vec<RecordStructure>> {
+    let (sql, binds) = by_entity_sql(
+        kind,
+        id,
+        min_confidence,
+        Extent::Page(limit),
+        scope,
+        Select::Structure,
+    );
+    run_structures(store, &sql, binds)
 }
 
 /// Every record touching one entity, with no row cap and no scope.
@@ -138,6 +189,7 @@ pub fn by_entity_unbounded(
         min_confidence,
         Extent::Everything,
         &Scope::Unrestricted,
+        Select::Id,
     );
     run_ids(store, &sql, binds)
 }
@@ -155,12 +207,66 @@ enum Extent {
     Everything,
 }
 
+/// What a read pulls out of every row it matched.
+///
+/// A parameter on the query builders rather than a second set of them, so the two projections cannot
+/// come from two different predicates. `body` is in neither: the column exists for the full-text
+/// index, and a read that selected it would hand a caller prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Select {
+    /// The record's identifier alone. What a sweep, a rebuild and a correlation want.
+    Id,
+    /// The record's identifier and its stored frontmatter — the whole plaintext structure.
+    ///
+    /// Costs a table lookup per returned row, because the covering indexes carry `record_id` and not
+    /// the frontmatter. Bounded by the page size, which is why the page sizes came down when this
+    /// projection arrived.
+    Structure,
+}
+
+impl Select {
+    /// The select list this projection reads.
+    fn columns(self) -> &'static str {
+        match self {
+            Self::Id => "rec.record_id",
+            Self::Structure => "rec.record_id, rec.frontmatter",
+        }
+    }
+
+    /// The page size a caller that named none gets, which is a property of what the row costs.
+    fn default_limit(self) -> u32 {
+        match self {
+            Self::Id => DEFAULT_LIMIT,
+            Self::Structure => DEFAULT_STRUCTURE_LIMIT,
+        }
+    }
+}
+
 /// Runs a statement whose one column is a record id.
 fn run_ids(store: &crate::Store, sql: &str, binds: Vec<SqlValue>) -> crate::Result<Vec<RecordId>> {
     let lease = store.lease()?;
     let mut stmt = lease.prepare(sql)?;
     let rows = stmt.query_map(params_from_iter(binds), one_id)?;
     collect(rows)
+}
+
+/// Runs a statement whose columns are a record id and its stored frontmatter.
+fn run_structures(
+    store: &crate::Store,
+    sql: &str,
+    binds: Vec<SqlValue>,
+) -> crate::Result<Vec<RecordStructure>> {
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(sql)?;
+    let rows = stmt.query_map(params_from_iter(binds), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, frontmatter) = row?;
+        out.push(crate::stored_structure(id, &frontmatter)?);
+    }
+    Ok(out)
 }
 
 /// Builds the entity query and its bindings.
@@ -174,17 +280,20 @@ fn by_entity_sql(
     min_confidence: f32,
     extent: Extent,
     scope: &Scope,
+    select: Select,
 ) -> (String, Vec<SqlValue>) {
     let mut binds: Vec<SqlValue> = vec![
         kind.to_owned().into(),
         id.to_owned().into(),
         f64::from(min_confidence).into(),
     ];
-    let mut sql = "SELECT rec.record_id
+    let mut sql = format!(
+        "SELECT {}
          FROM entity_refs AS er
          JOIN records AS rec ON rec.id = er.record_pk
-         WHERE er.kind = ? AND er.entity_id = ? AND er.confidence >= ?"
-        .to_owned();
+         WHERE er.kind = ? AND er.entity_id = ? AND er.confidence >= ?",
+        select.columns()
+    );
     if let Some(predicate) = scope_predicate(scope, "rec", &mut binds) {
         sql.push_str(" AND ");
         sql.push_str(&predicate);
@@ -194,7 +303,7 @@ fn by_entity_sql(
     // the walk instead of capping a set that was sorted in full first.
     sql.push_str(" ORDER BY er.received_ms DESC, er.record_pk DESC");
     if let Extent::Page(page) = extent {
-        push_limit(&mut sql, &mut binds, page);
+        push_limit(&mut sql, &mut binds, page, select);
     }
     (sql, binds)
 }
@@ -223,41 +332,58 @@ pub fn exists(store: &crate::Store, id: &str, scope: &Scope) -> crate::Result<bo
 /// columns rather than inline `json_extract`, and an attribute filter drives the query from the
 /// attribute index instead of testing JSON per row.
 pub fn by_filter(store: &crate::Store, filter: &Filter) -> crate::Result<Vec<RecordId>> {
-    let (sql, binds) = filter_sql(filter);
+    let (sql, binds) = filter_sql(filter, Select::Id);
     run_ids(store, &sql, binds)
+}
+
+/// The filtered query, returning each match's structure rather than its identifier.
+///
+/// The same statement as [`by_filter`] with a wider select list, so the scope predicate and the page
+/// size are the ones that filtered the rows and not a second read's.
+pub fn by_filter_structures(
+    store: &crate::Store,
+    filter: &Filter,
+) -> crate::Result<Vec<RecordStructure>> {
+    let (sql, binds) = filter_sql(filter, Select::Structure);
+    run_structures(store, &sql, binds)
 }
 
 /// Builds the filtered query and its bindings.
 ///
 /// Separate from running it so the plan can be asserted on: "indexed" is a property of the plan,
 /// not of the source text, and nothing else would notice an index quietly going unused.
-fn filter_sql(filter: &Filter) -> (String, Vec<SqlValue>) {
+fn filter_sql(filter: &Filter, select: Select) -> (String, Vec<SqlValue>) {
     let mut binds: Vec<SqlValue> = Vec::new();
+    let columns = select.columns();
     // Driving from record_attrs when an attribute is required: it is the most selective start
     // available, and it keeps the seek on an index either way.
     let mut sql = if let Some((key, value)) = &filter.attr {
         binds.push(key.clone().into());
         binds.push(value.clone().into());
-        "SELECT rec.record_id FROM record_attrs AS ra
+        format!(
+            "SELECT {columns} FROM record_attrs AS ra
          JOIN records AS rec ON rec.id = ra.record_pk
          WHERE ra.key = ? AND ra.value = ?"
-            .to_owned()
+        )
     } else {
-        "SELECT rec.record_id FROM records AS rec WHERE 1 = 1".to_owned()
+        format!("SELECT {columns} FROM records AS rec WHERE 1 = 1")
     };
     for predicate in record_predicates(filter, "rec", &mut binds) {
         sql.push_str(" AND ");
         sql.push_str(&predicate);
     }
     sql.push_str(" ORDER BY rec.received_ms DESC, rec.id DESC");
-    push_limit(&mut sql, &mut binds, filter.limit);
+    push_limit(&mut sql, &mut binds, filter.limit, select);
     (sql, binds)
 }
 
 /// Appends the row cap, which is emitted whether or not the caller named one.
-fn push_limit(sql: &mut String, binds: &mut Vec<SqlValue>, limit: Option<u32>) {
+///
+/// The default comes from the projection: a page of structure costs far more than a page of
+/// identifiers, and one number for both would make the cheaper read pay or the expensive one huge.
+fn push_limit(sql: &mut String, binds: &mut Vec<SqlValue>, limit: Option<u32>, select: Select) {
     sql.push_str(" LIMIT ?");
-    binds.push(i64::from(limit.unwrap_or(DEFAULT_LIMIT)).into());
+    binds.push(i64::from(limit.unwrap_or_else(|| select.default_limit())).into());
 }
 
 /// Correlates two actions falling within `within_ms` of each other.
@@ -312,7 +438,8 @@ fn correlate_sql(left: &Filter, right: &Filter, within_ms: i64) -> (String, Vec<
         sql.push_str(&predicate);
     }
     sql.push_str(" ORDER BY l.received_ms DESC, r.received_ms ASC, l.id DESC, r.id ASC");
-    push_limit(&mut sql, &mut binds, left.limit);
+    // A correlation returns pairs of identifiers, so it pages at the cheaper default.
+    push_limit(&mut sql, &mut binds, left.limit, Select::Id);
     (sql, binds)
 }
 
@@ -518,7 +645,9 @@ fn collect(rows: impl Iterator<Item = rusqlite::Result<String>>) -> crate::Resul
 /// explained from a second, hand-copied spelling of the SQL is a plan for a query nobody executes.
 #[cfg(feature = "explain")]
 pub mod explain {
-    use super::{Extent, Filter, Scope, by_entity_sql, correlate_sql, filter_sql, search_sql};
+    use super::{
+        Extent, Filter, Scope, Select, by_entity_sql, correlate_sql, filter_sql, search_sql,
+    };
 
     /// How [`super::by_entity`] would run.
     pub fn by_entity(
@@ -529,13 +658,50 @@ pub mod explain {
         limit: Option<u32>,
         scope: &Scope,
     ) -> crate::Result<String> {
-        let (sql, binds) = by_entity_sql(kind, id, min_confidence, Extent::Page(limit), scope);
+        let (sql, binds) = by_entity_sql(
+            kind,
+            id,
+            min_confidence,
+            Extent::Page(limit),
+            scope,
+            Select::Id,
+        );
+        plan(store, &sql, binds)
+    }
+
+    /// How [`super::by_entity_structures`] would run.
+    ///
+    /// Its own helper rather than a note beside the one above: the wider select list is the whole
+    /// difference between the read a sweep makes and the read a request makes, and whether it costs
+    /// a table lookup per row is a property of the plan.
+    pub fn by_entity_structures(
+        store: &crate::Store,
+        kind: &str,
+        id: &str,
+        min_confidence: f32,
+        limit: Option<u32>,
+        scope: &Scope,
+    ) -> crate::Result<String> {
+        let (sql, binds) = by_entity_sql(
+            kind,
+            id,
+            min_confidence,
+            Extent::Page(limit),
+            scope,
+            Select::Structure,
+        );
         plan(store, &sql, binds)
     }
 
     /// How [`super::by_filter`] would run.
     pub fn by_filter(store: &crate::Store, filter: &Filter) -> crate::Result<String> {
-        let (sql, binds) = filter_sql(filter);
+        let (sql, binds) = filter_sql(filter, Select::Id);
+        plan(store, &sql, binds)
+    }
+
+    /// How [`super::by_filter_structures`] would run.
+    pub fn by_filter_structures(store: &crate::Store, filter: &Filter) -> crate::Result<String> {
+        let (sql, binds) = filter_sql(filter, Select::Structure);
         plan(store, &sql, binds)
     }
 
@@ -599,8 +765,9 @@ mod tests {
     use yaam_contract::Visibility;
 
     use super::{
-        DEFAULT_LIMIT, Extent, Filter, MAX_CANDIDATES, SCOPE_HEADROOM, Scope, SqlValue, Window,
-        by_entity_sql, candidate_ceiling, correlate_sql, filter_sql, scope_predicate, search_sql,
+        DEFAULT_LIMIT, DEFAULT_STRUCTURE_LIMIT, Extent, Filter, MAX_CANDIDATES, SCOPE_HEADROOM,
+        Scope, Select, SqlValue, Window, by_entity_sql, candidate_ceiling, correlate_sql,
+        filter_sql, scope_predicate, search_sql,
     };
 
     /// What a reader on one team is entitled to.
@@ -652,13 +819,26 @@ mod tests {
             scope: reader(),
             ..Filter::default()
         };
-        let (sql, binds) = filter_sql(&filter);
-        let plan = plan(&sql, binds);
+        let (sql, binds) = filter_sql(&filter, Select::Id);
+        let ids = plan(&sql, binds);
         assert!(
-            plan.contains("SEARCH") && plan.contains("USING INDEX records_action_outcome_time"),
-            "expected an index seek, got:\n{plan}"
+            ids.contains("SEARCH") && ids.contains("USING INDEX records_action_outcome_time"),
+            "expected an index seek, got:\n{ids}"
         );
-        assert!(!plan.contains("SCAN records"), "unexpected scan:\n{plan}");
+        assert!(!ids.contains("SCAN records"), "unexpected scan:\n{ids}");
+
+        // The structure projection is the same seek. It pays a table lookup per row it returns,
+        // which the page size bounds; what it must not do is stop using the index.
+        let (sql, binds) = filter_sql(&filter, Select::Structure);
+        let structured = plan(&sql, binds);
+        assert!(
+            structured.contains("USING INDEX records_action_outcome_time"),
+            "the wider select list must not cost the seek:\n{structured}"
+        );
+        assert!(
+            !structured.contains("SCAN records"),
+            "unexpected scan:\n{structured}"
+        );
     }
 
     #[test]
@@ -668,7 +848,7 @@ mod tests {
             scope: reader(),
             ..Filter::default()
         };
-        let (sql, binds) = filter_sql(&filter);
+        let (sql, binds) = filter_sql(&filter, Select::Id);
         let plan = plan(&sql, binds);
         assert!(
             plan.contains("SEARCH ra") && plan.contains("record_attrs_lookup"),
@@ -716,22 +896,51 @@ mod tests {
         // every reference was sorted before the page was taken, so `LIMIT 10` over an entity with
         // 20,000 references cost 28 ms — the same as no limit at all — and 0.07 ms once the order
         // came out of the index. Only the plan tells those two apart.
-        let (sql, binds) =
-            by_entity_sql("ticket", "PROJ-42", 0.0, Extent::Page(Some(10)), &reader());
-        let plan = plan(&sql, binds);
+        let (sql, binds) = by_entity_sql(
+            "ticket",
+            "PROJ-42",
+            0.0,
+            Extent::Page(Some(10)),
+            &reader(),
+            Select::Id,
+        );
+        let ids = plan(&sql, binds);
         assert!(
-            plan.contains("entity_refs_recent"),
-            "the entity index must supply the order:\n{plan}"
+            ids.contains("entity_refs_recent"),
+            "the entity index must supply the order:\n{ids}"
         );
         assert!(
-            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
-            "sorting the whole history before taking the page is what the index avoids:\n{plan}"
+            !ids.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "sorting the whole history before taking the page is what the index avoids:\n{ids}"
+        );
+
+        // Structure comes out of the same walk, in the same order, still without a sort.
+        let (sql, binds) = by_entity_sql(
+            "ticket",
+            "PROJ-42",
+            0.0,
+            Extent::Page(Some(10)),
+            &reader(),
+            Select::Structure,
+        );
+        let structured = plan(&sql, binds);
+        assert!(structured.contains("entity_refs_recent"), "{structured}");
+        assert!(
+            !structured.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "{structured}"
         );
     }
 
     #[test]
     fn the_unbounded_entity_read_is_the_only_one_without_a_cap() {
-        let (bounded, _) = by_entity_sql("ticket", "PROJ-42", 0.0, Extent::Page(None), &reader());
+        let (bounded, _) = by_entity_sql(
+            "ticket",
+            "PROJ-42",
+            0.0,
+            Extent::Page(None),
+            &reader(),
+            Select::Id,
+        );
         assert!(bounded.contains("LIMIT ?"), "{bounded}");
         let (unbounded, binds) = by_entity_sql(
             "ticket",
@@ -739,6 +948,7 @@ mod tests {
             0.0,
             Extent::Everything,
             &Scope::Unrestricted,
+            Select::Id,
         );
         assert!(!unbounded.contains("LIMIT"), "{unbounded}");
         assert_eq!(binds.len(), 3, "no scope and no cap to bind: {binds:?}");
@@ -778,16 +988,21 @@ mod tests {
     fn the_default_scope_matches_nothing() {
         // A filter nobody scoped is a read whose entitlements are unknown, and the only safe answer
         // to that is no rows.
-        let (sql, _) = filter_sql(&Filter::default());
-        assert!(sql.contains("1 = 0"), "{sql}");
+        for select in [Select::Id, Select::Structure] {
+            let (sql, _) = filter_sql(&Filter::default(), select);
+            assert!(sql.contains("1 = 0"), "{select:?}: {sql}");
+        }
     }
 
     #[test]
     fn an_unrestricted_scope_adds_no_predicate() {
-        let (sql, binds) = filter_sql(&Filter {
-            scope: Scope::Unrestricted,
-            ..Filter::default()
-        });
+        let (sql, binds) = filter_sql(
+            &Filter {
+                scope: Scope::Unrestricted,
+                ..Filter::default()
+            },
+            Select::Id,
+        );
         assert!(!sql.contains("visibility"), "{sql}");
         assert_eq!(
             binds,
@@ -801,7 +1016,7 @@ mod tests {
         // An absent `limit` used to emit no `LIMIT` clause at all, so the first caller to omit it
         // read the whole index into memory — which works until the index is large.
         for (sql, binds) in [
-            filter_sql(&Filter::default()),
+            filter_sql(&Filter::default(), Select::Id),
             correlate_sql(&Filter::default(), &Filter::default(), 1),
         ] {
             assert!(sql.contains("LIMIT ?"), "{sql}");
@@ -811,11 +1026,22 @@ mod tests {
             );
         }
 
+        // A page of structure defaults lower, because the row is thirty times the size.
+        let (sql, binds) = filter_sql(&Filter::default(), Select::Structure);
+        assert!(sql.contains("LIMIT ?"), "{sql}");
+        assert!(
+            binds.contains(&SqlValue::from(i64::from(DEFAULT_STRUCTURE_LIMIT))),
+            "{binds:?}"
+        );
+
         // A caller that names one still gets exactly that.
-        let (_, binds) = filter_sql(&Filter {
-            limit: Some(7),
-            ..Filter::default()
-        });
+        let (_, binds) = filter_sql(
+            &Filter {
+                limit: Some(7),
+                ..Filter::default()
+            },
+            Select::Id,
+        );
         assert!(binds.contains(&SqlValue::from(7i64)), "{binds:?}");
     }
 
@@ -876,6 +1102,17 @@ mod tests {
         };
         let plan = super::explain::by_filter(&store, &filter).expect("a plan");
         assert!(plan.contains("records_action_outcome_time"), "{plan}");
+        // The projection a request runs has its own helper, and it explains the same seek.
+        assert!(
+            super::explain::by_filter_structures(&store, &filter)
+                .expect("a plan")
+                .contains("records_action_outcome_time")
+        );
+        assert!(
+            super::explain::by_entity_structures(&store, "ticket", "PROJ-42", 1.0, None, &reader())
+                .expect("a plan")
+                .contains("entity_refs_recent")
+        );
 
         // Every helper answers, and the join names both sides.
         assert!(
@@ -900,7 +1137,7 @@ mod tests {
     fn no_query_reads_the_clock() {
         // A time function in the plan would make the result depend on when it ran.
         let (correlation, _) = correlate_sql(&Filter::default(), &Filter::default(), 1);
-        let (filtered, _) = filter_sql(&Filter::default());
+        let (filtered, _) = filter_sql(&Filter::default(), Select::Id);
         for sql in [correlation, filtered] {
             assert!(!sql.contains("unixepoch"), "clock read in: {sql}");
             assert!(!sql.contains("'now'"), "clock read in: {sql}");

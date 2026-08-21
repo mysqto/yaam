@@ -1,10 +1,10 @@
 //! Generating `spec/schemas/`, and checking the shapes it is generated from.
 //!
-//! The wire record, the Markdown frontmatter and the store's columns are three projections of one
-//! shape. Each is owned by a different crate, and none of them can see the other two — which is why
-//! the rule went unenforced long enough to be broken twice. This crate is the one place all three
-//! are visible: it hands them to [`yaam_contract::lockstep`], which owns the rule, and fails the
-//! build when they disagree.
+//! The wire record, the Markdown frontmatter, the store's columns and the structure a read hands back
+//! are four projections of one shape. Each is owned by a different crate, and none of them can see
+//! the others — which is why the rule went unenforced long enough to be broken twice. This crate is
+//! the one place all four are visible: it hands them to [`yaam_contract::lockstep`], which owns the
+//! rule, and fails the build when they disagree.
 //!
 //! It also emits the schemas, and checks the committed copies against what the generator produces
 //! now. A generated artefact nobody verifies drifts exactly as fast as a hand-written one.
@@ -121,9 +121,9 @@ pub fn drift(dir: &Path) -> Vec<String> {
     found
 }
 
-/// The three shapes as the crates that own them spell them.
+/// The four shapes as the crates that own them spell them.
 ///
-/// Held together because [`Shapes`] borrows all three, and because reading them in one place is what
+/// Held together because [`Shapes`] borrows all four, and because reading them in one place is what
 /// makes it obvious that none of them is a copy kept for the check.
 #[derive(Debug)]
 pub struct Enumerated {
@@ -133,6 +133,8 @@ pub struct Enumerated {
     pub frontmatter: Vec<&'static str>,
     /// Columns of the store's record table, generated ones included.
     pub columns: Vec<String>,
+    /// Field names a read hands back, read out of the generated structure schema.
+    pub read: BTreeSet<String>,
 }
 
 impl Enumerated {
@@ -147,6 +149,7 @@ impl Enumerated {
             wire: yaam_contract::schema::wire_fields(),
             frontmatter: yaam_md::frontmatter::KEYS.to_vec(),
             columns: record_columns(),
+            read: yaam_contract::schema::read_fields(),
         }
     }
 
@@ -157,6 +160,7 @@ impl Enumerated {
             wire: &self.wire,
             frontmatter: &self.frontmatter,
             columns: &self.columns,
+            read: &self.read,
         }
     }
 }
@@ -193,9 +197,9 @@ pub fn record_columns() -> Vec<String> {
 /// Every way the three shapes currently disagree.
 ///
 /// Two comparisons, because one field can diverge in two ways. The name sets catch a field that
-/// exists on one side only — the `backfilled` failure. The projection of a maximal record catches a
-/// field that kept its name and changed its shape — the `redaction` failure, which no comparison of
-/// names can see.
+/// exists on one side only — the `backfilled` failure, and a read projection that drifted from the
+/// frontmatter keys. The projection of a maximal record catches a field that kept its name and
+/// changed its shape — the `redaction` failure, which no comparison of names can see.
 ///
 /// # Panics
 /// If the sample record cannot be rendered, which would mean the frontmatter projection had stopped
@@ -347,7 +351,8 @@ pub fn generated_objects() -> BTreeMap<String, serde_json::Value> {
 mod tests {
     use super::*;
 
-    /// The deliverable: the wire record, the frontmatter keys and the store's columns, compared.
+    /// The deliverable: the wire record, the frontmatter keys, the store's columns and the read
+    /// projection, compared.
     ///
     /// It has bitten twice in review and once in anger. What it costs when it does not run is two
     /// releases of a contract that described a record nobody was storing.
@@ -368,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bundle_is_the_four_files_the_design_advertises() {
+    fn the_bundle_is_the_files_the_design_advertises() {
         let files: BTreeSet<&str> = bundle().iter().map(|d| d.file).collect();
         assert_eq!(
             files,
@@ -376,9 +381,25 @@ mod tests {
                 "action-record.v1.json",
                 "bundle.v1.json",
                 "envelope.v1.json",
+                "record-structure.v1.json",
+                "records.v1.json",
                 "result.v1.json",
             ])
         );
+    }
+
+    /// The read projection is the frontmatter key set, and nothing may excuse a difference.
+    ///
+    /// Checked here as well as inside `divergences`, because it is the one comparison in the rule
+    /// with no exemption table behind it: what a read hands back is what frontmatter holds, or a
+    /// caller is being promised structure it cannot get.
+    #[test]
+    fn the_read_projection_is_exactly_the_frontmatter_keys() {
+        let shapes = Enumerated::read();
+        let keys: BTreeSet<&str> = shapes.frontmatter.iter().copied().collect();
+        let read: BTreeSet<&str> = shapes.read.iter().map(String::as_str).collect();
+        assert_eq!(read, keys);
+        assert!(!read.contains("summary"), "{read:?}");
     }
 
     /// The generated columns are the whole reason this reads a database rather than the SQL: a

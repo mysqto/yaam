@@ -105,6 +105,14 @@ fn ids(records: &[RecordId]) -> Vec<&str> {
     records.iter().map(RecordId::as_str).collect()
 }
 
+/// The identifiers a structure read returned, so a scope assertion reads the same either way.
+fn structure_ids(records: &[yaam_contract::RecordStructure]) -> Vec<&str> {
+    records
+        .iter()
+        .map(|record| record.record_id.as_str())
+        .collect()
+}
+
 /// The scope a maintenance read uses: everything, whatever its visibility.
 ///
 /// Most tests here are about a predicate or a plan rather than about entitlements, and reading as
@@ -521,6 +529,21 @@ fn every_read_path_applies_the_scope() {
     assert!(!history.contains(&hidden), "{history:?}");
     assert!(history.contains(&docs[1].record_id.as_str()));
 
+    // The structure projections answer the same rows. Widening the select list must not widen the
+    // predicate: a caller outside a record's scope receives neither its structure nor its id.
+    let structured =
+        query::by_entity_structures(&store, "ticket", "TCK-1", 1.0, None, &scope).expect("entity");
+    assert_eq!(structure_ids(&structured), history);
+    let filtered = query::by_filter_structures(
+        &store,
+        &Filter {
+            scope: scope.clone(),
+            ..Filter::default()
+        },
+    )
+    .expect("filter");
+    assert!(!structure_ids(&filtered).contains(&hidden), "{filtered:?}");
+
     // Full text: the other team's summary is in the index, and must not be reachable.
     let hidden_text = query::search(&store, "support", 10, &scope).expect("search");
     assert!(hidden_text.is_empty(), "{:?}", ids(&hidden_text));
@@ -571,6 +594,106 @@ fn a_read_with_no_scope_returns_nothing_rather_than_everything() {
             .expect("correlate")
             .is_empty()
     );
+    // The structure reads default the same way. A projection that widened what an unscoped read
+    // returns would hand out structure to a caller nothing authenticated.
+    assert!(
+        query::by_filter_structures(&store, &Filter::default())
+            .expect("filter")
+            .is_empty()
+    );
+    assert!(
+        query::by_entity_structures(&store, "ticket", "TCK-1", 1.0, None, &Scope::default())
+            .expect("by_entity")
+            .is_empty()
+    );
+}
+
+/// A structure read hands back the frontmatter the record was stored with, field for field.
+#[test]
+fn a_structure_read_returns_the_stored_frontmatter_and_never_a_body() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    let mut plain = record("deploy", Outcome::Partial, T10);
+    plain.attrs = BTreeMap::from([
+        ("service".to_owned(), attrs::Value::Text("api".to_owned())),
+        ("duration_ms".to_owned(), attrs::Value::Int(1_420)),
+        ("rolled_back".to_owned(), attrs::Value::Bool(true)),
+    ]);
+    plain.entities = vec![entity_ref("ticket", "TCK-1", 1.0)];
+    plain.summary = "prose no read may hand back".to_owned();
+    publish(&mut writer, &plain).expect("publish");
+
+    let mut sealed = record("lookup", Outcome::Success, T11);
+    sealed.data_class = DataClass::SubjectDerived;
+    sealed.subjects = vec![subject("ab")];
+    sealed.entities = vec![entity_ref("ticket", "TCK-1", 1.0)];
+    sealed.summary = "sealed prose no read may hand back".to_owned();
+    publish(&mut writer, &sealed).expect("publish");
+    drop(writer);
+
+    let store = Store::open_read(&path).expect("open read");
+    let rows = query::by_filter_structures(&store, &unfiltered()).expect("filter");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+
+    // Both classes, and neither carries prose: the rule does not branch on `data_class`.
+    let json = serde_json::to_string(&rows).expect("serialises");
+    assert!(!json.contains("summary"), "{json}");
+    assert!(!json.contains("no read may hand back"), "{json}");
+
+    let found = rows
+        .iter()
+        .find(|row| row.record_id == plain.record_id)
+        .expect("the plaintext record");
+    assert_eq!(found, &yaam_contract::RecordStructure::from(&plain));
+    let found = rows
+        .iter()
+        .find(|row| row.record_id == sealed.record_id)
+        .expect("the sealed record");
+    assert_eq!(found, &yaam_contract::RecordStructure::from(&sealed));
+}
+
+/// A frontmatter column this build cannot read is drift, named by the record it belongs to.
+///
+/// Reported rather than skipped or passed through: a read that dropped the row would answer with a
+/// short page nobody could tell from a short history, and one that forwarded the column would hand
+/// a caller whatever the store happened to hold.
+#[test]
+fn a_frontmatter_column_the_contract_cannot_read_is_drift() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    let doc = record("deploy", Outcome::Success, T10);
+    publish(&mut writer, &doc).expect("publish");
+    drop(writer);
+
+    let intact: String = raw(&path)
+        .query_row("SELECT frontmatter FROM records", [], |row| row.get(0))
+        .expect("the stored projection");
+
+    // Two ways the column can stop matching the record: a key the read shape does not declare, and
+    // an identifier that disagrees with the one every index is keyed by. Restored between the two,
+    // so the second is the failure it names rather than the first one again.
+    for tamper in [
+        "json_set(frontmatter, '$.summary', 'prose')",
+        "json_set(frontmatter, '$.record_id', '01ARZ3NDEKTSV4RRFFQ69G5FAV')",
+    ] {
+        let conn = raw(&path);
+        conn.execute("UPDATE records SET frontmatter = ?1", [&intact])
+            .expect("restore");
+        conn.execute_batch(&format!("UPDATE records SET frontmatter = {tamper}"))
+            .expect("tamper");
+        drop(conn);
+
+        let store = Store::open_read(&path).expect("open read");
+        let error = query::by_filter_structures(&store, &unfiltered())
+            .expect_err("a projection that does not match the record");
+        assert!(
+            matches!(&error, yaam_store::Error::Drift(id) if id == doc.record_id.as_str()),
+            "{error}"
+        );
+    }
 }
 
 #[test]

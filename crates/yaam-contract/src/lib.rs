@@ -8,12 +8,13 @@
 //! against a different reading of the policy than the service checks against is exactly the failure
 //! worth designing out.
 //!
-//! Three shapes must agree: the wire record, the Markdown frontmatter, and the database columns.
-//! They are all projections of [`ActionRecord`]. That is not a compile error — nothing in the type
-//! system can see three crates at once — so it is a test: [`lockstep`] holds the rule and the list
-//! of deliberate exceptions, and `xtask` hands it the three shapes as the crates that own them
-//! spell them. `summary` is the largest exception: prose that becomes the record body, sealed with
-//! it for erasable records.
+//! Four shapes must agree: the wire record, the Markdown frontmatter, the database columns, and
+//! [`structure::RecordStructure`] — what a read hands back. All four are projections of
+//! [`ActionRecord`]. That is not a compile error — nothing in the type system can see four crates at
+//! once — so it is a test: [`lockstep`] holds the rule and the list of deliberate exceptions, and
+//! `xtask` hands it the four shapes as the crates that own them spell them. `summary` is the largest
+//! exception: prose that becomes the record body, sealed with it for erasable records, and so absent
+//! from frontmatter and from every read.
 //!
 //! [`extract`] is here because the same reasoning applies to entities: what counts as a reference to
 //! an entity has to be one rule. A sidecar that infers a reference from prose the service would not
@@ -35,9 +36,11 @@ pub mod record;
 pub mod request;
 pub mod schema;
 mod spec_yaml;
+pub mod structure;
 pub mod timestamp;
 
 pub use error::{Error, Result};
 pub use ids::{CanonVer, RecordId, SchemaVer, SubjectHash};
 pub use record::{ActionRecord, DataClass, Outcome, Role, SubjectRef, Visibility};
 pub use request::{AGENT_HEADER, SIGNATURE_HEADER, SigningKeys};
+pub use structure::RecordStructure;
