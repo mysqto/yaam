@@ -66,6 +66,72 @@ pub(crate) struct Tombstone {
     pub(crate) complete: bool,
 }
 
+/// What an erasure would reach, without reaching it.
+///
+/// Exists because the destruction is irreversible and an operator naming the wrong pseudonym has no
+/// second chance. A confirmation prompt over a hash nobody can read at a glance is not a check; a
+/// count of what is about to become unreadable is.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ErasePreview {
+    /// Live records naming this subject.
+    pub records: usize,
+    /// Of those, the ones whose bodies are still readable and would stop being.
+    pub bodies_readable: usize,
+    /// Keys that would be destroyed, across all epochs.
+    pub keys: usize,
+    /// Records held in quarantine for this subject, which the erasure settles.
+    pub quarantined: usize,
+    /// Whether this subject has already been tombstoned by an earlier erasure.
+    pub already_tombstoned: bool,
+}
+
+/// Counts what [`erase_subject`] would destroy.
+///
+/// Read-only: nothing here writes, so it is safe to run before deciding. It walks the same three
+/// places the erasure does — the live tree, the key store and the quarantine spool — rather than
+/// asking the index, because the index holds a wrapped share per subject and the tree is what the
+/// erasure actually rewrites.
+pub fn preview(pipeline: &Pipeline, subject: &SubjectHash) -> Result<ErasePreview> {
+    let mut records = 0;
+    let mut bodies_readable = 0;
+    for path in fsutil::walk_files(
+        &pipeline.root().join(layout::RECORDS_DIR),
+        layout::RECORD_EXT,
+    )? {
+        let Ok(document) = Document::parse(&fs::read_to_string(&path)?) else {
+            continue;
+        };
+        if !names(&document, subject) {
+            continue;
+        }
+        records += 1;
+        // An already-emptied body is one an earlier erasure or replay reached; counting it again
+        // would overstate what this run takes away.
+        if !matches!(document.body, Body::Plain(_)) {
+            bodies_readable += 1;
+        }
+    }
+    let mut quarantined = 0;
+    for path in fsutil::walk_files(
+        &pipeline.root().join(layout::QUARANTINE_DIR),
+        layout::RECORD_EXT,
+    )? {
+        let Ok(document) = Document::parse(&fs::read_to_string(&path)?) else {
+            continue;
+        };
+        if names(&document, subject) {
+            quarantined += 1;
+        }
+    }
+    Ok(ErasePreview {
+        records,
+        bodies_readable,
+        keys: count_key_files(pipeline, subject)?,
+        quarantined,
+        already_tombstoned: pipeline.keys().is_tombstoned(subject)?,
+    })
+}
+
 /// Erases a subject's bodies and records the fact permanently.
 ///
 /// Verification is two-phase. The live check runs here; completion cannot be asserted until the key
@@ -228,7 +294,7 @@ fn names(document: &Document, subject: &SubjectHash) -> bool {
 /// file whose parent is that directory is a key — including one inside a backup directory a
 /// deployment keeps beside the live one, which is the copy that would make destruction a fiction.
 fn count_key_files(pipeline: &Pipeline, subject: &SubjectHash) -> Result<usize> {
-    let root = pipeline.root().join(layout::KEYSTORE_DIR);
+    let root = pipeline.paths().key_store.clone();
     let mut count = 0;
     let mut pending = vec![root];
     while let Some(dir) = pending.pop() {
@@ -336,8 +402,8 @@ mod tests {
     use yaam_md::{Body, Document};
 
     use super::{
-        KEY_BACKUP_WINDOW_MS, Tombstone, confirm_erasure, count_key_files, erase_subject, read_log,
-        verify_live,
+        KEY_BACKUP_WINDOW_MS, Tombstone, confirm_erasure, count_key_files, erase_subject, preview,
+        read_log, verify_live,
     };
     use crate::testkit::{self, BODY, Harness};
 
@@ -363,6 +429,61 @@ mod tests {
             .expect("accepted");
         harness.pipeline.drain_fanout(100).expect("drained");
         (harness, subject, record)
+    }
+
+    /// The preview has to count what the erasure would reach, and nothing else.
+    ///
+    /// It is what an operator confirms against, so an overcount would have them refuse a safe
+    /// erasure and an undercount would have them approve one they had not understood.
+    #[test]
+    fn a_preview_counts_what_an_erasure_would_reach() {
+        let (mut harness, subject, _) = with_sealed_record();
+
+        // A record held back for a different, tombstoned subject: in the quarantine spool, and not
+        // this subject's, so it must not be counted here.
+        let other = testkit::subject('f');
+        yaam_crypto::keystore::KeyStore::tombstone(harness.pipeline.keys(), &other)
+            .expect("tombstone");
+        harness
+            .pipeline
+            .accept(
+                testkit::subject_derived("2026-08-23T12:00:00Z", std::slice::from_ref(&other)),
+                BODY,
+            )
+            .expect("quarantined");
+
+        // A file the walk cannot parse must be skipped rather than abort the count.
+        fs::write(
+            harness.root().join("records/2026/08/20/unreadable.md"),
+            "---\naction: [unclosed\n---\nbody\n",
+        )
+        .expect("write");
+
+        let found = preview(&harness.pipeline, &subject).expect("preview");
+        assert_eq!(found.records, 1);
+        assert_eq!(
+            found.bodies_readable, 1,
+            "the body is still sealed, not gone"
+        );
+        assert_eq!(found.keys, 1);
+        assert_eq!(found.quarantined, 0, "the held record is another subject's");
+        assert!(!found.already_tombstoned);
+
+        // The other subject's own preview sees the spooled copy, which is what an erasure settles.
+        let held = preview(&harness.pipeline, &other).expect("preview");
+        assert_eq!(held.quarantined, 1);
+        assert!(
+            held.already_tombstoned,
+            "a subject the key store has tombstoned has to be reported as such"
+        );
+
+        // After the erasure nothing is left to take away, and a second run would report as much.
+        erase_subject(&mut harness.pipeline, &subject).expect("erased");
+        let after = preview(&harness.pipeline, &subject).expect("preview");
+        assert_eq!(after.records, 1, "the record itself is retained");
+        assert_eq!(after.bodies_readable, 0, "its body is already gone");
+        assert_eq!(after.keys, 0);
+        assert!(after.already_tombstoned);
     }
 
     #[test]

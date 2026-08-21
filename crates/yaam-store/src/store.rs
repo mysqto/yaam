@@ -123,9 +123,9 @@ const JOB_BUNDLE: &str = "bundle";
 const JOB_SUBJECT_LINK: &str = "subject_link";
 
 /// Queue state of a job nobody has taken yet.
-const STATE_PENDING: &str = "pending";
+pub(crate) const STATE_PENDING: &str = "pending";
 /// Queue state of a job handed to a worker.
-const STATE_CLAIMED: &str = "claimed";
+pub(crate) const STATE_CLAIMED: &str = "claimed";
 /// Queue state of a job that finished.
 ///
 /// Kept rather than deleted: the row is what makes a replayed publish a no-op instead of

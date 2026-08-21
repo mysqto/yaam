@@ -5,7 +5,7 @@
 //! writer for the same path.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use yaam_md::Document;
 use yaam_store::query::{self, Scope};
@@ -59,6 +59,60 @@ pub fn sweep(pipeline: &mut Pipeline) -> Result<SweepReport> {
     })
 }
 
+/// Staging files old enough that the write behind them is presumed dead.
+///
+/// Shared with the health read rather than counted a second time there: a backlog figure that
+/// disagreed with what a sweep would actually pick up would send an operator looking for work that
+/// is not owed. The grace period is the whole safety argument — a staging file younger than
+/// [`GRACE_MS`] may belong to a write in flight, and treating it as abandoned would have two
+/// processes renaming the same path.
+pub(crate) fn stale_staging(pipeline: &Pipeline) -> Result<Vec<PathBuf>> {
+    let now = fsutil::now_ms();
+    let mut stale = Vec::new();
+    for path in fsutil::walk_files(
+        &pipeline.root().join(layout::STAGING_DIR),
+        layout::RECORD_EXT,
+    )? {
+        if now - fsutil::mtime_ms(&path)? >= GRACE_MS {
+            stale.push(path);
+        }
+    }
+    Ok(stale)
+}
+
+/// Published record files the index has no row for.
+///
+/// One point lookup per candidate file, rather than reading every indexed identifier to answer a
+/// question about a handful of them: the id set costs the whole table on every pass, and grows with
+/// the archive while the number of files in the window does not.
+///
+/// Shared with the health read, which is the point: drift is *this* set, and a second definition of
+/// it would report a number no sweep acts on.
+pub(crate) fn unindexed(pipeline: &Pipeline) -> Result<Vec<PathBuf>> {
+    let store = pipeline.reader()?;
+    let cutoff = fsutil::now_ms() - SWEEP_LOOKBACK_MS;
+    let mut drifted = Vec::new();
+    for path in fsutil::walk_files(
+        &pipeline.root().join(layout::RECORDS_DIR),
+        layout::RECORD_EXT,
+    )? {
+        // The bound that matters: a record replayed today into an old date directory has a recent
+        // mtime and is swept, where a bound on the path's date would never look at it again.
+        if fsutil::mtime_ms(&path)? < cutoff {
+            continue;
+        }
+        // Unrestricted, because this read is not answering anybody: it compares the index against
+        // the tree, and a row it could not see is a row it would publish a second time.
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+            && query::exists(&store, stem, &Scope::Unrestricted)?
+        {
+            continue;
+        }
+        drifted.push(path);
+    }
+    Ok(drifted)
+}
+
 /// Window one: a staging file whose write never reached the tree.
 ///
 /// The grace period is the whole safety argument. A staging file younger than [`GRACE_MS`] may
@@ -66,13 +120,8 @@ pub fn sweep(pipeline: &mut Pipeline) -> Result<SweepReport> {
 /// and committing the same row — so it is left alone, and picked up by the next sweep if the writer
 /// really did die.
 fn redrive_staging(pipeline: &mut Pipeline) -> Result<usize> {
-    let dir = pipeline.root().join(layout::STAGING_DIR);
-    let now = fsutil::now_ms();
     let mut redriven = 0;
-    for path in fsutil::walk_files(&dir, layout::RECORD_EXT)? {
-        if now - fsutil::mtime_ms(&path)? < GRACE_MS {
-            continue;
-        }
+    for path in stale_staging(pipeline)? {
         let text = fs::read_to_string(&path)?;
         let Ok(document) = Document::parse(&text) else {
             // A half-written staging file cannot be published and will never parse. Set aside
@@ -103,28 +152,8 @@ fn redrive_staging(pipeline: &mut Pipeline) -> Result<usize> {
 /// No grace period here, and deliberately so: committing a row is idempotent, so there is no race to
 /// lose against a writer doing the same thing a moment later.
 fn index_the_unindexed(pipeline: &mut Pipeline) -> Result<usize> {
-    // One point lookup per candidate file, rather than reading every indexed identifier to answer
-    // a question about a handful of them: the id set costs the whole table on every sweep, and
-    // grows with the archive while the number of files in the window does not.
-    let store = pipeline.reader()?;
-    let cutoff = fsutil::now_ms() - SWEEP_LOOKBACK_MS;
     let mut reindexed = 0;
-    for path in fsutil::walk_files(
-        &pipeline.root().join(layout::RECORDS_DIR),
-        layout::RECORD_EXT,
-    )? {
-        // The bound that matters: a record replayed today into an old date directory has a recent
-        // mtime and is swept, where a bound on the path's date would never look at it again.
-        if fsutil::mtime_ms(&path)? < cutoff {
-            continue;
-        }
-        // Unrestricted, because this read is not answering anybody: the sweeper compares the index
-        // against the tree, and a row it could not see is a row it would publish a second time.
-        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
-            && query::exists(&store, stem, &Scope::Unrestricted)?
-        {
-            continue;
-        }
+    for path in unindexed(pipeline)? {
         match Document::parse(&fs::read_to_string(&path)?) {
             Ok(document) => {
                 pipeline.commit(&document)?;

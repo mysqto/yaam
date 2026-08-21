@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod health;
 pub mod query;
 pub mod schema;
 pub mod store;

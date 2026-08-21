@@ -34,6 +34,7 @@ use yaam_store::{FanoutJob, PublishInput, Store, Writer};
 
 use crate::fsutil;
 use crate::layout::{self, Stamp};
+use crate::paths::Paths;
 use crate::policy::Redaction;
 use crate::resolve::{DeclaredSubjects, Resolution, SubjectResolver};
 use crate::{Error, Result};
@@ -87,8 +88,8 @@ pub enum Accepted {
 
 /// The write pipeline.
 pub struct Pipeline {
-    /// Root of the memory tree. Every other path is derived from it.
-    root: PathBuf,
+    /// Where the tree, the index and the key store are.
+    paths: Paths,
     /// The single index writer. Owning it is what serialises writes.
     writer: Writer,
     /// Custody of per-subject keys.
@@ -108,7 +109,7 @@ pub struct Pipeline {
 impl std::fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pipeline")
-            .field("root", &self.root)
+            .field("paths", &self.paths)
             .finish_non_exhaustive()
     }
 }
@@ -122,7 +123,16 @@ impl Pipeline {
     /// attribute key is rejected rather than admitted unchecked. The one exception is the redaction
     /// policy, where "nothing declared" can only mean nothing to check; both cases are logged.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
+        Self::with_paths(Paths::under(root))
+    }
+
+    /// The same pipeline over paths the deployment chose itself.
+    ///
+    /// What [`Pipeline::new`] delegates to. Every path a running deployment touches comes from the
+    /// one [`Paths`] it was given — writer, reader and the erasure verifier alike — so a relocated
+    /// index or key store is relocated for all of them at once. Naming an index here and deriving it
+    /// from the root anywhere else is how a service ends up reading a file nothing writes.
+    pub fn with_paths(paths: Paths) -> Result<Self> {
         for dir in [
             layout::RECORDS_DIR,
             layout::ENTITIES_DIR,
@@ -132,17 +142,21 @@ impl Pipeline {
             layout::QUARANTINE_DIR,
             layout::DEAD_LETTER_DIR,
         ] {
-            fs::create_dir_all(root.join(dir))?;
+            fs::create_dir_all(paths.root.join(dir))?;
         }
-        let spec = root.join(layout::SPEC_DIR);
+        // The index may sit outside the tree, in which case nothing above has made its directory.
+        if let Some(parent) = paths.index.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let spec = paths.root.join(layout::SPEC_DIR);
         Ok(Self {
-            keys: FsKeyStore::unwrapped(root.join(layout::KEYSTORE_DIR))?,
+            keys: FsKeyStore::unwrapped(&paths.key_store)?,
             resolver: Box::new(DeclaredSubjects),
-            writer: Writer::open(&root.join(layout::INDEX_FILE))?,
+            writer: Writer::open(&paths.index)?,
             registry: load_registry(&spec.join("entities.yaml"))?,
             attrs: load_attrs(&spec.join("attrs-schema.yaml"))?,
             redaction: Redaction::load(&spec.join("redaction/default.yaml"))?,
-            root,
+            paths,
         })
     }
 
@@ -152,7 +166,7 @@ impl Pipeline {
     /// was in force when it was written, so changing the wrapper over live key material makes those
     /// keys unreadable rather than migrating them.
     pub fn with_key_wrapper(mut self, wrapper: impl KeyWrapper + 'static) -> Result<Self> {
-        self.keys = FsKeyStore::new(self.root.join(layout::KEYSTORE_DIR), wrapper)?;
+        self.keys = FsKeyStore::new(&self.paths.key_store, wrapper)?;
         Ok(self)
     }
 
@@ -271,9 +285,19 @@ impl Pipeline {
         &self.registry
     }
 
+    /// The paths this pipeline works over.
+    ///
+    /// Public because the operations built on a pipeline need the same three paths it uses — an
+    /// erasure verifier looking for keys somewhere else would attest to a destruction it never
+    /// checked.
+    #[must_use]
+    pub fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
     /// Root of the memory tree.
     pub(crate) fn root(&self) -> &Path {
-        &self.root
+        &self.paths.root
     }
 
     /// The index writer, for the operations that rebuild derived rows.
@@ -291,7 +315,7 @@ impl Pipeline {
     /// A second connection rather than a shared one: reads must not be able to migrate the schema,
     /// and the write handle stays the single owner of every mutation.
     pub(crate) fn reader(&self) -> Result<Store> {
-        Ok(Store::open_read(&self.root.join(layout::INDEX_FILE))?)
+        Ok(Store::open_read(&self.paths.index)?)
     }
 
     /// Where a record belongs in the tree.
@@ -299,7 +323,10 @@ impl Pipeline {
     /// Derived from the record, not from its identifier alone: an owner-visible record is stored
     /// apart, so its visibility and its owner are part of the answer.
     pub(crate) fn published_path(&self, record: &ActionRecord, stamp: &Stamp) -> Result<PathBuf> {
-        Ok(self.root.join(layout::record_relative(record, stamp)?))
+        Ok(self
+            .paths
+            .root
+            .join(layout::record_relative(record, stamp)?))
     }
 
     /// Step 1: everything that must hold before any byte is written.
@@ -448,7 +475,7 @@ impl Pipeline {
             body: Body::Sealed(sealed),
         };
 
-        let dir = self.root.join(layout::QUARANTINE_DIR);
+        let dir = self.paths.root.join(layout::QUARANTINE_DIR);
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!(
             "{}.{}",
@@ -480,7 +507,7 @@ impl Pipeline {
     /// two leaves a row a rebuild retracts, where the other order would leave a spool file a rebuild
     /// registers again.
     fn settle_quarantine(&mut self, id: &RecordId) -> Result<()> {
-        let path = self.root.join(layout::QUARANTINE_DIR).join(format!(
+        let path = self.paths.root.join(layout::QUARANTINE_DIR).join(format!(
             "{}.{}",
             id.as_str(),
             layout::RECORD_EXT
@@ -499,7 +526,7 @@ impl Pipeline {
     /// without the directory sync the *name* may not be, and a staging file nothing can find is a
     /// record the sweeper will never re-drive.
     pub(crate) fn stage(&self, document: &Document) -> Result<PathBuf> {
-        let dir = self.root.join(layout::STAGING_DIR);
+        let dir = self.paths.root.join(layout::STAGING_DIR);
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!(
             "{}.{}",
@@ -552,7 +579,7 @@ impl Pipeline {
             return Ok(());
         };
         fsutil::create_private_dir_all(parent)?;
-        let owner_root = self.root.join(owner_root);
+        let owner_root = self.paths.root.join(owner_root);
         let mut dir = parent;
         while dir.starts_with(&owner_root) {
             fsutil::make_private(dir)?;
@@ -581,7 +608,10 @@ impl Pipeline {
     /// built once per drain rather than searched per job.
     pub(crate) fn locate_records(&self) -> Result<BTreeMap<String, PathBuf>> {
         let mut located = BTreeMap::new();
-        for path in fsutil::walk_files(&self.root.join(layout::RECORDS_DIR), layout::RECORD_EXT)? {
+        for path in fsutil::walk_files(
+            &self.paths.root.join(layout::RECORDS_DIR),
+            layout::RECORD_EXT,
+        )? {
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                 located.insert(stem.to_owned(), path);
             }
@@ -607,7 +637,7 @@ impl Pipeline {
 
     /// Records a job as needing an operator rather than another retry.
     fn dead_letter(&self, job: &FanoutJob, reason: &str) -> Result<()> {
-        let dir = self.root.join(layout::DEAD_LETTER_DIR);
+        let dir = self.paths.root.join(layout::DEAD_LETTER_DIR);
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.{}", job.record.as_str(), job.kind));
         fsutil::write_sync(
@@ -633,6 +663,7 @@ impl Pipeline {
     fn append_timelines(&self, record: &ActionRecord) -> Result<()> {
         for entity in &record.entities {
             let dir = self
+                .paths
                 .root
                 .join(layout::ENTITIES_DIR)
                 .join(&entity.kind)
@@ -674,7 +705,7 @@ impl Pipeline {
         if record.subjects.is_empty() {
             return Ok(());
         }
-        let dir = self.root.join(layout::AUDIT_DIR).join("subjects");
+        let dir = self.paths.root.join(layout::AUDIT_DIR).join("subjects");
         fs::create_dir_all(&dir)?;
         let mut text = format!(
             "# subjects named by [[record:{}]]\n\n",

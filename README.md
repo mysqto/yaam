@@ -37,6 +37,7 @@ crates/
   yaam-core       write pipeline, sweeper, reindex, erasure, bundle composition
   yaam-server     HTTP service
   yaam-agent      local sidecar: one socket per caller, seals and signs on their behalf
+  yaam-cli        the three entry points: `yaam-server`, `yaam-agent`, `yaam`
 xtask/            repository chores: generates spec/schemas, checks the shapes behind it
 spec/             the contract bundle other implementations vendor
   memory.v1.yaml    the wire contract as OpenAPI 3.1, checked against the router and the types
@@ -46,6 +47,64 @@ spec/             the contract bundle other implementations vendor
   attrs-schema.yaml declared attributes per action, and which of them may sit in plaintext
   redaction/        the redaction policies the writer masks against and the service checks
 ```
+
+## Running it
+
+Three binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
+`--key-store` default to sitting under it, and every setting is also read from the environment
+(`YAAM_ROOT`, `YAAM_INDEX`, `YAAM_KEY_STORE`, `YAAM_LISTEN`, `YAAM_KEYRING`,
+`YAAM_UNSEAL_KEY_FILE`, `YAAM_AGENT_STATE`, `YAAM_LOG`). A flag beats the environment.
+
+```sh
+# The service. Refuses to start on a misconfiguration, and logs the effective one — never a key.
+yaam-server --root /srv/memory --listen 127.0.0.1:8787 \
+            --keyring /etc/yaam/keyring.json --unseal-key-file /etc/yaam/sealing.key
+
+# The sidecar. One socket per agent the state directory holds a signing key for.
+yaam-agent --state-dir /var/lib/yaam/agent
+
+# The operator command line.
+yaam --root /srv/memory check                       # schema, drift, backlog, quarantine
+yaam --root /srv/memory reindex --all               # rebuild the index from the tree
+yaam --root /srv/memory erase --subject s_…         # prints what it would destroy, and stops
+yaam --root /srv/memory erase --subject s_… --confirm-destroy-keys
+yaam --root /srv/memory verify-erasure --tombstone tomb-…
+```
+
+Both long-running binaries shut down on `SIGINT` or `SIGTERM`: they stop accepting, finish what is
+in flight, and the sidecar removes its sockets and drains what the service will still take.
+
+Exit codes are the scriptable interface and are listed in every `--help`:
+
+| | |
+|---|---|
+| `0` | success |
+| `1` | failed — anything the codes below do not describe |
+| `2` | usage error |
+| `3` | config error — a setting is missing, unreadable, or incomplete |
+| `4` | degraded — the store answered, and something in it wants attention |
+| `5` | unconfirmed — a destructive command was not confirmed; nothing was done |
+| `6` | incomplete — the erasure is real but cannot be asserted complete yet |
+
+### The keyring file
+
+Which callers the service authenticates, and what each may do. Never logged.
+
+```json
+{
+  "callers": {
+    "agent_a":   { "role": "writer",   "key": "<hex>", "teams": ["platform"] },
+    "agent_ops": { "role": "operator", "key": "<hex>", "previous_key": "<hex>" }
+  }
+}
+```
+
+### What is not wrapped yet
+
+This build ships no `yaam_crypto::keystore::KeyWrapper`, so subject keys are stored exactly as
+written. `yaam-server` says so at startup and `yaam check` says so on every read: a key file
+recovered from a snapshot or a stale volume is a usable key. Right for development; fit a wrapper
+before the store holds anyone's data.
 
 ## The three shapes
 

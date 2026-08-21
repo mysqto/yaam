@@ -97,6 +97,40 @@ fn a_record_written_through_the_service_is_queryable_bundled_and_then_erasable()
     assert!(after.contains(&sealed_id), "{after:?}");
 }
 
+/// Fan-out and the sweeper have no other caller in a running deployment.
+///
+/// A write enqueues fan-out inside its own transaction and leaves it there; nothing publishes an
+/// entity timeline or a subject audit record until something drains the queue. Before this method
+/// existed a service could answer every request correctly while that work never happened at all.
+#[test]
+fn maintenance_is_what_makes_the_derived_files_appear() {
+    let tree = Tree::new();
+    let service = Arc::clone(&tree.service);
+    let writer = caller("agent_a", Role::Writer, &["platform"]);
+
+    service
+        .write(&writer, record("agent_a", "2026-08-20T09:00:00Z"), BODY)
+        .expect("written");
+    let timeline = tree.root().join("entities/ticket/PROJ-42/timeline.md");
+    assert!(
+        !timeline.exists(),
+        "the write queues the work rather than doing it"
+    );
+
+    let first = service.maintain(64).expect("maintenance");
+    assert!(first.fanout_settled > 0, "{first:?}");
+    assert!(!first.did_nothing());
+    assert!(timeline.is_file(), "the timeline is fan-out's own output");
+
+    // Idempotent, and quiet once there is nothing owed: a service doing this on a timer would
+    // otherwise report work on every round for ever.
+    let second = service.maintain(64).expect("maintenance");
+    assert!(
+        second.did_nothing(),
+        "a second round has nothing left to do: {second:?}"
+    );
+}
+
 #[test]
 fn a_record_the_deployment_does_not_configure_is_refused_before_anything_is_written() {
     let tree = Tree::new();
