@@ -13,6 +13,20 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// The mapping matters: a malformed record is the caller's bug and gets `422`, while a transient
 /// dependency failure gets `503` so the caller retries instead of discarding the record.
+///
+/// | Status | From | Body |
+/// |---|---|---|
+/// | `400` | *not this type* — a rejected query string, before any handler runs | `text/plain` |
+/// | `401` | [`Error::Unauthenticated`] | `{"error": …}` |
+/// | `403` | [`Error::Forbidden`] | `{"error": …}` |
+/// | `422` | [`Error::Unprocessable`], and a core contract failure | `{"error": …}` |
+/// | `500` | any other core failure | `{"error": …}` |
+/// | `503` | [`Error::Unavailable`], and an unresolved subject | `{"error": …}` |
+///
+/// `400` is in the table because a caller's retry policy is written against the whole table, and it
+/// is the row that does not come from here: `axum`'s `Query` rejection answers an unknown or
+/// unparseable query parameter before a handler is reached, so it is the one failure that is not the
+/// `{"error": …}` shape. A client parsing every error body as JSON breaks on exactly that status.
 #[derive(Debug, Error)]
 pub enum Error {
     /// Signature missing, malformed, or wrong.
@@ -84,6 +98,10 @@ mod tests {
 
     /// The whole table, in one place. A caller's retry policy is written against these numbers, so a
     /// change here is a change to every caller's behaviour.
+    ///
+    /// `400` is absent by construction, and the assertion below says so: it is produced before a
+    /// handler runs and carries a `text/plain` body, which is the one answer a client cannot parse
+    /// as `{"error": …}`.
     #[test]
     fn every_failure_maps_to_its_documented_status() {
         let cases = [
@@ -103,6 +121,11 @@ mod tests {
         ];
         for (error, expected) in cases {
             assert_eq!(error.status(), expected, "{error}");
+            assert_ne!(
+                error.status(),
+                StatusCode::BAD_REQUEST,
+                "a `400` from here would answer JSON where the contract promises plain text"
+            );
         }
     }
 

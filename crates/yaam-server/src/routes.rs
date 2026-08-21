@@ -127,11 +127,16 @@ impl AppState {
 /// | `GET /records` | Filtered query. |
 /// | `GET /entities/{kind}/{id}` | Everything about one entity. |
 /// | `GET /bundle` | Compose context for a request. |
-/// | `POST /erase` | Destroy a subject's keys. Operator only. |
+/// | `POST /erase` | Destroy a subject's keys. Operator only, and rebuilds the index. |
 ///
-/// There is deliberately no reindex route. A rebuild walks the whole tree, and an endpoint would
-/// make that reachable by request — so it stays a command-line operation, which keeps "the index is
-/// derived" something an operator asserts rather than something a caller can trigger.
+/// There is deliberately no reindex route: a rebuild walks the whole tree, so it stays a
+/// command-line operation (`yaam reindex`) rather than something any caller can name.
+///
+/// One request does rebuild the index, and it is `POST /erase`. The derived index holds a wrapped
+/// key share per subject and no row can be un-written, so retracting one means rebuilding from the
+/// erased tree; [`yaam_core::erase::erase_subject`] does it synchronously, before the answer comes
+/// back. It needs the operator role, and it costs the whole tree — which is why it is documented as
+/// expensive rather than described as impossible.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/records", post(write_record).get(query_records))
@@ -189,7 +194,7 @@ pub struct RecordQuery {
     pub from_ms: Option<i64>,
     /// Exclusive end of the window.
     pub to_ms: Option<i64>,
-    /// Page size.
+    /// Page size. Absent means the index's default cap, not every match.
     pub limit: Option<u32>,
 }
 
@@ -300,7 +305,7 @@ pub struct EraseResponse {
     pub keys_destroyed: usize,
     /// Quarantined records resolved or discarded as part of this request.
     pub quarantine_settled: usize,
-    /// Identifier of the tombstone written.
+    /// Identifier of the tombstone written: `tomb-` followed by a ULID, not a bare ULID.
     pub tombstone_id: String,
     /// What key destruction does not reach, said in the answer so a caller cannot report this as
     /// having deleted everything about the subject.
@@ -585,6 +590,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_field_the_record_does_not_declare_is_refused_before_the_write() {
+        // Dropping it would store a record the caller did not describe, and no later read could
+        // tell. The wrapper always refused a stray field at the top level; this is the same
+        // mistake one level down, where the mistyped field is the record itself.
+        let fake = Arc::new(Fake::new());
+        let mut record = serde_json::to_value(testing::record(WRITER)).expect("serialises");
+        record
+            .as_object_mut()
+            .expect("an object")
+            .insert("nonsense".to_owned(), serde_json::json!(1));
+        let body = serde_json::json!({ "record": record }).to_string();
+
+        let (status, answer) = serve(&fake, post("/records", Some(WRITER), &body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown field"),
+            "{answer:?}"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "nothing understood, nothing stored"
+        );
+    }
+
+    #[tokio::test]
     async fn a_replayed_write_is_a_duplicate_not_a_conflict() {
         let id = RecordId::generate();
         let fake = Arc::new(Fake::new().answering(Accepted::Duplicate(id.clone())));
@@ -720,6 +753,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rejected_query_string_answers_outside_the_json_error_shape() {
+        // The one failure a client cannot parse as `{"error": …}`: the query string is rejected
+        // before any handler runs, so the body is plain text. A retry policy written against the
+        // JSON shape has to know that, which is why the status table says so.
+        let fake = Arc::new(Fake::new());
+        let response = app(&fake)
+            .oneshot(get("/records?actionn=deploy", Some(READER)))
+            .await
+            .expect("the router answers");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    #[tokio::test]
     async fn entity_history_defaults_to_every_reference() {
         let fake = Arc::new(Fake::new().holding(vec![RecordId::generate()]));
         let (status, body) = serve(&fake, get("/entities/ticket/T-1", Some(READER))).await;
@@ -801,7 +855,7 @@ mod tests {
         let (status, answer) = serve(&fake, post("/erase", Some(OPERATOR), &body)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(answer["keys_destroyed"], 2);
-        assert_eq!(answer["tombstone_id"], "tombstone-1");
+        assert_eq!(answer["tombstone_id"], "tomb-01ARZ3NDEKTSV4RRFFQ69G5FC7");
         // Said in the answer, because an erasure reported as deleting everything is reported wrongly.
         assert!(answer["retained"].as_str().unwrap().contains("timelines"));
         assert_eq!(

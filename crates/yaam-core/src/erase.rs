@@ -41,7 +41,8 @@ pub struct EraseReport {
     pub keys_destroyed: usize,
     /// Quarantined records resolved or discarded as part of this request.
     pub quarantine_settled: usize,
-    /// Identifier of the tombstone written.
+    /// Identifier of the tombstone written: `tomb-` followed by a ULID. Prefixed because the log is
+    /// read beside record identifiers, and one that could be mistaken for a record would be.
     pub tombstone_id: String,
 }
 

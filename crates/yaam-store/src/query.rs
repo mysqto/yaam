@@ -9,6 +9,14 @@
 use rusqlite::{Row, params_from_iter, types::Value as SqlValue};
 use yaam_contract::{RecordId, Visibility};
 
+/// Rows a filtered read returns when the caller names no page size.
+///
+/// A cap rather than everything. "Page size" with no default and no cursor is a trap: the first
+/// caller to omit it reads the whole index into memory, and it works until the index is large. A
+/// caller that wants a different number says so, and one that wants more than this pages by
+/// narrowing the window — there is deliberately no offset to walk.
+pub const DEFAULT_LIMIT: u32 = 1_000;
+
 /// The predicate for a read that may return nothing.
 ///
 /// A predicate rather than an early return, so a scope that admits no record takes the same path as
@@ -66,7 +74,7 @@ pub struct Filter {
     pub attr: Option<(String, String)>,
     /// Restrict to a time window.
     pub window: Option<Window>,
-    /// Page size.
+    /// Page size. `None` means [`DEFAULT_LIMIT`], never unbounded.
     pub limit: Option<u32>,
     /// What the reader is entitled to see.
     pub scope: Scope,
@@ -159,11 +167,14 @@ fn filter_sql(filter: &Filter) -> (String, Vec<SqlValue>) {
         sql.push_str(&predicate);
     }
     sql.push_str(" ORDER BY rec.received_ms DESC, rec.id DESC");
-    if let Some(limit) = filter.limit {
-        sql.push_str(" LIMIT ?");
-        binds.push(i64::from(limit).into());
-    }
+    push_limit(&mut sql, &mut binds, filter.limit);
     (sql, binds)
+}
+
+/// Appends the row cap, which is emitted whether or not the caller named one.
+fn push_limit(sql: &mut String, binds: &mut Vec<SqlValue>, limit: Option<u32>) {
+    sql.push_str(" LIMIT ?");
+    binds.push(i64::from(limit.unwrap_or(DEFAULT_LIMIT)).into());
 }
 
 /// Correlates two actions falling within `within_ms` of each other.
@@ -174,7 +185,8 @@ fn filter_sql(filter: &Filter) -> (String, Vec<SqlValue>) {
 /// Directional: a pair is returned when the right record was stamped at or after the left one and
 /// no later than `within_ms` after it. Bound the search with `left.window` — there is deliberately
 /// no implicit "recent", because a query whose meaning depends on when it ran cannot be tested.
-/// `left.limit` caps the number of pairs; a page size on the right side has no meaning for a join.
+/// `left.limit` caps the number of pairs, defaulting to [`DEFAULT_LIMIT`]; a page size on the right
+/// side has no meaning for a join.
 pub fn correlate(
     store: &crate::Store,
     left: &Filter,
@@ -217,10 +229,7 @@ fn correlate_sql(left: &Filter, right: &Filter, within_ms: i64) -> (String, Vec<
         sql.push_str(&predicate);
     }
     sql.push_str(" ORDER BY l.received_ms DESC, r.received_ms ASC, l.id DESC, r.id ASC");
-    if let Some(limit) = left.limit {
-        sql.push_str(" LIMIT ?");
-        binds.push(i64::from(limit).into());
-    }
+    push_limit(&mut sql, &mut binds, left.limit);
     (sql, binds)
 }
 
@@ -367,7 +376,9 @@ fn collect(rows: impl Iterator<Item = rusqlite::Result<String>>) -> crate::Resul
 mod tests {
     use yaam_contract::Visibility;
 
-    use super::{Filter, Scope, SqlValue, Window, correlate_sql, filter_sql, scope_predicate};
+    use super::{
+        DEFAULT_LIMIT, Filter, Scope, SqlValue, Window, correlate_sql, filter_sql, scope_predicate,
+    };
 
     /// What a reader on one team is entitled to.
     fn reader() -> Scope {
@@ -485,7 +496,34 @@ mod tests {
             ..Filter::default()
         });
         assert!(!sql.contains("visibility"), "{sql}");
-        assert!(binds.is_empty(), "{binds:?}");
+        assert_eq!(
+            binds,
+            vec![SqlValue::from(i64::from(DEFAULT_LIMIT))],
+            "the row cap is the only thing an unscoped filter binds"
+        );
+    }
+
+    #[test]
+    fn a_read_that_names_no_page_size_is_still_bounded() {
+        // An absent `limit` used to emit no `LIMIT` clause at all, so the first caller to omit it
+        // read the whole index into memory — which works until the index is large.
+        for (sql, binds) in [
+            filter_sql(&Filter::default()),
+            correlate_sql(&Filter::default(), &Filter::default(), 1),
+        ] {
+            assert!(sql.contains("LIMIT ?"), "{sql}");
+            assert!(
+                binds.contains(&SqlValue::from(i64::from(DEFAULT_LIMIT))),
+                "{binds:?}"
+            );
+        }
+
+        // A caller that names one still gets exactly that.
+        let (_, binds) = filter_sql(&Filter {
+            limit: Some(7),
+            ..Filter::default()
+        });
+        assert!(binds.contains(&SqlValue::from(7i64)), "{binds:?}");
     }
 
     #[test]

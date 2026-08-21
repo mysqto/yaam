@@ -83,6 +83,10 @@ info:
     | `500` | this service's own fault. Raise it; do not spin on it |
     | `503` | **transient.** Retry — retrying is safe, because every write is idempotent |
 
+    Every failure answers `{"error": …}` except `400`, which is `text/plain`: the query string is
+    rejected before the request reaches a handler, so nothing has built the JSON shape yet. A client
+    that parses every error body as JSON breaks on exactly that status.
+
     `422` against `503` is the pair to get right, and it is the pair clients get backwards. `422`
     says the bytes will never be accepted, so a client that retries burns its queue on a record that
     cannot land. `503` says the record was fine and the service was not, so a client that discards
@@ -113,8 +117,12 @@ info:
     ## There is deliberately no reindex endpoint
 
     Rebuilding the index walks the whole tree. It stays a command-line operation (`yaam reindex`),
-    and no request — signed by an operator or not — can start one. "The index is derived" is then
-    something an operator asserts, not something a caller can trigger. Do not add a route for it.
+    and no request can ask for one for its own sake. Do not add a route for it.
+
+    One request does cause a rebuild: `POST /erase`, with the operator role. The index holds a
+    wrapped key share per subject and no row can be un-written, so retracting one means rebuilding
+    from the erased tree, and the endpoint does it before answering. That is the exception, it is
+    expensive, and it is priced into the erasure call rather than offered on its own.
 
 servers:
   - url: /
@@ -250,8 +258,9 @@ paths:
                 error: 'forbidden: `agent_b` may not attribute a record to `agent_a`'
         '422':
           description: |
-            Permanent. The body is not JSON, carries a field the request type does not declare, is
-            larger than 1 MiB, or the record breaks a contract rule — an empty `action`, a timestamp
+            Permanent. The body is not JSON, is larger than 1 MiB, carries a field no schema in it
+            declares — at the top level, inside `record`, or inside one of its entity or subject
+            references — or the record breaks a contract rule — an empty `action`, a timestamp
             that cannot be read, a `subject_derived` record naming no subject, an `internal` record
             naming one, a `team` visibility with no team, or an entity confidence outside `0.0..=1.0`.
             Do not retry these bytes.
@@ -285,6 +294,9 @@ paths:
         Unknown parameters are `400`. A window needs both bounds: half a window is a different
         question, not a narrower one, so supplying the missing bound here would answer something the
         caller did not ask.
+
+        Bounded whether or not `limit` says so: an omitted `limit` is the default cap of `1000` rows,
+        so a short answer is not proof that nothing else matched.
       parameters:
         - $ref: '#/components/parameters/action'
         - $ref: '#/components/parameters/outcome'
@@ -320,10 +332,16 @@ paths:
       operationId: entityRecords
       summary: Everything touching one entity
       description: |
-        Entities are the join keys across records. Both path segments are taken as given and matched
-        against the index; `kind` must be one the deployment configures in `spec/entities.yaml`, and
-        `id` must already be in that kind's canonical form — this endpoint matches, it does not
-        canonicalise. An unknown kind or a non-canonical identifier is an empty result, not an error.
+        Entities are the join keys across records. `kind` must be one the deployment configures in
+        `spec/entities.yaml`, and `id` is canonicalised by that kind's normalisation steps before it
+        is matched — the same steps a write applies, so an identifier good enough to store is good
+        enough to find. Asking for `proj-42` where the store holds `PROJ-42` answers the history,
+        not an empty list.
+
+        An unconfigured kind, or an identifier the kind's pattern does not admit after
+        normalisation, is `422`. It is not an empty result: no rows is indistinguishable from "this
+        entity has no history", and a caller cannot tell a bug of its own from a fact about the
+        store.
 
         Scoped to the caller like every other read.
       parameters:
@@ -338,9 +356,9 @@ paths:
           in: path
           required: true
           description: |
-            Canonical identifier within the kind. Percent-encode it — several configured kinds carry
-            `/`, `#` or `@` inside an identifier — and sign the encoded target, since the signature
-            covers the request target exactly as sent.
+            Identifier within the kind, canonicalised here before it is matched. Percent-encode it —
+            several configured kinds carry `/`, `#` or `@` inside an identifier — and sign the
+            encoded target, since the signature covers the request target exactly as sent.
           schema:
             type: string
           example: PROJ-42
@@ -352,6 +370,17 @@ paths:
           $ref: '#/components/responses/BadQuery'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '422':
+          description: |
+            Permanent. `kind` is not configured by this deployment, or `id` is not in that kind's
+            canonical form and cannot be normalised into it. Fix the request; the same segments will
+            never match.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'unprocessable: entity id `not a ticket` is not canonical for kind `ticket`'
         '500':
           $ref: '#/components/responses/Internal'
         '503':
@@ -400,7 +429,8 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '422':
           description: |
-            Permanent. An `entity` term is not `kind:id`.
+            Permanent. An `entity` term is not `kind:id`, names a kind this deployment does not
+            configure, or carries an identifier that kind cannot canonicalise.
           content:
             application/json:
               schema:
@@ -566,8 +596,10 @@ components:
       in: query
       required: false
       description: |
-        Caps the number of rows returned. Absent means no cap at all — every match. There is no
-        cursor, so page by narrowing the window rather than by walking an offset.
+        Caps the number of rows returned. Absent means the service's default cap of `1000` rows, not
+        every match: a page size with no default and no cursor is a trap, and the first caller to
+        omit it would read the whole index into memory. A value given here is honoured as given.
+        There is no cursor, so page by narrowing the window rather than by walking an offset.
       schema:
         type: integer
         format: int32
@@ -594,7 +626,9 @@ components:
       required: false
       description: |
         Comma-separated `kind:id` terms. Each contributes its history to the bundle; duplicates
-        across terms are one record, counted once.
+        across terms are one record, counted once. Identifiers are canonicalised as on
+        `GET /entities/{kind}/{id}`, and a term that cannot be is `422` rather than a source that
+        quietly contributes nothing.
       schema:
         type: string
         pattern: '^[^,]+:[^,]*(,[^,]+:[^,]*)*$'
@@ -758,9 +792,10 @@ components:
     EntityRef:
       type: object
       description: |
-        A join key. Unknown fields are accepted and dropped here; only the request wrapper refuses
-        them.
+        A join key. Unknown fields are refused, as everywhere in a write body: a field dropped here
+        would leave the record joining on something other than what was sent.
       required: [kind, id, role, confidence]
+      additionalProperties: false
       properties:
         kind:
           type: string
@@ -789,8 +824,9 @@ components:
     SubjectRef:
       type: object
       description: |
-        Unknown fields are accepted and dropped here, as in `EntityRef`.
+        Unknown fields are refused, as in `EntityRef`.
       required: [hash, role, canon_ver]
+      additionalProperties: false
       properties:
         hash:
           $ref: '#/components/schemas/SubjectHash'
@@ -813,8 +849,11 @@ components:
         frontmatter and the index columns are three projections of it and cannot diverge; `summary`
         is the one exception, being prose that becomes the record body rather than a frontmatter key.
 
-        Unknown fields are accepted and dropped. The `WriteRequest` wrapper around it does refuse
-        them, so a typo at the top level fails while a typo *inside* `record` does not.
+        Unknown fields are refused, at this level and inside `entities` and `subjects` as well as in
+        the `WriteRequest` wrapper: a mistyped field that got dropped would store a record the
+        caller did not describe and cannot tell is incomplete. `attrs` is the one open map, and is
+        checked against `spec/attrs-schema.yaml` instead.
+      additionalProperties: false
       required:
         - record_id
         - schema_ver
@@ -1069,10 +1108,12 @@ components:
           example: 1
         tombstone_id:
           type: string
+          pattern: '^tomb-[0-9A-HJKMNP-TV-Z]{26}$'
           description: |
-            The line to confirm against in the append-only tombstone log. Completion is a second
-            line for the same identifier rather than an edit of the first: an erasure record that can
-            be rewritten is one that can be unwritten.
+            `tomb-` followed by a ULID — prefixed, so it cannot be mistaken for the `record_id` it
+            sits beside in a log. The line to confirm against in the append-only tombstone log:
+            completion is a second line for the same identifier rather than an edit of the first, an
+            erasure record that can be rewritten being one that can be unwritten.
           example: tomb-01ARZ3NDEKTSV4RRFFQ69G5FC7
         retained:
           type: string

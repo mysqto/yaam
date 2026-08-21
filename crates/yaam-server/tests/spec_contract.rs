@@ -51,6 +51,12 @@ enum Mode {
     Duplicate,
     /// A write is held pending subject resolution.
     Quarantined,
+    /// The read names something this deployment cannot canonicalise.
+    ///
+    /// A mode rather than a real registry: canonicalisation belongs to the service, so what this
+    /// file can check is that the router reports it as the document says. That it *is* refused, over
+    /// the repository's own `spec/entities.yaml`, is `end_to_end.rs`'s job.
+    Unaskable,
     /// Everything is transiently unavailable.
     Unavailable,
     /// Everything fails in a way that is this service's own fault.
@@ -67,6 +73,9 @@ impl Fake {
     /// The configured failure, if any.
     fn gate(&self) -> yaam_server::Result<()> {
         match self.mode {
+            Mode::Unaskable => Err(yaam_server::Error::Unprocessable(
+                "entity id `not a ticket` is not canonical for kind `ticket`".to_owned(),
+            )),
             Mode::Unavailable => Err(yaam_server::Error::Unavailable(
                 "index reopening".to_owned(),
             )),
@@ -195,6 +204,16 @@ fn write_body(agent: &str) -> String {
     serde_json::json!({ "record": record(agent) }).to_string()
 }
 
+/// A write request whose record carries a field no schema declares.
+fn nested_unknown_field(agent: &str) -> String {
+    let mut record = serde_json::to_value(record(agent)).expect("a record serialises");
+    record
+        .as_object_mut()
+        .expect("a record is an object")
+        .insert("nonsense".to_owned(), serde_json::json!(1));
+    serde_json::json!({ "record": record }).to_string()
+}
+
 /// A well-formed erasure request.
 fn erase_body() -> String {
     let subject = SubjectHash::parse(&format!("s_{:064x}", 1)).expect("a well-formed pseudonym");
@@ -293,6 +312,15 @@ fn write_cases() -> Vec<Case> {
             r#"{"record":1}"#,
             Mode::Stored,
         ),
+        // An undeclared field *inside* the record, which is the same mistake about more.
+        case(
+            "POST",
+            path,
+            path,
+            Some(WRITER),
+            nested_unknown_field(WRITER),
+            Mode::Stored,
+        ),
         case(
             "POST",
             path,
@@ -361,6 +389,7 @@ fn entity_cases() -> Vec<Case> {
             Mode::Stored,
         ),
         case("GET", template, uri, None, "", Mode::Stored),
+        case("GET", template, uri, Some(READER), "", Mode::Unaskable),
         case("GET", template, uri, Some(READER), "", Mode::Internal),
         case("GET", template, uri, Some(READER), "", Mode::Unavailable),
     ]
@@ -743,6 +772,18 @@ async fn the_documented_body_fields_are_the_ones_each_endpoint_accepts() {
 }
 
 #[test]
+fn the_documented_default_row_cap_is_the_one_the_index_applies() {
+    // A number a client plans its paging around, so a drifted document is a client that believes a
+    // short answer means nothing else matched.
+    let spec = spec();
+    let described = node(&spec, &["components", "parameters", "limit", "description"])
+        .as_str()
+        .expect("the parameter is described");
+    let cap = format!("`{}`", yaam_store::query::DEFAULT_LIMIT);
+    assert!(described.contains(&cap), "{described} does not name {cap}");
+}
+
+#[test]
 fn the_documented_headers_and_sealed_media_type_are_the_ones_the_code_uses() {
     let spec = spec();
     let schemes = map(&spec, &["components", "securitySchemes"]);
@@ -780,8 +821,9 @@ fn the_documented_headers_and_sealed_media_type_are_the_ones_the_code_uses() {
 
 #[tokio::test]
 async fn no_rebuild_endpoint_is_documented_or_served() {
-    // A rebuild walks the whole tree. Keeping it off the wire is what makes "the index is derived"
-    // something an operator asserts rather than something a caller can trigger.
+    // A rebuild walks the whole tree, so no route offers one for its own sake. `POST /erase` is the
+    // one request that causes one, because a wrapped share row cannot be retracted any other way;
+    // what must stay off the wire is a rebuild a caller can ask for directly.
     for (path, _) in documented().keys() {
         assert!(
             !path.contains("reindex") && !path.contains("sweep"),

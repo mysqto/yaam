@@ -23,12 +23,18 @@ use support::{POLICY, Tree, caller, record};
 const DIRTY: &str = concat!(
     "Rolled out the api service to staging.\n",
     "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+    "bm90LWEtcmVhbC1rZXktYXQtYWxs\n",
+    "-----END OPENSSH PRIVATE KEY-----\n",
     "authorization: Bearer not-a-real-token-0123456789\n",
     "api_key: not-a-real-key-value\n",
     "contact: someone@example.test\n",
     "card: 4111 1111 1111 1111\n",
     "order_ref: ord10014721, 12 shards\n",
 );
+
+/// The body of the fake key in [`DIRTY`], which `concat!` needs spelled as a literal there. A test
+/// asserts the two agree, so the assertions below cannot go looking for text no body contains.
+const KEY_MATERIAL: &str = "bm90LWEtcmVhbC1rZXktYXQtYWxs";
 
 /// The policy as this repository ships it, which is what the service loads too.
 fn shipped_policy() -> Policy {
@@ -39,6 +45,10 @@ fn shipped_policy() -> Policy {
 
 #[test]
 fn the_service_accepts_what_the_masking_library_produces() {
+    assert!(
+        DIRTY.contains(KEY_MATERIAL),
+        "the fixture and its key disagree"
+    );
     let policy = shipped_policy();
     assert_eq!(
         policy.name(),
@@ -87,6 +97,10 @@ fn the_service_accepts_what_the_masking_library_produces() {
     }
     assert!(!stored.contains("not-a-real-token"), "{stored}");
     assert!(!stored.contains("someone@example.test"), "{stored}");
+    // The pattern used to match the BEGIN marker alone, which took the label off the key and left
+    // the key. What has to be gone is the material, not the caption.
+    assert!(!stored.contains(KEY_MATERIAL), "{stored}");
+    assert!(!stored.contains("PRIVATE KEY"), "{stored}");
 }
 
 #[test]
