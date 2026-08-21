@@ -111,6 +111,33 @@ impl Harness {
         Self { dir, pipeline }
     }
 
+    /// Rebuilds the pipeline over the same tree with a subject resolver in place.
+    ///
+    /// Destructured rather than assigned through the field, so the temporary root outlives the
+    /// pipeline that is replaced.
+    pub(crate) fn resolving_with(
+        self,
+        resolver: impl crate::resolve::SubjectResolver + 'static,
+    ) -> Self {
+        let Self { dir, pipeline } = self;
+        Self {
+            dir,
+            pipeline: pipeline.with_subject_resolver(resolver),
+        }
+    }
+
+    /// Rebuilds the pipeline over the same tree with key material wrapped at rest.
+    pub(crate) fn wrapping_keys_with(
+        self,
+        wrapper: impl yaam_crypto::keystore::KeyWrapper + 'static,
+    ) -> Self {
+        let Self { dir, pipeline } = self;
+        Self {
+            dir,
+            pipeline: pipeline.with_key_wrapper(wrapper).expect("key store"),
+        }
+    }
+
     /// Where a record's file belongs.
     pub(crate) fn path_of(&self, record: &ActionRecord) -> std::path::PathBuf {
         let stamp = layout::stamp_of(record).expect("a readable stamp");

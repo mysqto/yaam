@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 
 use yaam_contract::attrs::Schema;
 use yaam_contract::entity::Registry;
-use yaam_contract::{ActionRecord, DataClass, RecordId, SubjectHash};
-use yaam_crypto::keystore::{FsKeyStore, KeyStore as _};
+use yaam_contract::{ActionRecord, DataClass, RecordId, SubjectHash, SubjectRef};
+use yaam_crypto::keystore::{FsKeyStore, KeyStore as _, KeyWrapper};
 use yaam_crypto::{Epoch, SealedBody};
 use yaam_md::{Body, Document};
 use yaam_store::{FanoutJob, PublishInput, Store, Writer};
@@ -35,6 +35,7 @@ use yaam_store::{FanoutJob, PublishInput, Store, Writer};
 use crate::fsutil;
 use crate::layout::{self, Stamp};
 use crate::policy::Redaction;
+use crate::resolve::{DeclaredSubjects, Resolution, SubjectResolver};
 use crate::{Error, Result};
 
 /// Claims of one fan-out job before it is set aside.
@@ -85,7 +86,6 @@ pub enum Accepted {
 }
 
 /// The write pipeline.
-#[derive(Debug)]
 pub struct Pipeline {
     /// Root of the memory tree. Every other path is derived from it.
     root: PathBuf,
@@ -93,12 +93,24 @@ pub struct Pipeline {
     writer: Writer,
     /// Custody of per-subject keys.
     keys: FsKeyStore,
+    /// How a record's subjects are determined. Declared-as-sent unless a deployment replaces it.
+    resolver: Box<dyn SubjectResolver>,
     /// Configured entity kinds, for canonicalising identifiers.
     registry: Registry,
     /// Configured attribute surface.
     attrs: Schema,
     /// Configured redaction policy.
     redaction: Redaction,
+}
+
+/// Written by hand because the resolver is a trait object: demanding `Debug` of every deployment's
+/// subject lookup would be a real constraint bought for a derive.
+impl std::fmt::Debug for Pipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pipeline")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Pipeline {
@@ -124,7 +136,8 @@ impl Pipeline {
         }
         let spec = root.join(layout::SPEC_DIR);
         Ok(Self {
-            keys: FsKeyStore::open(root.join(layout::KEYSTORE_DIR))?,
+            keys: FsKeyStore::unwrapped(root.join(layout::KEYSTORE_DIR))?,
+            resolver: Box::new(DeclaredSubjects),
             writer: Writer::open(&root.join(layout::INDEX_FILE))?,
             registry: load_registry(&spec.join("entities.yaml"))?,
             attrs: load_attrs(&spec.join("attrs-schema.yaml"))?,
@@ -133,7 +146,27 @@ impl Pipeline {
         })
     }
 
-    /// Runs a record through dedupe, validation, sealing, staging and publish.
+    /// Wraps key material with `wrapper` instead of writing it in the clear.
+    ///
+    /// Set this before the first record is written. A key already on disk was wrapped by whatever
+    /// was in force when it was written, so changing the wrapper over live key material makes those
+    /// keys unreadable rather than migrating them.
+    pub fn with_key_wrapper(mut self, wrapper: impl KeyWrapper + 'static) -> Result<Self> {
+        self.keys = FsKeyStore::new(self.root.join(layout::KEYSTORE_DIR), wrapper)?;
+        Ok(self)
+    }
+
+    /// Determines a record's subjects with `resolver` instead of trusting the ones it declares.
+    ///
+    /// [`crate::resolve::DeclaredSubjects`] is the default, so a deployment adopts this only if it
+    /// has a lookup to plug in.
+    #[must_use]
+    pub fn with_subject_resolver(mut self, resolver: impl SubjectResolver + 'static) -> Self {
+        self.resolver = Box::new(resolver);
+        self
+    }
+
+    /// Runs a record through dedupe, validation, resolution, sealing, staging and publish.
     ///
     /// Replay-safe end to end. A record whose identifier is already in the tree returns
     /// [`Accepted::Duplicate`] and touches nothing, which is what makes a retry, a spool replay and
@@ -148,15 +181,19 @@ impl Pipeline {
             return Ok(Accepted::Duplicate(id));
         }
 
-        let record = self.validated(record, body)?;
-        let sealed = match self.seal_body(&record, &stamp, body) {
-            Ok(body) => body,
+        let mut record = self.validated(record, body)?;
+        let (subjects, sealed) = match self.resolve_and_seal(&record, &stamp, body) {
+            Ok(resolved) => resolved,
             Err(Error::SubjectUnresolved) => {
                 self.quarantine(&record, &stamp, body)?;
                 return Ok(Accepted::Quarantined(id));
             }
             Err(other) => return Err(other),
         };
+        // The resolver's answer is the record's subject set from here on: the frontmatter, the
+        // wrapped shares that reach the index and the audit record all have to agree with what the
+        // body was sealed under.
+        record.subjects = subjects;
 
         let document = Document {
             record,
@@ -302,18 +339,51 @@ impl Pipeline {
         Ok(record)
     }
 
-    /// Step 1, second half: seal the body when the record is subject-derived.
+    /// Step 1, second half: resolve the record's subjects, then seal the body under them.
     ///
-    /// A subject that cannot be resolved *right now* is [`Error::SubjectUnresolved`], never a
-    /// rejection. Both shapes it takes are transient in the sense that matters — the record is real
-    /// and must not be dropped: a key store that cannot answer will answer later, and a tombstoned
-    /// subject means the record arrived after an erasure, which [`crate::erase::erase_subject`]
-    /// settles rather than the writer losing its history over.
-    fn seal_body(&self, record: &ActionRecord, stamp: &Stamp, body: &str) -> Result<Body> {
+    /// One step because the two share a failure: a subject that cannot be resolved *right now* is
+    /// [`Error::SubjectUnresolved`], never a rejection, whether the resolver said so or the key
+    /// store could not answer. Every shape it takes is transient in the sense that matters — the
+    /// record is real and must not be dropped: a lookup that is down will come back, and a
+    /// tombstoned subject means the record arrived after an erasure, which
+    /// [`crate::erase::erase_subject`] settles rather than the writer losing its history over.
+    ///
+    /// Returns the resolved subjects alongside the body, because the caller has to write both or
+    /// neither.
+    fn resolve_and_seal(
+        &self,
+        record: &ActionRecord,
+        stamp: &Stamp,
+        body: &str,
+    ) -> Result<(Vec<SubjectRef>, Body)> {
+        let resolved = match self.resolver.resolve(record) {
+            Resolution::Resolved(subjects) => subjects,
+            Resolution::Unavailable(reason) => {
+                tracing::info!(
+                    record = record.record_id.as_str(),
+                    reason,
+                    "subject resolution unavailable"
+                );
+                return Err(Error::SubjectUnresolved);
+            }
+        };
+        check_class(record, &resolved)?;
+        let sealed = self.seal_body(record, &resolved, stamp, body)?;
+        Ok((resolved, sealed))
+    }
+
+    /// Seals the body when the record is subject-derived, under the subjects resolution settled on.
+    fn seal_body(
+        &self,
+        record: &ActionRecord,
+        resolved: &[SubjectRef],
+        stamp: &Stamp,
+        body: &str,
+    ) -> Result<Body> {
         if record.data_class == DataClass::Internal {
             return Ok(Body::Plain(body.to_owned()));
         }
-        let subjects: Vec<SubjectHash> = record.subjects.iter().map(|s| s.hash.clone()).collect();
+        let subjects: Vec<SubjectHash> = resolved.iter().map(|s| s.hash.clone()).collect();
         for subject in &subjects {
             if self
                 .keys
@@ -745,6 +815,26 @@ fn subject_role_text(role: yaam_contract::Role) -> &'static str {
     }
 }
 
+/// Holds the resolver to the contract rule that ties a record's class to its subjects.
+///
+/// [`ActionRecord::validate`] already checked what arrived; this checks what resolution *replaced* it
+/// with, and the two failures need different words because they have different culprits. Neither is
+/// survivable: a subject-derived record with no subjects would be sealed under a key nobody can
+/// destroy, and an internal record naming subjects would claim an erasability its plaintext body
+/// cannot deliver.
+fn check_class(record: &ActionRecord, resolved: &[SubjectRef]) -> Result<()> {
+    match record.data_class {
+        DataClass::SubjectDerived if resolved.is_empty() => Err(invalid(
+            "subject resolution produced no subject for a subject-derived record",
+        )),
+        DataClass::Internal if !resolved.is_empty() => Err(invalid(format!(
+            "subject resolution produced {} subject(s) for an internal record",
+            resolved.len()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// A record the caller must fix.
 pub(crate) fn invalid(detail: impl Into<String>) -> Error {
     Error::Invalid(yaam_contract::Error::Invalid(detail.into()))
@@ -776,16 +866,76 @@ fn load_attrs(path: &Path) -> Result<Schema> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
-    use yaam_contract::{DataClass, Outcome, attrs};
+    use yaam_contract::{CanonVer, DataClass, Outcome, Role, SubjectRef, attrs};
+    use yaam_crypto::keystore::{KeyStore as _, KeyWrapper};
     use yaam_md::{Body, Document};
 
     use super::{Accepted, Pipeline, quarantine_subject};
+    use crate::resolve::{DeclaredSubjects, Resolution, SubjectResolver};
     use crate::testkit::{self, BODY, Harness};
 
     /// A record's server time, and so the directory it lands in.
     const T09: &str = "2026-08-20T09:14:03.117Z";
+
+    /// A subject lookup that is down. The case the quarantine spool was built for.
+    struct AlwaysUnavailable;
+
+    impl SubjectResolver for AlwaysUnavailable {
+        fn resolve(&self, _record: &yaam_contract::ActionRecord) -> Resolution {
+            Resolution::Unavailable("the lookup is not answering".to_owned())
+        }
+    }
+
+    /// A subject lookup driven by a table keyed on the record identifier.
+    ///
+    /// Stands in for a deployment that decides a record's subjects itself rather than believing what
+    /// arrived. An identifier it has never heard of is a lookup it cannot complete, not a record
+    /// without subjects.
+    struct Mapped(BTreeMap<String, Vec<SubjectRef>>);
+
+    impl SubjectResolver for Mapped {
+        fn resolve(&self, record: &yaam_contract::ActionRecord) -> Resolution {
+            match self.0.get(record.record_id.as_str()) {
+                Some(subjects) => Resolution::Resolved(subjects.clone()),
+                None => Resolution::Unavailable("no entry for this record yet".to_owned()),
+            }
+        }
+    }
+
+    /// A lookup that completes and finds nothing, which for a subject-derived record is a bug.
+    struct ResolvesToNothing;
+
+    impl SubjectResolver for ResolvesToNothing {
+        fn resolve(&self, _record: &yaam_contract::ActionRecord) -> Resolution {
+            Resolution::Resolved(Vec::new())
+        }
+    }
+
+    /// A stand-in for a key service: reversible, and enough to show the wrapper is on the write
+    /// path. What a wrapper that *cannot* open a file does is `yaam-crypto`'s test, not this one.
+    struct Xor(u8);
+
+    impl KeyWrapper for Xor {
+        fn wrap(&self, key: &[u8]) -> yaam_crypto::Result<Vec<u8>> {
+            Ok(key.iter().map(|byte| byte ^ self.0).collect())
+        }
+
+        fn unwrap(&self, wrapped: &[u8]) -> yaam_crypto::Result<Vec<u8>> {
+            self.wrap(wrapped)
+        }
+    }
+
+    /// A resolver's answer, in the shape a record carries.
+    fn subject_ref(fill: char) -> SubjectRef {
+        SubjectRef {
+            hash: testkit::subject(fill),
+            role: Role::Principal,
+            canon_ver: CanonVer(1),
+        }
+    }
 
     /// One way to break a record, and the name of what it breaks.
     type Case = (&'static str, Box<dyn Fn(&mut yaam_contract::ActionRecord)>);
@@ -1386,6 +1536,162 @@ mod tests {
             testkit::mode_of(&harness.root().join("records/owner")),
             0o700
         );
+    }
+
+    #[test]
+    fn a_resolver_that_cannot_answer_quarantines_and_the_record_comes_back() {
+        let mut harness = Harness::new().resolving_with(AlwaysUnavailable);
+        let record = testkit::subject_derived(T09, &[testkit::subject('a')]);
+
+        assert_eq!(
+            harness
+                .pipeline
+                .accept(record.clone(), BODY)
+                .expect("not a rejection"),
+            Accepted::Quarantined(record.record_id.clone())
+        );
+        assert!(!harness.path_of(&record).exists());
+        assert_eq!(harness.counts()["records"], 0);
+        assert_eq!(harness.counts()["quarantine_pending"], 1);
+        let spooled = harness
+            .root()
+            .join(".quarantine")
+            .join(record.record_id.as_str().to_owned() + ".md");
+        assert!(
+            !fs::read_to_string(&spooled)
+                .expect("spooled")
+                .contains("Rolled out"),
+            "a held body is sealed on disk, not merely delayed"
+        );
+
+        // The lookup comes back and the record is re-presented, which is the settle path that
+        // already existed: no second mechanism, and nothing to replay by hand.
+        let mut harness = harness.resolving_with(DeclaredSubjects);
+        assert_eq!(
+            harness
+                .pipeline
+                .accept(record.clone(), BODY)
+                .expect("accepted"),
+            Accepted::Stored(record.record_id.clone())
+        );
+        assert!(harness.path_of(&record).exists());
+        assert_eq!(harness.counts()["records"], 1);
+        assert_eq!(harness.counts()["quarantine_pending"], 0);
+        assert!(!spooled.exists(), "the spooled copy is dropped on publish");
+    }
+
+    #[test]
+    fn what_the_resolver_answers_is_what_gets_sealed() {
+        let declared = testkit::subject('a');
+        let record = testkit::subject_derived(T09, std::slice::from_ref(&declared));
+        let resolved = [subject_ref('b'), subject_ref('c')];
+        let mut harness = Harness::new().resolving_with(Mapped(BTreeMap::from([(
+            record.record_id.as_str().to_owned(),
+            resolved.to_vec(),
+        )])));
+
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+
+        // Frontmatter, wrapped shares and audit all follow the resolver, not the record: a body
+        // sealed to one subject set and indexed under another would be undestroyable by the subject
+        // the index names.
+        let stored = Document::parse(&fs::read_to_string(harness.path_of(&record)).expect("read"))
+            .expect("parses");
+        assert_eq!(stored.record.subjects, resolved);
+        let shares = harness.snapshot();
+        for subject in &resolved {
+            assert!(
+                shares.iter().any(
+                    |line| line.starts_with("subject|") && line.contains(subject.hash.as_str())
+                ),
+                "{} reached the index",
+                subject.hash.as_str()
+            );
+        }
+        assert!(
+            shares.iter().all(|line| !line.contains(declared.as_str())),
+            "the subject the record declared is not the one it was sealed under"
+        );
+        assert_eq!(harness.counts()["record_subjects"], 2);
+
+        // And a record the table has no entry for is held, not rejected: a lookup that has not
+        // caught up is the same transient failure whatever shape a resolver takes.
+        let unknown = testkit::subject_derived(T09, &[testkit::subject('d')]);
+        assert_eq!(
+            harness
+                .pipeline
+                .accept(unknown.clone(), BODY)
+                .expect("not a rejection"),
+            Accepted::Quarantined(unknown.record_id)
+        );
+    }
+
+    #[test]
+    fn a_resolver_that_contradicts_the_record_class_is_a_rejection() {
+        let mut none = Harness::new().resolving_with(ResolvesToNothing);
+        let sealed = testkit::subject_derived(T09, &[testkit::subject('a')]);
+        // Sealed under no subject at all would be unerasable by construction, so this is the
+        // deployment's bug to fix rather than something to hold and retry.
+        assert!(matches!(
+            none.pipeline.accept(sealed, BODY),
+            Err(crate::Error::Invalid(_))
+        ));
+
+        let plain = testkit::internal(T09);
+        let mut extra = Harness::new().resolving_with(Mapped(BTreeMap::from([(
+            plain.record_id.as_str().to_owned(),
+            vec![subject_ref('a')],
+        )])));
+        assert!(matches!(
+            extra.pipeline.accept(plain, BODY),
+            Err(crate::Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_wrapped_key_store_stores_no_usable_key() {
+        let mut harness = Harness::new().wrapping_keys_with(Xor(0x33));
+        let subject = testkit::subject('a');
+        let record = testkit::subject_derived(T09, std::slice::from_ref(&subject));
+
+        let epoch =
+            yaam_crypto::Epoch::containing(crate::layout::stamp_of(&record).expect("stamp").ms);
+        harness.pipeline.accept(record, BODY).expect("accepted");
+
+        // Minted through the pipeline, so the wrapper is on the write path and not just constructed.
+        let key = harness
+            .pipeline
+            .keys()
+            .get(&subject, &epoch)
+            .expect("readable")
+            .expect("minted");
+        let stored = fs::read(
+            harness
+                .root()
+                .join("keystore/keys")
+                .join(subject.as_str())
+                .join(epoch.as_str()),
+        )
+        .expect("key file");
+        assert_ne!(stored, key, "a recovered key file is not a key");
+    }
+
+    #[test]
+    fn a_pipeline_prints_its_root_and_reaches_no_further() {
+        let harness = Harness::new();
+        let printed = format!("{:?}", harness.pipeline);
+
+        assert!(printed.contains("Pipeline"), "{printed}");
+        assert!(
+            printed.contains(&harness.root().display().to_string()),
+            "{printed}"
+        );
+        // The plug-ins are left out: a deployment's resolver and key wrapper are under no obligation
+        // to be careful about what they print.
+        assert!(printed.ends_with(".. }"), "{printed}");
     }
 
     #[test]

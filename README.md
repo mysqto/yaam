@@ -39,6 +39,16 @@ crates/
 spec/             the contract bundle other implementations vendor
 ```
 
+## Deployment seams
+
+Two traits a deployment implements, neither with an implementation in this repo, and both with a
+default that behaves exactly as not using them did.
+
+| | |
+|---|---|
+| `yaam_crypto::keystore::KeyWrapper` | Wraps subject keys before they reach the disk, so a key file recovered from a snapshot or a stale volume is inert without a call to external key custody. `FsKeyStore::unwrapped` is the development default, named so nobody gets it by accident. |
+| `yaam_core::resolve::SubjectResolver` | Decides the subjects a record names. `DeclaredSubjects` trusts the ones it carries; a lookup that is briefly down quarantines the record for a later retry rather than rejecting it. |
+
 ## Status
 
 Early. See `AGENTS.md` for the invariants any contribution must hold.

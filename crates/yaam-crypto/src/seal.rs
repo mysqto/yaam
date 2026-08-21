@@ -498,7 +498,7 @@ mod tests {
 
     fn store() -> (TempDir, FsKeyStore) {
         let dir = TempDir::new().unwrap();
-        let store = FsKeyStore::open(dir.path()).unwrap();
+        let store = FsKeyStore::unwrapped(dir.path()).unwrap();
         (dir, store)
     }
 
