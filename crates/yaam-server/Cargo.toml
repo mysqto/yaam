@@ -31,6 +31,9 @@ yaam-store = { path = "../yaam-store" }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Reads `spec/memory.v1.yaml` back, so the published wire contract is checked against this
+# router rather than trusted.
+saphyr.workspace = true
 # Drives the router directly, so handler tests need no listening socket.
 tower = { version = "0.5", features = ["util"] }
 # The boundary test runs a real sidecar against this router: nothing else proves the two can talk.
