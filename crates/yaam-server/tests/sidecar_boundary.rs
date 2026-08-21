@@ -163,14 +163,16 @@ async fn a_record_written_to_a_sidecar_reaches_the_service() {
     );
     assert!(tree.holds(&id), "the record is not in the service's tree");
 
-    // And it is readable back through the service, under the writer's own scope.
+    // And it is readable back through the service, under the writer's own scope — as structure,
+    // which is the only shape a read hands back.
     let writer = caller("agent_a", Role::Writer, &["platform"]);
-    assert_eq!(
-        tree.service
-            .query(&writer, &Filter::default())
-            .expect("query"),
-        vec![id.clone()]
-    );
+    let read = tree
+        .service
+        .query(&writer, &Filter::default())
+        .expect("query");
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(read[0].record_id, id);
+    assert_eq!(read[0].action, doc.action);
 
     // A replay of the same record is a duplicate, not a second copy: the sidecar's retry is safe
     // end to end, not only inside the pipeline.

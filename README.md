@@ -21,6 +21,7 @@ index that makes it queryable in single-digit milliseconds.
 | **Derived index** | SQLite + FTS5, rebuildable from the tree. Delete it and run `yaam reindex`. |
 | **Crash-recoverable** | Write-ahead staging, atomic publish, a sweeper that converges. No claim of distributed atomicity. |
 | **Erasable bodies** | Per-record keys, per-subject key encryption. Deleting a subject's keys makes their record bodies permanently unreadable in every copy, including backups. |
+| **Reads return structure, never a body** | A read answers with each matching record's frontmatter — action, outcome, declared attributes, entity references, subject pseudonyms, timestamps — and never its prose. The rule does not branch on data class: a sealed body is withheld because it is a body, and a plaintext one for the same reason. Reading a body is a tree-level operation, not a request. |
 | **Idempotent** | Every write is keyed. Replays, retries and re-drives are safe. |
 | **Redacted at the source** | The writer masks, the service only checks and refuses what is still unmasked — so a record's `fields_masked` is the writer's own account. `yaam_contract::mask` is the one implementation of masking, reading the same policy file the service checks against. |
 | **Portable** | Any harness that speaks HTTP can participate; a local sidecar handles signing and sealing, for reads as well as writes, so callers hold no keys. |

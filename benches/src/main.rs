@@ -402,6 +402,13 @@ fn single_table_reads(
     targets: &Targets,
     queries: &Queries,
 ) -> Vec<Row> {
+    let mut rows = entity_reads(index, iterations, targets);
+    rows.extend(filtered_reads(index, iterations, queries));
+    rows
+}
+
+/// One entity's history, at each extent and each projection: measurement 1 and its variants.
+fn entity_reads(index: &Path, iterations: usize, targets: &Targets) -> Vec<Row> {
     let (hot_id, hot_count) = (&targets.hot.0, targets.hot.1);
     let (tail_id, tail_count) = (&targets.tail[0].1, targets.tail[0].2);
 
@@ -441,6 +448,18 @@ fn single_table_reads(
             }),
         },
         Row {
+            tag: "1s",
+            what: format!(
+                "as 1a, the busiest entity ({hot_count} records), as structure rather than ids"
+            ),
+            estimate: "—",
+            timings: measure(index, iterations / 3, |store| {
+                query::by_entity_structures(store, "order_ref", hot_id, 1.0, None, &reader())
+                    .expect("by entity")
+                    .len()
+            }),
+        },
+        Row {
             tag: "1c",
             what: format!(
                 "as 1a, the busiest entity ({hot_count} records), the unbounded verification read"
@@ -452,12 +471,28 @@ fn single_table_reads(
                     .len()
             }),
         },
+    ]
+}
+
+/// The filtered reads: measurements 2 to 4.
+fn filtered_reads(index: &Path, iterations: usize, queries: &Queries) -> Vec<Row> {
+    vec![
         Row {
             tag: "2",
             what: "one action with a failure outcome, last 7 days".to_owned(),
             estimate: "~2 ms",
             timings: measure(index, iterations, |store| {
                 query::by_filter(store, &failed_deploys(Some(queries.week)))
+                    .expect("by filter")
+                    .len()
+            }),
+        },
+        Row {
+            tag: "2s",
+            what: "as 2, returning each match's structure rather than its id".to_owned(),
+            estimate: "—",
+            timings: measure(index, iterations, |store| {
+                query::by_filter_structures(store, &failed_deploys(Some(queries.week)))
                     .expect("by filter")
                     .len()
             }),
@@ -613,8 +648,23 @@ fn plans(index: &Path, targets: &Targets, queries: &Queries) -> String {
             ),
         ),
         (
+            "1s",
+            explain::by_entity_structures(
+                &store,
+                "order_ref",
+                &targets.tail[0].1,
+                1.0,
+                None,
+                &reader(),
+            ),
+        ),
+        (
             "2",
             explain::by_filter(&store, &failed_deploys(Some(queries.week))),
+        ),
+        (
+            "2s",
+            explain::by_filter_structures(&store, &failed_deploys(Some(queries.week))),
         ),
         (
             "3",

@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use yaam_contract::{RecordId, SubjectHash};
+use yaam_contract::{RecordId, RecordStructure, SubjectHash};
 use yaam_core::bundle;
 use yaam_core::pipeline::Accepted;
 use yaam_crypto::envelope;
@@ -170,10 +170,15 @@ pub struct WriteResponse {
 }
 
 /// Answer to a read.
-#[derive(Debug, Serialize)]
+///
+/// Structure, not identifiers. A read used to answer with the ids of the records it matched, which
+/// left the caller holding names it had no way to resolve — the only endpoint that opens a record is
+/// operator-only by design. Each entry is the record's stored frontmatter and carries no body,
+/// whether that body was sealed or plaintext.
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct RecordsResponse {
     /// Matching records, newest first.
-    pub records: Vec<RecordId>,
+    pub records: Vec<RecordStructure>,
 }
 
 /// Filters for a record query.
@@ -283,13 +288,13 @@ impl BundleQuery {
 /// Context assembled for a caller.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct BundleResponse {
-    /// Records judged relevant.
-    pub records: Vec<RecordId>,
+    /// Records judged relevant, each as its stored structure and never its body.
+    pub records: Vec<RecordStructure>,
     /// `true` when a source was unavailable and the bundle is incomplete.
     pub degraded: bool,
     /// What was left out, and why.
     pub omitted: Vec<String>,
-    /// Rough token cost, advisory only.
+    /// Rough token cost of the structure being returned, advisory only.
     pub token_estimate: usize,
 }
 
@@ -700,8 +705,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_query_carries_its_filters_to_the_index() {
-        let held = vec![RecordId::generate()];
-        let fake = Arc::new(Fake::new().holding(held.clone()));
+        let held = [testing::record(WRITER)];
+        let fake = Arc::new(Fake::new().holding(&held));
         let (status, body) = serve(
             &fake,
             get(
@@ -712,7 +717,10 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["records"][0], held[0].as_str());
+        // Structure, not an identifier a caller would have to ask about again.
+        assert_eq!(body["records"][0]["record_id"], held[0].record_id.as_str());
+        assert_eq!(body["records"][0]["action"], "deploy");
+        assert!(body["records"][0].get("summary").is_none(), "{body}");
         let call = &fake.calls()[0];
         for expected in [
             "\"deploy\"",
@@ -782,7 +790,8 @@ mod tests {
 
     #[tokio::test]
     async fn entity_history_defaults_to_every_reference_and_one_page() {
-        let fake = Arc::new(Fake::new().holding(vec![RecordId::generate()]));
+        let held = [testing::record(WRITER)];
+        let fake = Arc::new(Fake::new().holding(&held));
         let (status, body) = serve(&fake, get("/entities/ticket/T-1", Some(READER))).await;
 
         assert_eq!(status, StatusCode::OK);
@@ -816,7 +825,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_bundle_reports_what_it_left_out() {
-        let fake = Arc::new(Fake::new().holding(vec![RecordId::generate()]));
+        let held = [testing::record(WRITER)];
+        let fake = Arc::new(Fake::new().holding(&held));
         let (status, body) = serve(
             &fake,
             get(

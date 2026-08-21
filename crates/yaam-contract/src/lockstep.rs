@@ -1,9 +1,15 @@
-//! The lockstep rule: three shapes, one record.
+//! The lockstep rule: four shapes, one record.
 //!
-//! The wire record, the Markdown frontmatter (`yaam-md`) and the columns of the store's record
-//! table (`yaam-store`) are projections of [`ActionRecord`]. Divergence between them is not a
-//! cosmetic problem: a frontmatter key no field feeds is a value no `yaam reindex` can recover, and
-//! a column no field feeds breaks invariant 2 outright.
+//! The wire record, the Markdown frontmatter (`yaam-md`), the columns of the store's record table
+//! (`yaam-store`) and [`RecordStructure`] — what a read hands back — are projections of
+//! [`ActionRecord`]. Divergence between them is not a cosmetic problem: a frontmatter key no field
+//! feeds is a value no `yaam reindex` can recover, and a column no field feeds breaks invariant 2
+//! outright.
+//!
+//! The read projection is the strict one. It must be the frontmatter key set exactly, and
+//! [`EXEMPTIONS`] cannot excuse a divergence there, because the read shape is the whole of "a caller
+//! receives structure and never a body": a key it dropped is structure the design promised and no
+//! caller can ask for, and a key it added is a value frontmatter does not hold.
 //!
 //! The rule used to be enforced by review, and review missed it twice — `redaction` was an object
 //! on the wire and a scalar in frontmatter, and `backfilled` was a column and a paragraph of prose
@@ -16,6 +22,7 @@
 //! the only way past the check, so adding a divergence is a visible edit to a table of reasons.
 //!
 //! [`ActionRecord`]: crate::ActionRecord
+//! [`RecordStructure`]: crate::RecordStructure
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -121,7 +128,7 @@ pub const EXEMPTIONS: &[Exemption] = &[
     },
 ];
 
-/// The three shapes, as the crates that own them enumerate them.
+/// The four shapes, as the crates that own them enumerate them.
 #[derive(Debug, Clone, Copy)]
 pub struct Shapes<'a> {
     /// Field names of the wire record.
@@ -130,6 +137,11 @@ pub struct Shapes<'a> {
     pub frontmatter: &'a [&'a str],
     /// Column names of the store's record table, generated columns included.
     pub columns: &'a [String],
+    /// Field names a read hands back, from `RecordStructure`.
+    ///
+    /// Compared against `frontmatter` alone and with no exemption available: the read projection is
+    /// the frontmatter key set or it is wrong.
+    pub read: &'a BTreeSet<String>,
 }
 
 /// One way the three shapes disagree.
@@ -144,6 +156,10 @@ pub enum Divergence {
     KeyWithoutField(String),
     /// A column with no field behind it.
     ColumnWithoutField(String),
+    /// A field a read returns that frontmatter does not carry.
+    ReadFieldWithoutKey(String),
+    /// A frontmatter key a read does not hand back.
+    KeyMissingFromRead(String),
     /// A column exempted as a projection of a field the record no longer has.
     ProjectionOfNothing {
         /// The exempted column.
@@ -183,6 +199,18 @@ impl fmt::Display for Divergence {
                 "frontmatter key `{key}` has no field on the wire record: add the field to \
                  `ActionRecord`, or drop the key — a key no field feeds holds a value no \
                  `yaam reindex` can recover"
+            ),
+            Self::ReadFieldWithoutKey(field) => write!(
+                f,
+                "`RecordStructure` returns `{field}`, which frontmatter does not carry: a read hands \
+                 back stored frontmatter, so a field with no key behind it is one no stored record \
+                 can fill — drop it, or add the key to `yaam_md::frontmatter`"
+            ),
+            Self::KeyMissingFromRead(key) => write!(
+                f,
+                "frontmatter key `{key}` is not a field of `RecordStructure`: a read returns the \
+                 record's structure, and a key it leaves out is structure the design promised and \
+                 no caller can ask for. There is deliberately no exemption for this side"
             ),
             Self::ColumnWithoutField(column) => write!(
                 f,
@@ -245,6 +273,20 @@ pub fn check_against(shapes: &Shapes<'_>, exemptions: &[Exemption]) -> Vec<Diver
     for key in &keys {
         if !shapes.wire.contains(*key) && !excused(key, Side::FrontmatterOnly) {
             found.push(Divergence::KeyWithoutField((*key).to_owned()));
+        }
+    }
+
+    // No exemption is consulted: the read projection is frontmatter exactly, so there is nothing
+    // to excuse and no entry anybody could add to excuse it.
+    for field in shapes.read {
+        if !keys.contains(field.as_str()) {
+            found.push(Divergence::ReadFieldWithoutKey(field.clone()));
+        }
+    }
+
+    for key in &keys {
+        if !shapes.read.contains(*key) {
+            found.push(Divergence::KeyMissingFromRead((*key).to_owned()));
         }
     }
 
@@ -355,8 +397,13 @@ fn describe(value: &Json) -> String {
 mod tests {
     use super::*;
 
-    /// The three shapes as they stand when nothing has drifted.
-    fn agreeing() -> (BTreeSet<String>, Vec<&'static str>, Vec<String>) {
+    /// The four shapes as they stand when nothing has drifted.
+    fn agreeing() -> (
+        BTreeSet<String>,
+        Vec<&'static str>,
+        Vec<String>,
+        BTreeSet<String>,
+    ) {
         let wire = ["record_id", "at", "action", "summary"]
             .iter()
             .map(|s| (*s).to_owned())
@@ -366,7 +413,8 @@ mod tests {
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        (wire, frontmatter, columns)
+        let read = frontmatter.iter().map(|s| (*s).to_owned()).collect();
+        (wire, frontmatter, columns, read)
     }
 
     /// The exemptions the fixture above needs, and no others.
@@ -396,12 +444,13 @@ mod tests {
 
     #[test]
     fn shapes_that_agree_report_nothing() {
-        let (wire, frontmatter, columns) = agreeing();
+        let (wire, frontmatter, columns, read) = agreeing();
         let found = check_against(
             &Shapes {
                 wire: &wire,
                 frontmatter: &frontmatter,
                 columns: &columns,
+                read: &read,
             },
             FIXTURE,
         );
@@ -411,13 +460,14 @@ mod tests {
     /// The first historical failure, in the shape it would take today.
     #[test]
     fn a_wire_field_with_no_frontmatter_key_is_named() {
-        let (mut wire, frontmatter, columns) = agreeing();
+        let (mut wire, frontmatter, columns, read) = agreeing();
         wire.insert("redaction".to_owned());
         let found = check_against(
             &Shapes {
                 wire: &wire,
                 frontmatter: &frontmatter,
                 columns: &columns,
+                read: &read,
             },
             FIXTURE,
         );
@@ -428,13 +478,17 @@ mod tests {
 
     #[test]
     fn a_frontmatter_key_with_no_field_is_named() {
-        let (wire, mut frontmatter, columns) = agreeing();
+        let (wire, mut frontmatter, columns, mut read) = agreeing();
+        // Mirrored into the read shape: what this fixture is about is the wire side, and a read
+        // projection left behind would report a second, unrelated divergence.
         frontmatter.push("redaction");
+        read.insert("redaction".to_owned());
         let found = check_against(
             &Shapes {
                 wire: &wire,
                 frontmatter: &frontmatter,
                 columns: &columns,
+                read: &read,
             },
             FIXTURE,
         );
@@ -446,13 +500,14 @@ mod tests {
     /// The second historical failure: a column, and prose about it, and nothing else.
     #[test]
     fn a_column_with_no_field_behind_it_is_named() {
-        let (wire, frontmatter, mut columns) = agreeing();
+        let (wire, frontmatter, mut columns, read) = agreeing();
         columns.push("backfilled".to_owned());
         let found = check_against(
             &Shapes {
                 wire: &wire,
                 frontmatter: &frontmatter,
                 columns: &columns,
+                read: &read,
             },
             FIXTURE,
         );
@@ -461,18 +516,104 @@ mod tests {
         assert!(message.contains("no field behind it"), "{message}");
     }
 
+    /// A read that drops a frontmatter key hands back less structure than the design promises, and
+    /// no caller has a second endpoint to ask for the rest.
     #[test]
-    fn an_exemption_pointing_at_a_renamed_field_is_reported() {
-        let (mut wire, mut frontmatter, columns) = agreeing();
-        wire.remove("at");
-        wire.insert("at_utc".to_owned());
-        frontmatter.retain(|k| *k != "at");
-        frontmatter.push("at_utc");
+    fn a_frontmatter_key_a_read_leaves_out_is_named() {
+        let (wire, frontmatter, columns, mut read) = agreeing();
+        read.remove("action");
         let found = check_against(
             &Shapes {
                 wire: &wire,
                 frontmatter: &frontmatter,
                 columns: &columns,
+                read: &read,
+            },
+            FIXTURE,
+        );
+        let message = only(&found);
+        assert!(message.contains("frontmatter key `action`"), "{message}");
+        assert!(message.contains("no exemption"), "{message}");
+    }
+
+    /// The other direction: a field with no key behind it is one no stored record can fill.
+    #[test]
+    fn a_read_field_with_no_frontmatter_key_is_named() {
+        let (wire, frontmatter, columns, mut read) = agreeing();
+        read.insert("summary".to_owned());
+        let found = check_against(
+            &Shapes {
+                wire: &wire,
+                frontmatter: &frontmatter,
+                columns: &columns,
+                read: &read,
+            },
+            FIXTURE,
+        );
+        let message = only(&found);
+        assert!(message.contains("returns `summary`"), "{message}");
+        assert!(message.contains("frontmatter does not carry"), "{message}");
+    }
+
+    /// No entry in the table can excuse the read side, whichever way it diverges.
+    #[test]
+    fn no_exemption_excuses_the_read_projection() {
+        let (wire, frontmatter, columns, mut read) = agreeing();
+        read.remove("action");
+        read.insert("summary".to_owned());
+        let excusing_everything: Vec<Exemption> = ["action", "summary"]
+            .into_iter()
+            .flat_map(|name| {
+                [
+                    Side::WireOnly,
+                    Side::FrontmatterOnly,
+                    Side::Column { from: None },
+                ]
+                .map(|side| Exemption {
+                    name,
+                    side,
+                    reason: "an exemption that must not reach the read projection",
+                })
+            })
+            .collect();
+        let found = check_against(
+            &Shapes {
+                wire: &wire,
+                frontmatter: &frontmatter,
+                columns: &columns,
+                read: &read,
+            },
+            &excusing_everything,
+        );
+        assert!(
+            found
+                .iter()
+                .any(|d| matches!(d, Divergence::KeyMissingFromRead(key) if key == "action")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|d| matches!(d, Divergence::ReadFieldWithoutKey(f) if f == "summary")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn an_exemption_pointing_at_a_renamed_field_is_reported() {
+        let (mut wire, mut frontmatter, columns, mut read) = agreeing();
+        wire.remove("at");
+        wire.insert("at_utc".to_owned());
+        frontmatter.retain(|k| *k != "at");
+        frontmatter.push("at_utc");
+        read.remove("at");
+        read.insert("at_utc".to_owned());
+        let found = check_against(
+            &Shapes {
+                wire: &wire,
+                frontmatter: &frontmatter,
+                columns: &columns,
+                read: &read,
             },
             FIXTURE,
         );
@@ -483,14 +624,16 @@ mod tests {
 
     #[test]
     fn an_exemption_nobody_needs_is_reported() {
-        let (wire, mut frontmatter, columns) = agreeing();
+        let (wire, mut frontmatter, columns, mut read) = agreeing();
         // `summary` became a frontmatter key, so its exemption has nothing left to excuse.
         frontmatter.push("summary");
+        read.insert("summary".to_owned());
         let found = check_against(
             &Shapes {
                 wire: &wire,
                 frontmatter: &frontmatter,
                 columns: &columns,
+                read: &read,
             },
             FIXTURE,
         );
@@ -501,7 +644,7 @@ mod tests {
 
     #[test]
     fn a_frontmatter_only_exemption_is_honoured_and_reclaimed() {
-        let (wire, frontmatter, columns) = agreeing();
+        let (wire, frontmatter, columns, read) = agreeing();
         let exemptions = &[Exemption {
             name: "action",
             side: Side::FrontmatterOnly,
@@ -513,6 +656,7 @@ mod tests {
                 wire: &wire,
                 frontmatter: &frontmatter,
                 columns: &columns,
+                read: &read,
             },
             exemptions,
         );
@@ -532,6 +676,7 @@ mod tests {
                 wire: &narrowed,
                 frontmatter: &frontmatter,
                 columns: &columns,
+                read: &read,
             },
             exemptions,
         );
@@ -545,11 +690,12 @@ mod tests {
     /// One table, reached one way: a second list would be the drift this module exists to catch.
     #[test]
     fn the_public_check_reads_the_declared_exemptions() {
-        let (wire, frontmatter, columns) = agreeing();
+        let (wire, frontmatter, columns, read) = agreeing();
         let shapes = Shapes {
             wire: &wire,
             frontmatter: &frontmatter,
             columns: &columns,
+            read: &read,
         };
         assert_eq!(check(&shapes), check_against(&shapes, EXEMPTIONS));
     }

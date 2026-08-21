@@ -18,7 +18,7 @@ use saphyr::{LoadableYamlNode, Mapping, Yaml};
 use tower::ServiceExt;
 use yaam_contract::request::{AGENT_HEADER, SIGNATURE_HEADER, sign};
 use yaam_contract::{
-    ActionRecord, DataClass, Outcome, RecordId, SchemaVer, SubjectHash, Visibility,
+    ActionRecord, DataClass, Outcome, RecordId, RecordStructure, SchemaVer, SubjectHash, Visibility,
 };
 use yaam_core::bundle::{self, Bundle};
 use yaam_core::erase::EraseReport;
@@ -103,7 +103,11 @@ impl Service for Fake {
         })
     }
 
-    fn query(&self, _caller: &Caller, _filter: &Filter) -> yaam_server::Result<Vec<RecordId>> {
+    fn query(
+        &self,
+        _caller: &Caller,
+        _filter: &Filter,
+    ) -> yaam_server::Result<Vec<RecordStructure>> {
         self.gate()?;
         Ok(Vec::new())
     }
@@ -115,7 +119,7 @@ impl Service for Fake {
         _id: &str,
         _min_confidence: f32,
         _limit: Option<u32>,
-    ) -> yaam_server::Result<Vec<RecordId>> {
+    ) -> yaam_server::Result<Vec<RecordStructure>> {
         self.gate()?;
         Ok(Vec::new())
     }
@@ -780,7 +784,7 @@ fn the_documented_default_row_cap_is_the_one_the_index_applies() {
     let described = node(&spec, &["components", "parameters", "limit", "description"])
         .as_str()
         .expect("the parameter is described");
-    let cap = format!("`{}`", yaam_store::query::DEFAULT_LIMIT);
+    let cap = format!("`{}`", yaam_store::query::DEFAULT_STRUCTURE_LIMIT);
     assert!(described.contains(&cap), "{described} does not name {cap}");
 }
 

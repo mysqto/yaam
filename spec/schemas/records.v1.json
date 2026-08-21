@@ -322,41 +322,21 @@
       ]
     }
   },
-  "$id": "https://github.com/mysqto/yaam/blob/main/spec/schemas/bundle.v1.json",
+  "$id": "https://github.com/mysqto/yaam/blob/main/spec/schemas/records.v1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Context assembled for a caller.",
+  "description": "Answer to a read.\n\nStructure, not identifiers. A read used to answer with the ids of the records it matched, which\nleft the caller holding names it had no way to resolve — the only endpoint that opens a record is\noperator-only by design. Each entry is the record's stored frontmatter and carries no body,\nwhether that body was sealed or plaintext.",
   "properties": {
-    "degraded": {
-      "description": "`true` when a source was unavailable and the bundle is incomplete.",
-      "type": "boolean"
-    },
-    "omitted": {
-      "description": "What was left out, and why.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
-    },
     "records": {
-      "description": "Records judged relevant, each as its stored structure and never its body.",
+      "description": "Matching records, newest first.",
       "items": {
         "$ref": "#/$defs/RecordStructure"
       },
       "type": "array"
-    },
-    "token_estimate": {
-      "description": "Rough token cost of the structure being returned, advisory only.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
     }
   },
   "required": [
-    "records",
-    "degraded",
-    "omitted",
-    "token_estimate"
+    "records"
   ],
-  "title": "BundleResponse",
+  "title": "RecordsResponse",
   "type": "object"
 }

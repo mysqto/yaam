@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use yaam_contract::entity::Registry;
-use yaam_contract::{ActionRecord, RecordId, SubjectHash};
+use yaam_contract::{ActionRecord, RecordStructure, SubjectHash};
 use yaam_core::Paths;
 use yaam_core::bundle::{self, Bundle};
 use yaam_core::erase::EraseReport;
@@ -31,7 +31,12 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
     fn write(&self, caller: &Caller, record: ActionRecord, body: &str) -> Result<Accepted>;
 
     /// Answers a filtered query.
-    fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordId>>;
+    ///
+    /// Each match comes back as its stored structure and never its body. That is the read contract
+    /// rather than this implementation's choice: an identifier on its own is answerable only by a
+    /// read this service does not offer a caller, so a read that returned one would be telling the
+    /// caller to ask a question nothing can answer.
+    fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordStructure>>;
 
     /// Answers one page of what touches one entity.
     ///
@@ -50,7 +55,7 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
         id: &str,
         min_confidence: f32,
         limit: Option<u32>,
-    ) -> Result<Vec<RecordId>>;
+    ) -> Result<Vec<RecordStructure>>;
 
     /// Composes context for a request.
     ///
@@ -197,12 +202,14 @@ impl Service for CoreService {
         Ok(self.pipeline().accept(record, body)?)
     }
 
-    fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordId>> {
+    fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordStructure>> {
         let scoped = Filter {
             scope: caller.scope(),
             ..filter.clone()
         };
-        Ok(query::by_filter(self.store()?, &scoped).map_err(yaam_core::Error::from)?)
+        // One query, widened — not this query for the ids and a second one for their structure. A
+        // follow-up read is where a scope predicate gets forgotten.
+        Ok(query::by_filter_structures(self.store()?, &scoped).map_err(yaam_core::Error::from)?)
     }
 
     fn entity(
@@ -212,9 +219,9 @@ impl Service for CoreService {
         id: &str,
         min_confidence: f32,
         limit: Option<u32>,
-    ) -> Result<Vec<RecordId>> {
+    ) -> Result<Vec<RecordStructure>> {
         let id = self.canonical(kind, id)?;
-        Ok(query::by_entity(
+        Ok(query::by_entity_structures(
             self.store()?,
             kind,
             &id,

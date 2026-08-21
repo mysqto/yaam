@@ -21,6 +21,17 @@ use yaam_store::query::Filter;
 
 use support::{BODY, KEY, Tree, caller, keyring, record, subject, subject_record};
 
+/// The identifiers a read answered with.
+///
+/// A read hands back structure, and most assertions here are about *which* records reached the
+/// caller; the ones about what a record carries read the structure itself.
+fn read_ids(records: &[yaam_contract::RecordStructure]) -> Vec<RecordId> {
+    records
+        .iter()
+        .map(|record| record.record_id.clone())
+        .collect()
+}
+
 #[test]
 fn a_record_written_through_the_service_is_queryable_bundled_and_then_erasable() {
     let tree = Tree::new();
@@ -50,17 +61,22 @@ fn a_record_written_through_the_service_is_queryable_bundled_and_then_erasable()
         action: Some("deploy".to_owned()),
         ..Filter::default()
     };
+    let queried = service.query(&writer, &filter).expect("query");
     assert_eq!(
-        service.query(&writer, &filter).expect("query"),
+        read_ids(&queried),
         vec![id.clone()],
         "the scope comes from the caller, not from the filter the request built"
     );
+    // The read is structure, taken from the record's stored frontmatter.
+    assert_eq!(queried[0], yaam_contract::RecordStructure::from(&internal));
 
     // Entity lookup.
     assert_eq!(
-        service
-            .entity(&writer, "ticket", "PROJ-42", 1.0, None)
-            .expect("entity"),
+        read_ids(
+            &service
+                .entity(&writer, "ticket", "PROJ-42", 1.0, None)
+                .expect("entity")
+        ),
         vec![id.clone()]
     );
 
@@ -72,7 +88,7 @@ fn a_record_written_through_the_service_is_queryable_bundled_and_then_erasable()
         ..bundle::Request::default()
     };
     let bundle = service.bundle(&writer, &request).expect("bundle");
-    assert_eq!(bundle.records, vec![id.clone()]);
+    assert_eq!(read_ids(&bundle.records), vec![id.clone()]);
     assert!(!bundle.degraded, "{:?}", bundle.omitted);
 
     // Erase, which needs a record whose body is sealed to a subject.
@@ -92,7 +108,7 @@ fn a_record_written_through_the_service_is_queryable_bundled_and_then_erasable()
 
     // The internal record survives the rebuild erasure runs, and the erased one keeps its
     // frontmatter — which is what the endpoint's `retained` field tells a caller.
-    let after = service.query(&writer, &Filter::default()).expect("query");
+    let after = read_ids(&service.query(&writer, &Filter::default()).expect("query"));
     assert!(after.contains(&id), "{after:?}");
     assert!(after.contains(&sealed_id), "{after:?}");
 }
@@ -161,9 +177,11 @@ fn a_read_canonicalises_its_identifier_rather_than_answering_nothing() {
     // would answer nothing — and nothing is indistinguishable from "this entity has no history",
     // which is the worst kind of wrong answer because it looks like a fact.
     assert_eq!(
-        service
-            .entity(&writer, "ticket", "  proj-42 ", 1.0, None)
-            .expect("entity"),
+        read_ids(
+            &service
+                .entity(&writer, "ticket", "  proj-42 ", 1.0, None)
+                .expect("entity")
+        ),
         vec![id.clone()]
     );
 
@@ -173,7 +191,7 @@ fn a_read_canonicalises_its_identifier_rather_than_answering_nothing() {
         ..bundle::Request::default()
     };
     assert_eq!(
-        service.bundle(&writer, &request).expect("bundle").records,
+        read_ids(&service.bundle(&writer, &request).expect("bundle").records),
         vec![id]
     );
 }
@@ -242,9 +260,11 @@ fn scoped_tree() -> (Tree, axum::Router, Vec<RecordId>) {
     (tree, app, ids)
 }
 
-/// The record ids `agent` sees from `GET /records`.
-async fn visible_to(app: &axum::Router, agent: &str) -> Vec<String> {
-    let uri = "/records";
+/// One signed read, as text: what a caller actually receives, before anything parses it.
+///
+/// Text rather than a parsed value for the tests that assert on *absence* — a field nobody looked
+/// for is a field no parsed assertion notices.
+async fn read_as(app: &axum::Router, agent: &str, uri: &str) -> String {
     let request = Request::builder()
         .method(Method::GET)
         .uri(uri)
@@ -258,16 +278,27 @@ async fn visible_to(app: &axum::Router, agent: &str) -> Vec<String> {
         .unwrap();
 
     let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK, "{uri} as {agent}");
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    String::from_utf8(bytes.to_vec()).expect("a JSON answer")
+}
+
+/// The record ids `agent` sees from `GET /records`.
+async fn visible_to(app: &axum::Router, agent: &str) -> Vec<String> {
+    let body = read_as(app, agent, "/records").await;
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
     answer["records"]
         .as_array()
         .expect("a records array")
         .iter()
-        .map(|id| id.as_str().expect("a record id").to_owned())
+        .map(|record| {
+            record["record_id"]
+                .as_str()
+                .expect("every structure names its record")
+                .to_owned()
+        })
         .collect()
 }
 
@@ -312,6 +343,100 @@ async fn a_read_returns_only_what_the_authenticated_caller_may_see() {
         operator_sees.contains(&audit.to_owned()),
         "{operator_sees:?}"
     );
+}
+
+/// Every read hands back structure, and none of them hands back a body.
+///
+/// Asserted over a record of each data class, on all three reads, against the raw answer: the point
+/// is what is *absent*, and a parsed assertion only sees fields somebody thought to look for.
+#[tokio::test]
+async fn no_read_returns_a_body_for_either_data_class() {
+    let tree = Tree::new();
+    let operator = caller("agent_ops", Role::Operator, &["platform"]);
+
+    let plain = record("agent_a", "2026-08-20T09:00:00Z");
+    tree.service
+        .write(&operator, plain.clone(), BODY)
+        .expect("written");
+    let sealed = subject_record("agent_a", "2026-08-21T09:00:00Z", &subject('a'));
+    tree.service
+        .write(&operator, sealed.clone(), BODY)
+        .expect("written");
+
+    let app = router(AppState::new(
+        Arc::new(keyring()),
+        Arc::clone(&tree.service) as Arc<dyn Service>,
+    ));
+
+    for uri in [
+        "/records",
+        "/entities/ticket/PROJ-42",
+        "/entities/order_ref/ord10014721",
+        "/bundle?entity=ticket:PROJ-42,order_ref:ord10014721",
+    ] {
+        let body = read_as(&app, "agent_b", uri).await;
+        assert!(
+            !body.contains("summary"),
+            "{uri} named the record's prose field: {body}"
+        );
+        assert!(!body.contains(BODY), "{uri} returned a body: {body}");
+        // A word only the body has, so a partial body is caught as well as a whole one.
+        assert!(BODY.contains("shards"), "the fixture body moved: {BODY}");
+        assert!(!body.contains("shards"), "{uri} returned prose: {body}");
+    }
+
+    // Both classes were in the answers above, so the assertions had something to catch. The classes
+    // are named back to the caller, which is how it knows what it is *not* being given.
+    let answer: serde_json::Value =
+        serde_json::from_str(&read_as(&app, "agent_b", "/records").await).expect("JSON");
+    let classes: Vec<&str> = answer["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .map(|record| record["data_class"].as_str().expect("a data class"))
+        .collect();
+    assert!(classes.contains(&"internal"), "{classes:?}");
+    assert!(classes.contains(&"subject_derived"), "{classes:?}");
+
+    // And the structure is the record's own, field for field.
+    let structures: Vec<yaam_contract::RecordStructure> =
+        serde_json::from_value(answer["records"].clone()).expect("structures");
+    for written in [&plain, &sealed] {
+        let found = structures
+            .iter()
+            .find(|found| found.record_id == written.record_id)
+            .expect("the record is in the answer");
+        assert_eq!(found, &yaam_contract::RecordStructure::from(written));
+    }
+}
+
+/// A caller outside a record's scope receives neither its structure nor its id.
+///
+/// The raw answer is searched for the hidden record's identifier: the read now carries structure, and
+/// a record that leaked would leak more than a name.
+#[tokio::test]
+async fn a_caller_outside_a_records_scope_receives_neither_its_structure_nor_its_id() {
+    let (_tree, app, ids) = scoped_tree();
+    // The platform team's record, the operator's own, and the audit trail: none of them is a
+    // support-team reader's to see.
+    let hidden = [ids[1].as_str(), ids[3].as_str(), ids[4].as_str()];
+
+    for uri in [
+        "/records",
+        "/entities/ticket/PROJ-42",
+        "/bundle?entity=ticket:PROJ-42",
+    ] {
+        let body = read_as(&app, "agent_b", uri).await;
+        for id in hidden {
+            assert!(
+                !body.contains(id),
+                "{uri} handed `{id}` to a caller outside its scope: {body}"
+            );
+        }
+        // Not vacuous: the records this caller may read are there.
+        assert!(body.contains(ids[0].as_str()), "{uri}: {body}");
+        assert!(body.contains(ids[2].as_str()), "{uri}: {body}");
+    }
 }
 
 #[tokio::test]

@@ -60,13 +60,17 @@ pub fn drift() -> Vec<String> {
 /// Every check in this module skips a shape the document does not mention. Without this, deleting
 /// `ActionRecord` from the document would make the comparison silent rather than loud.
 fn missing_spine(documented: &BTreeMap<String, Json>) -> Vec<String> {
-    ["ActionRecord", "WriteRequest", "EntityRef", "SubjectRef"]
-        .into_iter()
-        .filter(|name| !documented.contains_key(*name))
-        .map(|name| {
-            format!("`{name}` is no longer in `spec/memory.v1.yaml`, so nothing compares it")
-        })
-        .collect()
+    [
+        "ActionRecord",
+        "RecordStructure",
+        "WriteRequest",
+        "EntityRef",
+        "SubjectRef",
+    ]
+    .into_iter()
+    .filter(|name| !documented.contains_key(*name))
+    .map(|name| format!("`{name}` is no longer in `spec/memory.v1.yaml`, so nothing compares it"))
+    .collect()
 }
 
 /// Compares one shape, in whichever of the three forms it takes.
@@ -266,7 +270,7 @@ mod tests {
     #[test]
     fn a_document_that_stopped_naming_a_shape_is_reported() {
         let found = missing_spine(&BTreeMap::new());
-        assert_eq!(found.len(), 4, "{found:?}");
+        assert_eq!(found.len(), 5, "{found:?}");
         assert!(
             found[0].contains("`ActionRecord` is no longer"),
             "{found:?}"

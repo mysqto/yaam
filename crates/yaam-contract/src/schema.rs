@@ -9,7 +9,7 @@
 use schemars::{JsonSchema, SchemaGenerator};
 use serde_json::Value as Json;
 
-use crate::{ActionRecord, request::WriteRequest};
+use crate::{ActionRecord, request::WriteRequest, structure::RecordStructure};
 
 /// Where a vendored copy of these schemas came from, and what a `$ref` between them resolves
 /// against. Taken from the manifest so the published identity cannot drift from the repository.
@@ -102,13 +102,16 @@ fn is_link_definition(line: &str) -> bool {
 /// The schemas this crate publishes.
 ///
 /// `envelope.v1.json` is the write envelope — a record plus the prose stored as its body — and is
-/// what a caller actually sends. The record has its own file because it is also what a reader gets
-/// back and what a Markdown file holds, so an implementation may need it alone.
+/// what a caller actually sends. The record has its own file because it is also what a Markdown file
+/// holds, so an implementation may need it alone. `record-structure.v1.json` is the other half of
+/// that asymmetry: it is what a *read* hands back, which is the record without its body, and a
+/// vendoring implementation needs it alone for the same reason.
 #[must_use]
 pub fn documents() -> Vec<Document> {
     vec![
         document::<ActionRecord>("action-record.v1.json"),
         document::<WriteRequest>("envelope.v1.json"),
+        document::<RecordStructure>("record-structure.v1.json"),
     ]
 }
 
@@ -122,11 +125,31 @@ pub fn documents() -> Vec<Document> {
 /// object and the lockstep rule no longer had three shapes to compare.
 #[must_use]
 pub fn wire_fields() -> std::collections::BTreeSet<String> {
-    let schema = document::<ActionRecord>("action-record.v1.json").schema;
+    properties_of(&document::<ActionRecord>("action-record.v1.json").schema)
+}
+
+/// The field names a read hands back, read out of the generated structure schema.
+///
+/// The read side of [`crate::lockstep`], and read from the schema for the reason `wire_fields` is:
+/// the list is the thing that drifts.
+///
+/// # Panics
+/// If the generated structure schema has no `properties`.
+#[must_use]
+pub fn read_fields() -> std::collections::BTreeSet<String> {
+    properties_of(&document::<RecordStructure>("record-structure.v1.json").schema)
+}
+
+/// The property names of one generated object schema.
+///
+/// # Panics
+/// If the schema does not describe an object with properties, which would mean the shape had stopped
+/// being a record projection and the lockstep rule had nothing to compare.
+fn properties_of(schema: &Json) -> std::collections::BTreeSet<String> {
     schema
         .get("properties")
         .and_then(Json::as_object)
-        .expect("the record schema describes an object with properties")
+        .expect("a record projection describes an object with properties")
         .keys()
         .cloned()
         .collect()
@@ -327,6 +350,31 @@ mod tests {
             envelope["$defs"].get("ActionRecord").is_some(),
             "the envelope must carry the record it wraps: {envelope:#}"
         );
+    }
+
+    /// The read shape is published in its own right: an implementation returning structure needs
+    /// the shape of it, and reading it out of a bundle response's `$defs` is not a description.
+    #[test]
+    fn the_read_projection_is_published_and_carries_no_body() {
+        let schema = document::<RecordStructure>("record-structure.v1.json").schema;
+        assert_eq!(
+            schema.get("additionalProperties"),
+            Some(&Json::Bool(false)),
+            "{schema:#}"
+        );
+        assert!(schema["properties"].get("summary").is_none(), "{schema:#}");
+        for field in ["record_id", "action", "attrs", "entities", "subjects"] {
+            assert!(schema["properties"][field].is_object(), "{field}");
+        }
+    }
+
+    #[test]
+    fn read_fields_are_the_frontmatter_keys_this_crate_can_see() {
+        let read = read_fields();
+        assert!(read.contains("data_class"), "{read:?}");
+        // The one field the wire record has and a read must not.
+        assert!(!read.contains("summary"), "{read:?}");
+        assert_eq!(read.len(), wire_fields().len() - 1, "{read:?}");
     }
 
     #[test]

@@ -121,131 +121,6 @@
       "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
       "type": "string"
     },
-    "RecordStructure": {
-      "additionalProperties": false,
-      "description": "One record as a read returns it: every frontmatter key, and no body.\n\nDeserialised from the frontmatter a record was stored with rather than rebuilt from parts, so a\nread describes the record on disk and not this build's idea of it. Unknown fields are refused for\nthe reason `ActionRecord` refuses them: a stored key this type does not declare is one nothing\ndownstream reads, and passing it through would forward whatever the store happened to hold.",
-      "properties": {
-        "action": {
-          "description": "What was done.",
-          "type": "string"
-        },
-        "agent": {
-          "description": "Which agent produced this.",
-          "type": "string"
-        },
-        "agent_ver": {
-          "description": "Agent version, for attributing behaviour to a release.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "at": {
-          "description": "Source-reported time. May be skewed; never used for ordering.",
-          "type": "string"
-        },
-        "attrs": {
-          "additionalProperties": {
-            "$ref": "#/$defs/AttrValue"
-          },
-          "description": "Declared, classified attributes. Structural keys only — a sensitive one is refused on write,\nso it is not in frontmatter to be read back.",
-          "type": "object"
-        },
-        "backfilled": {
-          "description": "`true` when `received_at` came from an upstream source rather than the service's clock.",
-          "type": "boolean"
-        },
-        "correlation_id": {
-          "description": "Ties every stage of one interaction together.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "data_class": {
-          "$ref": "#/$defs/DataClass",
-          "description": "Whether the body is erasable. Reported so a caller knows what it is *not* being given."
-        },
-        "entities": {
-          "description": "Entities this record joins on.",
-          "items": {
-            "$ref": "#/$defs/EntityRef"
-          },
-          "type": "array"
-        },
-        "fields_masked": {
-          "description": "Fields the policy masked. Informational.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "outcome": {
-          "$ref": "#/$defs/Outcome",
-          "description": "How it went."
-        },
-        "received_at": {
-          "description": "Time stamped by the service. Authoritative for ordering and windowing.",
-          "type": "string"
-        },
-        "record_id": {
-          "$ref": "#/$defs/RecordId",
-          "description": "Identity the record is addressable by."
-        },
-        "redaction_policy": {
-          "description": "Redaction policy applied before the write.",
-          "type": "string"
-        },
-        "schema_ver": {
-          "$ref": "#/$defs/SchemaVer",
-          "description": "Schema version the record was written under."
-        },
-        "subjects": {
-          "description": "Data subjects named by this record, as keyed pseudonyms. Never a direct identifier.",
-          "items": {
-            "$ref": "#/$defs/SubjectRef"
-          },
-          "type": "array"
-        },
-        "tags": {
-          "description": "Free tags.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "team": {
-          "description": "Team, present when `visibility` is team-scoped.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "visibility": {
-          "$ref": "#/$defs/Visibility",
-          "description": "Read scope the record was stored under."
-        }
-      },
-      "required": [
-        "record_id",
-        "schema_ver",
-        "at",
-        "received_at",
-        "backfilled",
-        "agent",
-        "action",
-        "outcome",
-        "attrs",
-        "entities",
-        "subjects",
-        "visibility",
-        "data_class",
-        "redaction_policy",
-        "fields_masked",
-        "tags"
-      ],
-      "type": "object"
-    },
     "SchemaVer": {
       "description": "Version of the record schema a row was written under.",
       "format": "uint32",
@@ -322,41 +197,130 @@
       ]
     }
   },
-  "$id": "https://github.com/mysqto/yaam/blob/main/spec/schemas/bundle.v1.json",
+  "$id": "https://github.com/mysqto/yaam/blob/main/spec/schemas/record-structure.v1.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Context assembled for a caller.",
+  "additionalProperties": false,
+  "description": "One record as a read returns it: every frontmatter key, and no body.\n\nDeserialised from the frontmatter a record was stored with rather than rebuilt from parts, so a\nread describes the record on disk and not this build's idea of it. Unknown fields are refused for\nthe reason `ActionRecord` refuses them: a stored key this type does not declare is one nothing\ndownstream reads, and passing it through would forward whatever the store happened to hold.",
   "properties": {
-    "degraded": {
-      "description": "`true` when a source was unavailable and the bundle is incomplete.",
+    "action": {
+      "description": "What was done.",
+      "type": "string"
+    },
+    "agent": {
+      "description": "Which agent produced this.",
+      "type": "string"
+    },
+    "agent_ver": {
+      "description": "Agent version, for attributing behaviour to a release.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "at": {
+      "description": "Source-reported time. May be skewed; never used for ordering.",
+      "type": "string"
+    },
+    "attrs": {
+      "additionalProperties": {
+        "$ref": "#/$defs/AttrValue"
+      },
+      "description": "Declared, classified attributes. Structural keys only — a sensitive one is refused on write,\nso it is not in frontmatter to be read back.",
+      "type": "object"
+    },
+    "backfilled": {
+      "description": "`true` when `received_at` came from an upstream source rather than the service's clock.",
       "type": "boolean"
     },
-    "omitted": {
-      "description": "What was left out, and why.",
+    "correlation_id": {
+      "description": "Ties every stage of one interaction together.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_class": {
+      "$ref": "#/$defs/DataClass",
+      "description": "Whether the body is erasable. Reported so a caller knows what it is *not* being given."
+    },
+    "entities": {
+      "description": "Entities this record joins on.",
+      "items": {
+        "$ref": "#/$defs/EntityRef"
+      },
+      "type": "array"
+    },
+    "fields_masked": {
+      "description": "Fields the policy masked. Informational.",
       "items": {
         "type": "string"
       },
       "type": "array"
     },
-    "records": {
-      "description": "Records judged relevant, each as its stored structure and never its body.",
+    "outcome": {
+      "$ref": "#/$defs/Outcome",
+      "description": "How it went."
+    },
+    "received_at": {
+      "description": "Time stamped by the service. Authoritative for ordering and windowing.",
+      "type": "string"
+    },
+    "record_id": {
+      "$ref": "#/$defs/RecordId",
+      "description": "Identity the record is addressable by."
+    },
+    "redaction_policy": {
+      "description": "Redaction policy applied before the write.",
+      "type": "string"
+    },
+    "schema_ver": {
+      "$ref": "#/$defs/SchemaVer",
+      "description": "Schema version the record was written under."
+    },
+    "subjects": {
+      "description": "Data subjects named by this record, as keyed pseudonyms. Never a direct identifier.",
       "items": {
-        "$ref": "#/$defs/RecordStructure"
+        "$ref": "#/$defs/SubjectRef"
       },
       "type": "array"
     },
-    "token_estimate": {
-      "description": "Rough token cost of the structure being returned, advisory only.",
-      "format": "uint",
-      "minimum": 0,
-      "type": "integer"
+    "tags": {
+      "description": "Free tags.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "team": {
+      "description": "Team, present when `visibility` is team-scoped.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "visibility": {
+      "$ref": "#/$defs/Visibility",
+      "description": "Read scope the record was stored under."
     }
   },
   "required": [
-    "records",
-    "degraded",
-    "omitted",
-    "token_estimate"
+    "record_id",
+    "schema_ver",
+    "at",
+    "received_at",
+    "backfilled",
+    "agent",
+    "action",
+    "outcome",
+    "attrs",
+    "entities",
+    "subjects",
+    "visibility",
+    "data_class",
+    "redaction_policy",
+    "fields_masked",
+    "tags"
   ],
-  "title": "BundleResponse",
+  "title": "RecordStructure",
   "type": "object"
 }
