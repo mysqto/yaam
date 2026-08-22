@@ -70,6 +70,8 @@ pub async fn bind(settings: &ServerSettings) -> Result<Bound> {
         .transpose()?;
 
     let pipeline = settings.store.open()?;
+    let key_wrapping = pipeline.key_wrapping();
+    let key_protected = pipeline.key_material_protected();
     let service = Arc::new(CoreService::with_pipeline(pipeline));
     let mut state = AppState::new(Arc::clone(&keyring), Arc::clone(&service) as Arc<_>);
     if let Some((secret, _)) = &sealing {
@@ -87,6 +89,8 @@ pub async fn bind(settings: &ServerSettings) -> Result<Bound> {
         settings,
         address,
         sealing.as_ref().map(|(_, public)| *public),
+        key_wrapping,
+        key_protected,
     );
 
     Ok(Bound {
@@ -165,7 +169,13 @@ async fn maintenance_loop(
 /// Paths, the address, and whether sealed bodies can be opened. No key material: the secret half is
 /// never printed, and the public half is, because a sidecar has to be configured with it and a
 /// service that made an operator dig it out of a file is a service configured by guesswork.
-fn announce(settings: &ServerSettings, address: SocketAddr, sealing_public_key: Option<[u8; 32]>) {
+fn announce(
+    settings: &ServerSettings,
+    address: SocketAddr,
+    sealing_public_key: Option<[u8; 32]>,
+    key_wrapping: &'static str,
+    key_protected: bool,
+) {
     for (setting, value) in settings.store.describe() {
         tracing::info!(setting, %value, "configuration");
     }
@@ -187,14 +197,20 @@ fn announce(settings: &ServerSettings, address: SocketAddr, sealing_public_key: 
              body. A sidecar posting to it would spool for ever"
         );
     }
-    // Once, clearly, and not buried: this build ships no `KeyWrapper`, so every subject key under
-    // the key store is a usable key to anyone who can read the file. Right for development, and not
-    // right for anyone's data.
-    tracing::warn!(
-        "subject keys are stored unwrapped: this build ships no yaam_crypto::keystore::KeyWrapper, \
-         so a key file recovered from a snapshot, a stale volume or a decommissioned disk is a \
-         usable key. Fit a wrapper before this store holds anyone's data"
+    // Once, clearly, and not buried -- but only when it is true. Asked of the store rather than of
+    // the configuration, so a wrapper that failed to take effect still warns.
+    tracing::info!(
+        setting = "key wrapping",
+        value = key_wrapping,
+        "configuration"
     );
+    if !key_protected {
+        tracing::warn!(
+            "subject keys are stored unwrapped: no --key-passphrase-file, so a key file recovered \
+             from a snapshot, a stale volume or a decommissioned disk is a usable key. Fit a \
+             wrapper before this store holds anyone's data"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +245,7 @@ mod tests {
                     root: Some(self.dir.path().to_path_buf()),
                     index: None,
                     key_store: None,
+                    key_passphrase_file: None,
                 },
                 listen: Some(listen.to_owned()),
                 keyring: Some(self.dir.path().join("keyring.json")),

@@ -30,6 +30,9 @@ pub const ENV_ROOT: &str = "YAAM_ROOT";
 pub const ENV_INDEX: &str = "YAAM_INDEX";
 /// Environment variable naming the key store root.
 pub const ENV_KEY_STORE: &str = "YAAM_KEY_STORE";
+
+/// Environment variable naming the file that holds the key-wrapping passphrase.
+pub const ENV_KEY_PASSPHRASE_FILE: &str = "YAAM_KEY_PASSPHRASE_FILE";
 /// Environment variable naming the address the service listens on.
 pub const ENV_LISTEN: &str = "YAAM_LISTEN";
 /// Environment variable naming the keyring file.
@@ -58,6 +61,8 @@ pub struct Env {
     pub index: Option<OsString>,
     /// [`ENV_KEY_STORE`].
     pub key_store: Option<OsString>,
+    /// `YAAM_KEY_PASSPHRASE_FILE`.
+    pub key_passphrase_file: Option<OsString>,
     /// [`ENV_LISTEN`].
     pub listen: Option<OsString>,
     /// [`ENV_KEYRING`].
@@ -81,6 +86,7 @@ impl Env {
             root: std::env::var_os(ENV_ROOT),
             index: std::env::var_os(ENV_INDEX),
             key_store: std::env::var_os(ENV_KEY_STORE),
+            key_passphrase_file: std::env::var_os(ENV_KEY_PASSPHRASE_FILE),
             listen: std::env::var_os(ENV_LISTEN),
             keyring: std::env::var_os(ENV_KEYRING),
             unseal_key_file: std::env::var_os(ENV_UNSEAL_KEY),
@@ -98,6 +104,8 @@ impl Env {
 pub struct StoreSettings {
     /// The paths the pipeline will work over.
     pub paths: Paths,
+    /// Where the wrapping passphrase is read from, if key material is protected at all.
+    pub key_passphrase_file: Option<PathBuf>,
 }
 
 impl StoreSettings {
@@ -139,7 +147,14 @@ impl StoreSettings {
         if let Some(key_store) = pick(flags.key_store.as_deref(), env.key_store.as_deref()) {
             paths = paths.with_key_store(key_store);
         }
-        Ok(Self { paths })
+        let key_passphrase_file = pick(
+            flags.key_passphrase_file.as_deref(),
+            env.key_passphrase_file.as_deref(),
+        );
+        Ok(Self {
+            paths,
+            key_passphrase_file,
+        })
     }
 
     /// Opens the pipeline these settings describe.
@@ -148,6 +163,40 @@ impl StoreSettings {
     /// it — a reader that migrated would be a second writer — and the remedy is outside this process:
     /// run the build that wrote it, or delete the index and rebuild from the tree.
     pub fn open(&self) -> Result<yaam_core::Pipeline> {
+        let pipeline = self.open_unwrapped()?;
+        match &self.key_passphrase_file {
+            None => Ok(pipeline),
+            Some(path) => {
+                let wrapper = Self::wrapper(path)?;
+                pipeline
+                    .with_key_wrapper(wrapper)
+                    .map_err(|error| failed("fitting the key wrapper", &error))
+            }
+        }
+    }
+
+    /// The wrapper the configured passphrase describes.
+    ///
+    /// Trailing newlines go, because a passphrase file written by `echo` and one written by a secret
+    /// manager would otherwise derive two different keys from the same secret. Nothing else is
+    /// trimmed: interior and leading whitespace is passphrase.
+    fn wrapper(path: &Path) -> Result<yaam_crypto::wrapper::PassphraseWrapper> {
+        let read = std::fs::read(path)
+            .map_err(|e| config(format!("cannot read {}: {e}", path.display())))?;
+        let passphrase = read.strip_suffix(b"\n").unwrap_or(&read);
+        let passphrase = passphrase.strip_suffix(b"\r").unwrap_or(passphrase);
+        if passphrase.is_empty() {
+            return Err(config(format!(
+                "{} is empty: a wrapper derived from nothing protects nothing",
+                path.display()
+            )));
+        }
+        yaam_crypto::wrapper::PassphraseWrapper::new(passphrase)
+            .map_err(|error| failed("deriving the key-wrapping key", &error))
+    }
+
+    /// Opens the pipeline without fitting a wrapper.
+    fn open_unwrapped(&self) -> Result<yaam_core::Pipeline> {
         yaam_core::Pipeline::with_paths(self.paths.clone()).map_err(|error| match &error {
             yaam_core::Error::Store(yaam_store::Error::SchemaTooNew { found, supported }) => {
                 config(format!(
@@ -373,7 +422,87 @@ mod tests {
             root: root.map(Path::to_path_buf),
             index: None,
             key_store: None,
+            key_passphrase_file: None,
         }
+    }
+
+    /// Store args naming a passphrase file.
+    fn passphrase_args(root: &Path, file: &Path) -> StoreArgs {
+        StoreArgs {
+            key_passphrase_file: Some(file.to_path_buf()),
+            ..store_args(Some(root))
+        }
+    }
+
+    #[test]
+    fn a_passphrase_file_fits_a_wrapper_and_silences_the_warning() {
+        let dir = tree();
+        let file = dir.path().join("pass");
+        std::fs::write(&file, b"a passphrase\n").expect("written");
+
+        let settings = StoreSettings::resolve(&passphrase_args(dir.path(), &file), &Env::default())
+            .expect("resolved");
+        let pipeline = settings.open().expect("opened");
+        assert!(pipeline.key_material_protected());
+        assert!(pipeline.key_wrapping().contains("argon2id"));
+    }
+
+    #[test]
+    fn no_passphrase_file_leaves_key_material_in_the_clear() {
+        let dir = tree();
+        let settings = StoreSettings::resolve(&store_args(Some(dir.path())), &Env::default())
+            .expect("resolved");
+        let pipeline = settings.open().expect("opened");
+        assert!(!pipeline.key_material_protected());
+    }
+
+    #[test]
+    fn a_trailing_newline_is_not_part_of_the_passphrase() {
+        use yaam_crypto::keystore::KeyWrapper;
+
+        // `echo secret > file` and a secret manager writing the same secret must derive the same
+        // key, or a store opens under one and not the other.
+        let dir = tree();
+        let bare = dir.path().join("bare");
+        let with_newline = dir.path().join("newline");
+        let with_crlf = dir.path().join("crlf");
+        std::fs::write(&bare, b"secret").expect("written");
+        std::fs::write(&with_newline, b"secret\n").expect("written");
+        std::fs::write(&with_crlf, b"secret\r\n").expect("written");
+
+        let wrapped = |file: &Path| StoreSettings::wrapper(file).expect("derived");
+        // Same secret, so a key wrapped under one unwraps under the others.
+        let blob = wrapped(&bare).wrap(b"0123456789abcdef").expect("wrapped");
+        for file in [&with_newline, &with_crlf] {
+            assert_eq!(
+                wrapped(file).unwrap(&blob).expect("unwrapped"),
+                b"0123456789abcdef",
+                "{} derived a different key",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_passphrase_file_is_refused() {
+        let dir = tree();
+        let file = dir.path().join("empty");
+        std::fs::write(&file, b"\n").expect("written");
+
+        let settings = StoreSettings::resolve(&passphrase_args(dir.path(), &file), &Env::default())
+            .expect("resolved");
+        let err = settings.open().expect_err("must refuse");
+        assert!(format!("{err}").contains("protects nothing"), "{err}");
+    }
+
+    #[test]
+    fn a_passphrase_file_that_is_not_there_is_refused() {
+        let dir = tree();
+        let file = dir.path().join("absent");
+        let settings = StoreSettings::resolve(&passphrase_args(dir.path(), &file), &Env::default())
+            .expect("resolved");
+        let err = settings.open().expect_err("must refuse");
+        assert!(format!("{err}").contains("cannot read"), "{err}");
     }
 
     #[test]
@@ -431,6 +560,7 @@ mod tests {
             root: Some(dir.path().to_path_buf()),
             index: Some(dir.path().join("elsewhere/index.sqlite")),
             key_store: Some(dir.path().join("secrets")),
+            key_passphrase_file: None,
         };
         let settings = StoreSettings::resolve(&flags, &Env::default()).expect("resolved");
         assert_eq!(
@@ -457,6 +587,7 @@ mod tests {
             root: Some(dir.path().to_path_buf()),
             index: Some(dir.path().join("spec")),
             key_store: None,
+            key_passphrase_file: None,
         };
         let error = StoreSettings::resolve(&flags, &Env::default()).expect_err("a directory");
         assert!(error.to_string().contains("--index"), "{error}");
@@ -594,6 +725,7 @@ mod tests {
             root: Some(dir.path().to_path_buf()),
             index: Some(blocked),
             key_store: None,
+            key_passphrase_file: None,
         };
         std::fs::write(dir.path().join("spec/entities.yaml"), "version: 1\n").expect("write");
         let settings = StoreSettings::resolve(&flags, &Env::default()).expect("resolved");

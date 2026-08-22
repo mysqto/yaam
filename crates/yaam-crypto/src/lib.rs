@@ -32,6 +32,7 @@ pub mod envelope;
 pub mod error;
 pub mod keystore;
 pub mod seal;
+pub mod wrapper;
 
 pub use error::{Error, Result};
 pub use seal::{BareShare, Dek, Epoch, Nonce, SealedBody, WrappedShare};
