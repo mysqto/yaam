@@ -35,6 +35,8 @@ pub struct Plan {
     pub limits: Limits,
     /// The state directory holding the configuration and the spool.
     pub state_dir: PathBuf,
+    /// What this sidecar masks before sealing, if the deployment configures a policy.
+    pub redaction: Option<yaam_contract::mask::Policy>,
 }
 
 /// Reads the configuration and works out what to serve.
@@ -75,13 +77,36 @@ pub fn plan(settings: &AgentSettings) -> Result<Plan> {
         limits.retry_interval_ms = interval;
     }
 
-    announce(&sockets, &limits);
+    let redaction = load_redaction(configured.redaction_policy_file.as_deref())?;
+    announce(&sockets, &limits, redaction.as_ref());
     Ok(Plan {
         sockets,
         upstream,
         limits,
         state_dir: settings.state_dir.clone(),
+        redaction,
     })
+}
+
+/// Loads the redaction policy a sidecar masks with.
+///
+/// An absent path is not an error, and is warned about rather than passed over: a sidecar masking
+/// nothing is a legitimate development setup and a liability anywhere else, and the difference
+/// between "no policy configured" and "the policy is not where this build looked" is invisible from
+/// the outcome. The service makes the same distinction the same way.
+fn load_redaction(path: Option<&Path>) -> Result<Option<yaam_contract::mask::Policy>> {
+    let Some(path) = path else {
+        tracing::warn!(
+            "no redaction_policy_file configured: this sidecar masks nothing, so a caller that \
+             sends an unredacted body has its record refused by the service outright"
+        );
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| config(format!("cannot read {}: {error}", path.display())))?;
+    let policy = yaam_contract::mask::Policy::from_yaml(&text)
+        .map_err(|error| config(format!("{}: {error}", path.display())))?;
+    Ok(Some(policy))
 }
 
 /// Serves until `shutdown` completes.
@@ -94,6 +119,7 @@ where
         &plan.state_dir,
         &plan.upstream,
         plan.limits,
+        plan.redaction.clone(),
         shutdown,
     )
     .await
@@ -126,7 +152,16 @@ fn default_sockets(state_dir: &Path, configured: &Config) -> Result<Vec<CallerSo
 ///
 /// Both of a caller's sockets are named, and each says what it carries: a caller reading the log to
 /// find where to connect must not have to know the derivation rule to find its read socket.
-fn announce(sockets: &[CallerSocket], limits: &Limits) {
+fn announce(
+    sockets: &[CallerSocket],
+    limits: &Limits,
+    redaction: Option<&yaam_contract::mask::Policy>,
+) {
+    tracing::info!(
+        setting = "redaction policy",
+        value = redaction.map_or("none", yaam_contract::mask::Policy::name),
+        "configuration"
+    );
     for socket in sockets {
         tracing::info!(
             setting = "socket",

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use yaam_contract::ActionRecord;
+use yaam_contract::mask::Policy;
 use yaam_contract::request::WriteRequest;
 
 use crate::spool::Spool;
@@ -31,14 +32,53 @@ pub(crate) struct Sidecar {
     /// The pending queue. Only ever touched from a blocking thread, since its work is filesystem
     /// work and its ordering guarantee depends on one operation at a time.
     spool: Arc<Mutex<Spool>>,
+    /// What this sidecar masks before sealing. `None` masks nothing.
+    ///
+    /// Masking belongs to the writer, not the service: a service that masked would leave the caller
+    /// believing it sent what it wrote, and the record's own `fields_masked` would disagree with it.
+    /// The sidecar is the last place that is still the writer -- same host, same process tree, before
+    /// anything crosses a network -- so it is where an unredacted body stops.
+    redaction: Option<Policy>,
 }
 
 impl Sidecar {
-    /// Builds a sidecar around an upstream and its spool.
-    pub(crate) fn new(upstream: Upstream, spool: Spool) -> Self {
+    /// Builds a sidecar around an upstream, its spool and the policy it masks with.
+    ///
+    /// The policy is not optional-by-omission: `None` is a deployment that masks nothing, and making
+    /// a caller write it means nobody reaches that state by forgetting an argument.
+    pub(crate) fn new(upstream: Upstream, spool: Spool, redaction: Option<Policy>) -> Self {
         Self {
             upstream,
             spool: Arc::new(Mutex::new(spool)),
+            redaction,
+        }
+    }
+
+    /// Masks a record's prose and records what was taken out of it.
+    ///
+    /// The account is a union rather than a replacement: a caller that masked something this policy
+    /// has no pattern for still masked it, and dropping its account would make the record claim less
+    /// redaction than happened.
+    fn redact(&self, record: &mut ActionRecord) {
+        let Some(policy) = &self.redaction else {
+            return;
+        };
+        let masked = policy.mask(&record.summary);
+        if masked.fields_masked.is_empty() {
+            return;
+        }
+        // Names only. The whole point is that the value does not reach a log.
+        tracing::info!(
+            agent = %record.agent,
+            record = record.record_id.as_str(),
+            patterns = %masked.fields_masked.join(","),
+            "masked a body before sealing"
+        );
+        record.summary = masked.text;
+        for name in masked.fields_masked {
+            if !record.fields_masked.contains(&name) {
+                record.fields_masked.push(name);
+            }
         }
     }
 
@@ -52,7 +92,8 @@ impl Sidecar {
     /// posted and accepted needs no durable copy, and one the service refuses should not leave a
     /// file behind for a retry that can only fail again.
     pub(crate) async fn submit(&self, socket_agent: &str, line: &[u8]) -> crate::Result<()> {
-        let record = parse(socket_agent, line)?;
+        let mut record = parse(socket_agent, line)?;
+        self.redact(&mut record);
         // Re-serialised from the parsed record, not forwarded verbatim: what the service unseals is
         // then exactly what this sidecar validated, with no unknown fields riding along. The body
         // is left out so the service uses the record's own summary, which is the prose the caller
@@ -269,7 +310,7 @@ mod tests {
             service_public_key: public.to_vec(),
             credentials: credentials(),
         };
-        (dir, secret, Sidecar::new(upstream, spool))
+        (dir, secret, Sidecar::new(upstream, spool, None))
     }
 
     #[tokio::test]
@@ -439,6 +480,7 @@ mod tests {
                 credentials: credentials(),
             },
             spool,
+            None,
         );
 
         let err = sidecar
@@ -462,6 +504,7 @@ mod tests {
                 credentials: credentials(),
             },
             spool,
+            None,
         );
 
         assert_eq!(sidecar.flush().await.unwrap(), 1);

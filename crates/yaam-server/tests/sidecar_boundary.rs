@@ -48,6 +48,17 @@ async fn service(secret: &[u8]) -> (Tree, String) {
 
 /// A sidecar for `agent`, pointed at `base_url`, serving one socket in `state`.
 async fn sidecar(agent: &str, base_url: &str, public: &[u8], state: &Path) -> std::path::PathBuf {
+    sidecar_masking(agent, base_url, public, state, None).await
+}
+
+/// As [`sidecar`], with a redaction policy fitted.
+async fn sidecar_masking(
+    agent: &str,
+    base_url: &str,
+    public: &[u8],
+    state: &Path,
+    redaction: Option<yaam_contract::mask::Policy>,
+) -> std::path::PathBuf {
     let path = state.join(format!("{agent}.sock"));
     let upstream = Upstream {
         base_url: base_url.to_owned(),
@@ -60,7 +71,7 @@ async fn sidecar(agent: &str, base_url: &str, public: &[u8], state: &Path) -> st
     }];
     let state = state.to_path_buf();
     tokio::spawn(async move {
-        listener::serve_with(&sockets, &state, &upstream, Limits::default())
+        listener::serve_with(&sockets, &state, &upstream, Limits::default(), redaction)
             .await
             .expect("sidecar");
     });
@@ -187,6 +198,75 @@ async fn a_record_written_to_a_sidecar_reaches_the_service() {
 }
 
 #[tokio::test]
+async fn a_masking_sidecar_turns_a_rejected_body_into_an_accepted_redacted_one() {
+    // Without a policy fitted, the service refuses this body permanently and the record is simply
+    // lost: `invalid` is not retried, so a caller that forgets to redact loses its history. With one
+    // fitted the record lands, redacted, and says so in its own account.
+    let policy = yaam_contract::mask::Policy::from_yaml(
+        // The policy the deployment ships, not a fixture: a sidecar masking with different
+        // patterns than the service checks would pass this test and fail in the field.
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../spec/redaction/default.yaml"),
+        )
+        .expect("shipped policy"),
+    )
+    .expect("policy");
+
+    let (secret, public) = envelope::generate_keypair();
+    let (tree, base_url) = service(&secret).await;
+    let state = tempfile::tempdir().expect("state dir");
+    let socket = sidecar_masking("agent_a", &base_url, &public, state.path(), Some(policy)).await;
+
+    let mut doc = record("agent_a", "2026-08-20T09:00:00Z");
+    doc.summary = "deploy failed, retried with bearer aaaaaaaaaaaaaaaaaaaa".to_owned();
+    let id = doc.record_id.clone();
+    let line = format!("{}\n", serde_json::to_string(&doc).expect("serialise"));
+
+    assert_eq!(
+        submit(&socket, &line).await,
+        r#"{"status":"accepted"}"#,
+        "the service refuses an unredacted body, so acceptance means the sidecar masked it"
+    );
+    assert!(tree.holds(&id));
+
+    let writer = caller("agent_a", Role::Writer, &["platform"]);
+    let read = tree
+        .service
+        .query(&writer, &Filter::default())
+        .expect("query");
+    assert_eq!(read.len(), 1, "{read:?}");
+    // The record's own account of its redaction, which is the field a reader trusts.
+    assert!(
+        read[0].fields_masked.contains(&"bearer_token".to_owned()),
+        "{:?}",
+        read[0].fields_masked
+    );
+}
+
+#[tokio::test]
+async fn an_unredacted_body_is_still_refused_when_no_policy_is_fitted() {
+    // The other half, and the reason fitting a policy is worth the trouble: nothing masks, so the
+    // service's check is the only thing standing there and the record does not land.
+    let (secret, public) = envelope::generate_keypair();
+    let (tree, base_url) = service(&secret).await;
+    let state = tempfile::tempdir().expect("state dir");
+    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+
+    let mut doc = record("agent_a", "2026-08-20T09:00:00Z");
+    doc.summary = "deploy failed, retried with bearer aaaaaaaaaaaaaaaaaaaa".to_owned();
+    let id = doc.record_id.clone();
+    let line = format!("{}\n", serde_json::to_string(&doc).expect("serialise"));
+
+    let answer = submit(&socket, &line).await;
+    assert!(
+        answer.contains("rejected") || answer.contains("redact"),
+        "expected a refusal naming redaction, got {answer}"
+    );
+    assert!(!tree.holds(&id), "an unredacted record must not land");
+}
+
+#[tokio::test]
 async fn a_sidecar_signing_with_the_wrong_key_is_refused_rather_than_stored() {
     let (secret, public) = envelope::generate_keypair();
     let (tree, base_url) = service(&secret).await;
@@ -205,7 +285,7 @@ async fn a_sidecar_signing_with_the_wrong_key_is_refused_rather_than_stored() {
     }];
     let dir = state.path().to_path_buf();
     tokio::spawn(async move {
-        listener::serve_with(&sockets, &dir, &upstream, Limits::default())
+        listener::serve_with(&sockets, &dir, &upstream, Limits::default(), None)
             .await
             .expect("sidecar");
     });
