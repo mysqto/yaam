@@ -184,11 +184,10 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
         report.sweeper_backlog.stale_claims
     );
     let _ = writeln!(text, "quarantine depth   {}", report.quarantine_depth);
-    // Said on every health read, not only at startup: this build ships no `KeyWrapper`, so the key
-    // files under the store are usable keys to anyone who can read them.
-    text.push_str(
-        "key wrapping       none — key material is stored as written (development only)\n",
-    );
+    // Said on every health read and not only at startup, and asked of the store rather than
+    // assumed: a key file recovered from a snapshot or a decommissioned disk is a usable key if
+    // this line says none.
+    let _ = writeln!(text, "key wrapping       {}", pipeline.key_wrapping());
 
     if report.index_drift > 0 {
         let _ = writeln!(

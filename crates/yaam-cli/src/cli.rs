@@ -26,6 +26,12 @@ pub struct StoreArgs {
     /// Root of the key store. Defaults to `<root>/keystore`; also read from `YAAM_KEY_STORE`.
     #[arg(long, value_name = "PATH")]
     pub key_store: Option<PathBuf>,
+    /// File holding the passphrase that protects key material at rest. Without it, subject keys are
+    /// written in the clear. Also read from `YAAM_KEY_PASSPHRASE_FILE`.
+    ///
+    /// A file and not a value: an argument is visible in `ps` to every user on the host.
+    #[arg(long, value_name = "PATH")]
+    pub key_passphrase_file: Option<PathBuf>,
 }
 
 /// Serve the memory service.

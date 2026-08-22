@@ -65,6 +65,23 @@ pub trait KeyWrapper: Send + Sync {
     /// Failure must be an error. Key material this cannot recover is not key material that was
     /// erased, and the store keeps those two apart on the strength of this contract.
     fn unwrap(&self, wrapped: &[u8]) -> crate::Result<Vec<u8>>;
+
+    /// How this wrapper protects key material, for a health report.
+    ///
+    /// Defaulted so a deployment's own wrapper need not implement it, and never a secret: this
+    /// reaches a startup log, which is the most widely copied text a deployment produces.
+    fn scheme(&self) -> &'static str {
+        "an unnamed wrapper"
+    }
+
+    /// Whether this wrapper actually protects key material.
+    ///
+    /// Separate from [`KeyWrapper::scheme`] so a caller deciding whether to warn asks a predicate
+    /// rather than matching on prose. Defaulted to `true`, because a wrapper that protects nothing is
+    /// the exception and should have to say so.
+    fn protects(&self) -> bool {
+        true
+    }
 }
 
 /// A [`KeyWrapper`] that stores key material exactly as handed to it.
@@ -76,6 +93,14 @@ pub trait KeyWrapper: Send + Sync {
 pub struct Passthrough;
 
 impl KeyWrapper for Passthrough {
+    fn protects(&self) -> bool {
+        false
+    }
+
+    fn scheme(&self) -> &'static str {
+        "none \u{2014} key material is stored as written (development only)"
+    }
+
     fn wrap(&self, key: &[u8]) -> crate::Result<Vec<u8>> {
         Ok(key.to_vec())
     }
@@ -135,6 +160,18 @@ impl FsKeyStore {
     /// reviewer sees it.
     pub fn unwrapped(root: impl Into<PathBuf>) -> crate::Result<Self> {
         Self::new(root, Passthrough)
+    }
+
+    /// How key material in this store is protected.
+    #[must_use]
+    pub fn wrapping(&self) -> &'static str {
+        self.wrapper.scheme()
+    }
+
+    /// Whether key material in this store is protected at all.
+    #[must_use]
+    pub fn protects(&self) -> bool {
+        self.wrapper.protects()
     }
 
     /// Path of a subject's key directory, rejecting anything that could escape the root.
@@ -508,6 +545,54 @@ mod tests {
         // The whole point of the seam: the bytes at rest are not the key.
         let stored = fs::read(store.key_path(&subject, &epoch()).unwrap()).unwrap();
         assert_ne!(stored, key);
+    }
+
+    #[test]
+    fn the_real_wrapper_keeps_a_key_across_reopens_and_refuses_a_wrong_passphrase() {
+        // The contract above, proven against the wrapper a deployment actually fits rather than a
+        // test double. The double could satisfy it while the real one did not.
+        use crate::wrapper::{Cost, PassphraseWrapper};
+
+        // Cheap on purpose: real cost parameters make this a benchmark.
+        let cheap = Cost {
+            memory_kib: 32,
+            passes: 1,
+            lanes: 1,
+        };
+        let derive =
+            |pass: &[u8]| PassphraseWrapper::with_salt(pass, [3u8; 16], cheap).expect("derived");
+
+        let dir = TempDir::new().unwrap();
+        let subject = subject(0);
+        let minted = FsKeyStore::new(dir.path(), derive(b"a passphrase"))
+            .unwrap()
+            .mint(&subject, &epoch())
+            .unwrap();
+
+        // Reopened with the same passphrase: the same key, so nothing sealed under it is lost.
+        let same = FsKeyStore::new(dir.path(), derive(b"a passphrase")).unwrap();
+        assert_eq!(
+            same.get(&subject, &epoch()).unwrap().as_deref(),
+            Some(minted.as_ref())
+        );
+        assert!(same.protects(), "a passphrase wrapper protects");
+        assert!(same.wrapping().contains("argon2id"));
+
+        // Reopened with the wrong one: an error, never an absence. An absence here would report a
+        // key destroyed that is sitting on disk intact.
+        let wrong = FsKeyStore::new(dir.path(), derive(b"the wrong passphrase")).unwrap();
+        assert!(matches!(
+            wrong.get(&subject, &epoch()),
+            Err(Error::Authentication)
+        ));
+    }
+
+    #[test]
+    fn an_unwrapped_store_says_so() {
+        let dir = TempDir::new().unwrap();
+        let store = FsKeyStore::unwrapped(dir.path()).unwrap();
+        assert!(!store.protects());
+        assert!(store.wrapping().starts_with("none"));
     }
 
     #[test]

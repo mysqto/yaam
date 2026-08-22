@@ -305,6 +305,21 @@ impl Pipeline {
         &mut self.writer
     }
 
+    /// How key material in this pipeline's key store is protected.
+    ///
+    /// Reported rather than assumed: a health read that printed what the CLI intended, instead of
+    /// what the store actually has, would say "protected" for a store that is not.
+    #[must_use]
+    pub fn key_wrapping(&self) -> &'static str {
+        self.keys.wrapping()
+    }
+
+    /// Whether this pipeline's key material is protected at all.
+    #[must_use]
+    pub fn key_material_protected(&self) -> bool {
+        self.keys.protects()
+    }
+
     /// Custody of the subject keys.
     pub(crate) fn keys(&self) -> &FsKeyStore {
         &self.keys
