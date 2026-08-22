@@ -94,7 +94,7 @@ pub struct AgentArgs {
     pub retry_interval_ms: Option<u64>,
 }
 
-/// Operate a memory store: rebuild the index, erase a subject, read its health.
+/// Operate a memory store: rebuild the index, erase a subject, copy it, read its health.
 #[derive(Debug, Parser)]
 #[command(
     name = "yaam",
@@ -150,6 +150,28 @@ pub enum Command {
     ///
     /// The first command to run when something looks wrong.
     Check,
+    /// Copy the store's authoritative half into a fresh directory.
+    ///
+    /// What travels and what does not is declared by `yaam_core::backup::MANIFEST`, not by this
+    /// command. The key store is on the excluded side, and that exclusion is what makes an erasure
+    /// reach every copy instead of only the live one — so a backup that quietly picked it up would
+    /// un-erase a subject on the next restore.
+    Backup {
+        /// Directory to write the backup into. Must be absent or empty.
+        #[arg(long = "to", value_name = "PATH")]
+        to: PathBuf,
+    },
+    /// Restore a backup into this store, then rebuild the index.
+    ///
+    /// The rebuild is part of the command rather than a step to remember: restored files can be
+    /// older than the sweeper's own scan bound, and the rebuild is also what replays the restored
+    /// tombstone log so a backup cannot resurrect erased structure. Refuses a store that already
+    /// holds records — a restore is not a merge.
+    Restore {
+        /// Directory holding the backup.
+        #[arg(long = "from", value_name = "PATH")]
+        from: PathBuf,
+    },
 }
 
 #[cfg(test)]

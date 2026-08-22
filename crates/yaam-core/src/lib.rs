@@ -27,9 +27,14 @@
 //! The visible directories are the store; the dot-prefixed ones are machinery. Nothing outside
 //! `records/`, `cold/` and `tombstones.jsonl` is authoritative — the rest is either configuration
 //! or derived, which is what makes a rebuild routine rather than a recovery.
+//!
+//! Which of these a copy of the store may contain is not a property of whoever writes the copy:
+//! [`backup::MANIFEST`] declares it, and `keystore/` is on the excluded side because that is what
+//! makes [`erase`] reach every copy rather than only the live one.
 
 #![forbid(unsafe_code)]
 
+pub mod backup;
 pub mod bundle;
 pub mod erase;
 pub mod error;

@@ -78,7 +78,22 @@ yaam --root /srv/memory reindex --all               # rebuild the index from the
 yaam --root /srv/memory erase --subject s_…         # prints what it would destroy, and stops
 yaam --root /srv/memory erase --subject s_… --confirm-destroy-keys
 yaam --root /srv/memory verify-erasure --tombstone tomb-…
+yaam --root /srv/memory backup --to /srv/backups/2026-08-20   # authoritative half only
+yaam --root /restored     restore --from /srv/backups/2026-08-20
 ```
+
+A backup carries the tree, the cold manifests, the materialised timelines, the erasure log and the
+`spec/` they are read under. It carries **no key store**, no quarantine spool, no staging and no
+index: `yaam_core::backup::MANIFEST` declares the split, each exclusion with its reason, and both
+commands read that one list. The key store is the load-bearing exclusion — erasure works by
+destroying keys, so a key surviving in a backup would make a restore un-erase a subject while live
+verification still reported the erasure complete. `restore` refuses a backup that carries one, and
+refuses a store that already holds records; it rebuilds the index and replays the restored
+tombstone log as part of the same command.
+
+The key store has its own recovery path and is not part of this one. Restoring a tree without it
+gives a store that answers structure and no bodies, which is the honest outcome: bodies are
+readable only where their keys still are.
 
 Both long-running binaries shut down on `SIGINT` or `SIGTERM`: they stop accepting, finish what is
 in flight, and the sidecar removes its sockets and drains what the service will still take.

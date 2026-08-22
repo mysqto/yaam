@@ -115,11 +115,7 @@ impl StoreSettings {
     /// `spec/` is a deployment that would come up and reject every record it was sent — with the
     /// reason arriving one write at a time, at the caller, hours later.
     pub fn resolve(flags: &StoreArgs, env: &Env) -> Result<Self> {
-        let root = pick(flags.root.as_deref(), env.root.as_deref()).ok_or_else(|| {
-            config(format!(
-                "the memory tree root is not set: pass --root or set {ENV_ROOT}"
-            ))
-        })?;
+        let root = Self::root(flags, env)?;
         if !root.is_dir() {
             return Err(config(format!(
                 "--root {} is not a directory",
@@ -133,7 +129,37 @@ impl StoreSettings {
                 root.display()
             )));
         }
+        Self::paths_of(root, flags, env)
+    }
 
+    /// Resolves the settings for a restore destination.
+    ///
+    /// The one place the refusals above are wrong. A restore's destination is not a store yet: it
+    /// may not exist, and its `spec/` arrives inside the backup — so demanding one here would refuse
+    /// exactly the operation that installs it. Everything else about the destination is checked by
+    /// the restore itself, which refuses a directory already holding records.
+    pub fn resolve_destination(flags: &StoreArgs, env: &Env) -> Result<Self> {
+        let root = Self::root(flags, env)?;
+        if root.exists() && !root.is_dir() {
+            return Err(config(format!(
+                "--root {} is not a directory",
+                root.display()
+            )));
+        }
+        Self::paths_of(root, flags, env)
+    }
+
+    /// The root a flag or the environment names.
+    fn root(flags: &StoreArgs, env: &Env) -> Result<PathBuf> {
+        pick(flags.root.as_deref(), env.root.as_deref()).ok_or_else(|| {
+            config(format!(
+                "the memory tree root is not set: pass --root or set {ENV_ROOT}"
+            ))
+        })
+    }
+
+    /// The rest of the settings, once the root is settled.
+    fn paths_of(root: PathBuf, flags: &StoreArgs, env: &Env) -> Result<Self> {
         let mut paths = Paths::under(root);
         if let Some(index) = pick(flags.index.as_deref(), env.index.as_deref()) {
             if index.is_dir() {

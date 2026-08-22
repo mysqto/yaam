@@ -18,8 +18,8 @@ pub enum Exit {
     Usage,
     /// A setting is missing, unreadable, or does not say what is needed.
     Config,
-    /// The store answered, and something in it wants an operator: index drift, or a backlog nothing
-    /// is draining.
+    /// The store answered, and something in it wants an operator: index drift, a backlog nothing
+    /// is draining, or a file beside the store that no backup manifest classifies.
     Degraded,
     /// A destructive command was asked for without the flag that confirms it. Nothing was done.
     Unconfirmed,

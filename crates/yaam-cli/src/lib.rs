@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `yaam-server` | The HTTP service, plus the maintenance its store needs. |
 //! | `yaam-agent` | The local sidecar: one socket per caller, sealing and signing on their behalf. |
-//! | `yaam` | The operator command line: rebuild, erase, verify an erasure, read the health. |
+//! | `yaam` | The operator command line: rebuild, erase, verify, back up, restore, read health. |
 //!
 //! One crate, because the first two open the same store and have to agree about where it is. Three
 //! crates would be three argument parsers, and the first setting one of them spelled differently
@@ -26,9 +26,10 @@
 //! # Where the logic is
 //!
 //! Not here. Every judgement these binaries appear to make is a library call:
-//! [`yaam_core::reindex::reindex_all`], [`yaam_core::erase`], [`yaam_core::health::check`],
-//! [`yaam_agent::listener::serve_until`], [`yaam_server::routes::router`]. What is here is argument
-//! parsing, refusals that belong before anything starts, signal handling, rendering and exit codes.
+//! [`yaam_core::reindex::reindex_all`], [`yaam_core::erase`], [`yaam_core::backup`],
+//! [`yaam_core::health::check`], [`yaam_agent::listener::serve_until`],
+//! [`yaam_server::routes::router`]. What is here is argument parsing, refusals that belong before
+//! anything starts, signal handling, rendering and exit codes.
 
 #![forbid(unsafe_code)]
 
@@ -146,6 +147,14 @@ fn logging(env: &Env) {
 
 /// The operator command, once its arguments are known.
 fn run_operator(cli: &OperatorCli, env: &Env, out: &mut dyn Write) -> Result<Exit> {
+    // A restore returns before the store is opened, because its destination is not a store yet:
+    // `spec/` arrives inside the backup, and the refusal that protects every other command — a root
+    // carrying none — would refuse the very operation that installs one.
+    if let Command::Restore { from } = &cli.command {
+        let settings = StoreSettings::resolve_destination(&cli.store, env)?;
+        return ops::restore(&settings.paths, from, out);
+    }
+
     let settings = StoreSettings::resolve(&cli.store, env)?;
     let mut pipeline = settings.open()?;
     match &cli.command {
@@ -158,6 +167,8 @@ fn run_operator(cli: &OperatorCli, env: &Env, out: &mut dyn Write) -> Result<Exi
         } => ops::erase(&mut pipeline, subject, *confirm_destroy_keys, out),
         Command::VerifyErasure { tombstone } => ops::verify_erasure(&mut pipeline, tombstone, out),
         Command::Check => ops::check(&pipeline, out),
+        Command::Backup { to } => ops::backup(&pipeline, to, out),
+        Command::Restore { .. } => unreachable!("a restore returns before the store is opened"),
     }
 }
 

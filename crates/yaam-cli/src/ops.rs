@@ -1,4 +1,4 @@
-//! The four operator commands.
+//! The six operator commands.
 //!
 //! Thin on purpose: each one opens a pipeline, calls the library operation the documentation names,
 //! and renders the report. Every judgement they make — what drift is, what a backlog is, what an
@@ -13,12 +13,14 @@
 
 use std::fmt::Write as _;
 use std::io::Write;
+use std::path::Path;
 
 use yaam_contract::SubjectHash;
-use yaam_core::Pipeline;
+use yaam_core::backup::{self, BackupReport};
 use yaam_core::erase::{self, ErasePreview};
 use yaam_core::health::{self, HealthReport};
 use yaam_core::reindex;
+use yaam_core::{Paths, Pipeline};
 
 use crate::error::{Error, Result, config, failed};
 use crate::exit::Exit;
@@ -124,6 +126,54 @@ pub fn verify_erasure(
     Ok(Exit::Incomplete)
 }
 
+/// Copies the store's authoritative half into a fresh directory.
+///
+/// The exclusions are printed rather than left implicit. An operator holding a backup has to be
+/// able to see that the key store is not in it — that absence is the whole reason an erasure
+/// reaches every copy, and a report that mentioned only what was copied would read the same
+/// whether the exclusion had held or not.
+pub fn backup(pipeline: &Pipeline, to: &Path, out: &mut dyn Write) -> Result<Exit> {
+    let report =
+        backup::back_up(pipeline, to).map_err(|error| failed("writing the backup", &error))?;
+    emit(out, &describe_backup(pipeline, to, &report))?;
+    // A file beside the store that no manifest classifies is not in the backup and nobody decided
+    // that; a monitor should be able to branch on it without reading the prose.
+    if report.unclassified.is_empty() {
+        Ok(Exit::Ok)
+    } else {
+        Ok(Exit::Degraded)
+    }
+}
+
+/// Restores a backup into a store and rebuilds its index.
+///
+/// Takes paths rather than an open pipeline: the destination reads its `spec/` from the backup, so
+/// the store has to be opened after the copy rather than before it.
+pub fn restore(paths: &Paths, from: &Path, out: &mut dyn Write) -> Result<Exit> {
+    let report =
+        backup::restore(paths, from).map_err(|error| failed("restoring the backup", &error))?;
+
+    let mut text = format!(
+        "restored {} from {}\n",
+        paths.root.display(),
+        from.display()
+    );
+    line(&mut text, "files copied", report.files);
+    line(&mut text, "records indexed", report.records_indexed);
+    line(&mut text, "erasures replayed", report.erasures_replayed);
+    text.push_str(
+        "\nthe index was rebuilt as part of this restore, and the restored tombstone log was \
+         replayed over it: an erasure ordered before the backup was taken stays applied\n",
+    );
+    text.push_str(
+        "no key material was restored, because a backup carries none. Bodies are readable only \
+         where their keys still are: recover the key store from its own copy if this store is \
+         meant to read them\n",
+    );
+    emit(out, &text)?;
+    Ok(Exit::Ok)
+}
+
 /// Reads the store's health.
 ///
 /// [`Exit::Degraded`] when something wants an operator, so a monitor can branch on it without
@@ -136,6 +186,38 @@ pub fn check(pipeline: &Pipeline, out: &mut dyn Write) -> Result<Exit> {
     } else {
         Ok(Exit::Ok)
     }
+}
+
+/// A finished backup, as an operator reads it.
+fn describe_backup(pipeline: &Pipeline, to: &Path, report: &BackupReport) -> String {
+    let mut text = format!(
+        "backed up {} to {}\n",
+        pipeline.paths().root.display(),
+        to.display()
+    );
+    line(&mut text, "files", report.files);
+    let _ = writeln!(text, "  {:<20}{}", "bytes", report.bytes);
+
+    text.push_str("\nleft behind, deliberately:\n");
+    for entry in backup::excluded() {
+        let present = if report.excluded.iter().any(|name| name == entry.name) {
+            "present"
+        } else {
+            "absent"
+        };
+        let _ = writeln!(text, "  {:<20}{present}: {}", entry.name, entry.reason);
+    }
+
+    if !report.unclassified.is_empty() {
+        let _ = writeln!(
+            text,
+            "\nbeside the store, in no manifest, and NOT copied: {}. Either these belong in the \
+             manifest or they belong somewhere else — a keyring or an unsealing key kept here \
+             would have been swept into the backup by a copy that guessed.",
+            report.unclassified.join(", ")
+        );
+    }
+    text
 }
 
 /// What an erasure would reach, as an operator has to read it before confirming.
@@ -226,7 +308,7 @@ mod tests {
 
     use yaam_core::{Paths, Pipeline};
 
-    use super::{check, erase, reindex, verify_erasure};
+    use super::{backup, check, erase, reindex, restore, verify_erasure};
     use crate::exit::Exit;
     use crate::fixtures::{self, BODY};
 
@@ -247,6 +329,12 @@ mod tests {
         fn root(&self) -> &Path {
             self.dir.path()
         }
+    }
+
+    /// A backup destination outside every store, since a backup inside the tree it copies is
+    /// refused.
+    fn elsewhere() -> tempfile::TempDir {
+        tempfile::TempDir::new().expect("tempdir")
     }
 
     /// The text a command printed.
@@ -446,6 +534,118 @@ mod tests {
             printed.contains("nothing here names this subject"),
             "a mistyped pseudonym looks exactly like a subject with no records: {printed}"
         );
+    }
+
+    /// A backup names what it left behind as well as what it took, because the absence is the
+    /// property an operator has to be able to check.
+    #[test]
+    fn a_backup_reports_what_it_copied_and_what_it_deliberately_did_not() {
+        let mut tree = Tree::new();
+        tree.pipeline
+            .accept(fixtures::record("2026-08-20T09:00:00Z"), BODY)
+            .expect("accepted");
+        let held = elsewhere();
+        let into = held.path().join("backup");
+
+        let (exit, printed) = run(|out| backup(&tree.pipeline, &into, out));
+        assert_eq!(exit, Exit::Ok, "{printed}");
+        assert!(printed.contains("left behind, deliberately"), "{printed}");
+        assert!(
+            printed.contains("keystore"),
+            "the key store exclusion is the one an operator has to see: {printed}"
+        );
+        assert!(!into.join("keystore").exists());
+        assert!(into.join("records").is_dir());
+    }
+
+    /// A file beside the store is in no manifest, so it is not in the backup — and that is a
+    /// scriptable outcome rather than a line of prose.
+    #[test]
+    fn an_unclassified_file_beside_the_store_reports_degraded() {
+        let tree = Tree::new();
+        fs::write(tree.root().join("keyring.json"), "{}").expect("a file beside the store");
+
+        let held = elsewhere();
+        let (exit, printed) = run(|out| backup(&tree.pipeline, &held.path().join("backup"), out));
+        assert_eq!(exit, Exit::Degraded, "{printed}");
+        assert!(printed.contains("keyring.json"), "{printed}");
+    }
+
+    /// The restore drill, through the commands an operator would actually run.
+    #[test]
+    fn a_restore_rebuilds_the_index_and_says_the_erasure_log_was_replayed() {
+        let mut source = Tree::new();
+        let subject = fixtures::subject('e');
+        source
+            .pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &subject),
+                BODY,
+            )
+            .expect("accepted");
+        let held = elsewhere();
+        let into = held.path().join("backup");
+        let (_, printed) = run(|out| backup(&source.pipeline, &into, out));
+        assert!(printed.contains("files"), "{printed}");
+
+        // Erased after the copy was taken, which is the ordering that matters: the backup holds the
+        // sealed body and never held the key.
+        let (_, _) = run(|out| erase(&mut source.pipeline, subject.as_str(), true, out));
+
+        // A destination that is not a store yet: no `spec/` of its own, so what it reads records
+        // under has to have arrived in the backup.
+        let elsewhere = elsewhere();
+        let paths = yaam_core::Paths::under(elsewhere.path().join("restored"));
+        let (exit, printed) = run(|out| restore(&paths, &into, out));
+        assert_eq!(exit, Exit::Ok, "{printed}");
+        assert!(printed.contains("records indexed     1"), "{printed}");
+        assert!(printed.contains("stays applied"), "{printed}");
+        assert!(paths.root.join("spec/entities.yaml").is_file());
+        assert!(
+            !paths
+                .key_store
+                .join("keys")
+                .read_dir()
+                .is_ok_and(|mut held| held.next().is_some()),
+            "a restore must not have produced key material"
+        );
+
+        // The restored store answers, which is the half that files-on-disk does not prove.
+        let restored = yaam_core::Pipeline::with_paths(paths).expect("the restored store");
+        let (exit, health) = run(|out| check(&restored, out));
+        assert_eq!(
+            exit,
+            Exit::Degraded,
+            "fan-out is queued and nothing drains it here: {health}"
+        );
+        assert!(health.contains("records indexed    1"), "{health}");
+        assert!(health.contains("index drift        0"), "{health}");
+    }
+
+    /// A restore that would merge, or would put keys back, is refused.
+    #[test]
+    fn a_restore_refuses_a_store_with_records_and_a_backup_carrying_keys() {
+        let mut source = Tree::new();
+        source
+            .pipeline
+            .accept(fixtures::record("2026-08-20T09:00:00Z"), BODY)
+            .expect("accepted");
+        let held = elsewhere();
+        let into = held.path().join("backup");
+        let (_, _) = run(|out| backup(&source.pipeline, &into, out));
+
+        // Into a store that already holds records: that is a merge, and two record sets in one tree
+        // cannot be told apart afterwards.
+        let error = restore(source.pipeline.paths(), &into, &mut Vec::new()).expect_err("a merge");
+        assert_eq!(error.exit(), Exit::Failed);
+        assert!(error.to_string().contains("not a merge"), "{error}");
+
+        // And a backup somebody put a key store back into.
+        fs::create_dir_all(into.join("keystore")).expect("dir");
+        let elsewhere = elsewhere();
+        let paths = yaam_core::Paths::under(elsewhere.path().join("restored"));
+        let error = restore(&paths, &into, &mut Vec::new()).expect_err("carries keys");
+        assert!(error.to_string().contains("keystore"), "{error}");
     }
 
     #[test]
