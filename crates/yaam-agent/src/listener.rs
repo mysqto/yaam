@@ -50,6 +50,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use yaam_contract::mask::Policy;
 use yaam_contract::request::SigningKeys;
 
 use crate::proxy::ReadProxy;
@@ -136,6 +137,13 @@ pub struct Config {
     /// Entries the spool holds before it starts refusing writes.
     #[serde(default = "default_capacity")]
     pub spool_capacity: usize,
+    /// Redaction policy this sidecar masks with, as a path to the deployment's `redaction/*.yaml`.
+    ///
+    /// The same file the service checks against. Absent means this sidecar masks nothing, and a
+    /// caller that sends an unredacted body has its record refused outright -- which is what the
+    /// service already did, and why configuring this is worth the trouble.
+    #[serde(default)]
+    pub redaction_policy_file: Option<PathBuf>,
 }
 
 /// The bounds a running sidecar works within.
@@ -240,17 +248,26 @@ pub async fn serve(
     state_dir: &Path,
     upstream: &Upstream,
 ) -> crate::Result<()> {
-    serve_with(sockets, state_dir, upstream, Limits::default()).await
+    serve_with(sockets, state_dir, upstream, Limits::default(), None).await
 }
 
-/// As [`serve`], with the spool bound and retry cadence named.
+/// As [`serve`], with the spool bound, retry cadence and redaction policy named.
 pub async fn serve_with(
     sockets: &[CallerSocket],
     state_dir: &Path,
     upstream: &Upstream,
     limits: Limits,
+    redaction: Option<Policy>,
 ) -> crate::Result<()> {
-    serve_until(sockets, state_dir, upstream, limits, interrupted()).await
+    serve_until(
+        sockets,
+        state_dir,
+        upstream,
+        limits,
+        redaction,
+        interrupted(),
+    )
+    .await
 }
 
 /// Completes on `SIGINT` or `SIGTERM`.
@@ -301,6 +318,7 @@ pub async fn serve_until<S>(
     state_dir: &Path,
     upstream: &Upstream,
     limits: Limits,
+    redaction: Option<Policy>,
     shutdown: S,
 ) -> crate::Result<()>
 where
@@ -315,7 +333,7 @@ where
         }
     }
     let spool = Spool::open_with_capacity(state_dir.join(SPOOL_DIR), limits.spool_capacity)?;
-    let sidecar = Arc::new(Sidecar::new(upstream.clone(), spool));
+    let sidecar = Arc::new(Sidecar::new(upstream.clone(), spool, redaction));
     // The read path gets its own handle on the upstream and no handle on the spool at all, which is
     // what makes "a read is never spooled" a fact about the code rather than a promise about it.
     let proxy = Arc::new(ReadProxy::new(upstream.clone()));
@@ -704,7 +722,9 @@ mod tests {
         let limits = config.limits();
         let (owned, state) = (sockets.clone(), state.to_path_buf());
         let handle = tokio::spawn(async move {
-            serve_with(&owned, &state, &upstream, limits).await.unwrap();
+            serve_with(&owned, &state, &upstream, limits, None)
+                .await
+                .unwrap();
         });
         for socket in &sockets {
             await_socket(&socket.path).await;
@@ -728,7 +748,7 @@ mod tests {
         let (stop, wait) = tokio::sync::oneshot::channel::<()>();
         let (owned, state) = (sockets.to_vec(), state.to_path_buf());
         let serving = tokio::spawn(async move {
-            serve_until(&owned, &state, &upstream, config.limits(), async {
+            serve_until(&owned, &state, &upstream, config.limits(), None, async {
                 let _ = wait.await;
             })
             .await
@@ -1325,6 +1345,7 @@ mod tests {
             signing_keys: BTreeMap::from([("writer".to_owned(), "zz".to_owned())]),
             retry_interval_ms: 1,
             spool_capacity: 1,
+            redaction_policy_file: None,
         };
         assert!(config.upstream().is_err(), "a key that is not hex");
 
@@ -1366,6 +1387,7 @@ mod tests {
             signing_keys: BTreeMap::new(),
             retry_interval_ms: 1,
             spool_capacity: 1,
+            redaction_policy_file: None,
         };
         assert!(short.upstream().is_err());
 
