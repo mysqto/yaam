@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bundle;
+pub mod crash;
 pub mod erase;
 pub mod error;
 pub mod health;

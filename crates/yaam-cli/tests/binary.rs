@@ -6,66 +6,18 @@
 //!
 //! The end-to-end test is the one that would have caught this repository having no entry points at
 //! all: a record written to a caller socket, sealed by the sidecar, posted to the service, published
-//! to the tree, and then found by `yaam check`.
+//! to the tree, and then found by `yaam check`. What a *killed* process leaves behind is the other
+//! integration test in this directory.
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::SocketAddr;
-use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::process::{Child, ChildStderr, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::io::{BufRead, BufReader, Write};
 
-use yaam_contract::{
-    ActionRecord, DataClass, Outcome, RecordId, SchemaVer, Visibility, attrs,
-    entity::{self, EntityRef},
+mod support;
+
+use support::{
+    Deployment, SIGNING_KEY, Service, await_socket, record, rendered, spawn, terminate, yaam,
 };
-
-/// The signing key the test caller and the test service share, hex encoded.
-const SIGNING_KEY: &str = "0a0b0c0d0e0f";
-
-/// Prose no configured redaction pattern matches.
-const BODY: &str = "Rolled out the api service to staging across two of three shards.";
-
-/// How long any wait here is allowed to take before the test gives up.
-const PATIENCE: Duration = Duration::from_secs(30);
-
-/// A memory tree with this repository's own spec, a keyring, and a sealing key.
-struct Deployment {
-    dir: tempfile::TempDir,
-}
-
-impl Deployment {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec");
-        copy_dir(&spec, &dir.path().join("spec"));
-        std::fs::write(
-            dir.path().join("keyring.json"),
-            format!(r#"{{"callers":{{"agent_a":{{"role":"writer","key":"{SIGNING_KEY}"}}}}}}"#),
-        )
-        .expect("keyring");
-        Self { dir }
-    }
-
-    fn root(&self) -> &Path {
-        self.dir.path()
-    }
-
-    fn root_str(&self) -> &str {
-        self.root().to_str().expect("a utf-8 temporary path")
-    }
-}
-
-/// Runs `yaam` and returns what a script would see.
-fn yaam(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_yaam"))
-        .args(args)
-        .output()
-        .expect("run yaam")
-}
 
 /// Every documented code has to come out of the real process, or it is not an interface.
 #[test]
@@ -170,10 +122,7 @@ fn a_record_written_to_a_socket_reaches_the_tree_through_the_service() {
     );
 
     // In the tree, which is the authoritative half.
-    let published = deployment
-        .root()
-        .join("records/2026/08/20")
-        .join(format!("{}.md", record.record_id.as_str()));
+    let published = deployment.published(&record.record_id);
     assert!(published.is_file(), "{} is not there", published.display());
 
     // And in the index, which `check` reads: no drift means the row landed with the file.
@@ -199,214 +148,4 @@ fn a_record_written_to_a_socket_reaches_the_tree_through_the_service() {
         "a socket outliving its sidecar is a caller writing into nothing"
     );
     service.stop();
-}
-
-/// A running service, and what a sidecar needs to reach it.
-struct Service {
-    child: Child,
-    /// Held open for the life of the service: closing the read end would leave it writing every
-    /// later log line into a broken pipe.
-    _log: BufReader<ChildStderr>,
-    /// The address the kernel gave it, read from its own startup log.
-    address: SocketAddr,
-    /// The public half of its sealing key, also read from its startup log.
-    sealing_public_key: String,
-}
-
-impl Service {
-    /// Starts the service on an ephemeral port and waits until it says which one it got.
-    fn start(deployment: &Deployment) -> Self {
-        let (secret, _) = yaam_crypto::envelope::generate_keypair();
-        let key_file = deployment.root().join("unseal.key");
-        std::fs::write(&key_file, hex::encode(secret)).expect("sealing key");
-
-        let mut child = spawn(
-            env!("CARGO_BIN_EXE_yaam-server"),
-            &[
-                "--root",
-                deployment.root_str(),
-                "--listen",
-                "127.0.0.1:0",
-                "--keyring",
-                deployment
-                    .root()
-                    .join("keyring.json")
-                    .to_str()
-                    .expect("utf-8"),
-                "--unseal-key-file",
-                key_file.to_str().expect("utf-8"),
-            ],
-        );
-
-        // The startup log is where the effective configuration is published, which is also the only
-        // place the chosen port and the sealing public key exist.
-        let log = child.stderr.take().expect("stderr is piped");
-        let mut reader = BufReader::new(log);
-        let mut address = None;
-        let mut public = None;
-        let mut line = String::new();
-        while address.is_none() || public.is_none() {
-            line.clear();
-            assert!(
-                reader.read_line(&mut line).expect("read the log") > 0,
-                "the service exited before it said what it was running with"
-            );
-            if let Some(value) = setting(&line, "listen") {
-                address = Some(value.parse().expect("an address in the log"));
-            }
-            if let Some(value) = setting(&line, "sealing-public-key") {
-                public = Some(value);
-            }
-        }
-        Self {
-            child,
-            _log: reader,
-            address: address.expect("the listen line"),
-            sealing_public_key: public.expect("the sealing key line"),
-        }
-    }
-
-    /// Signals the service and asserts it came down cleanly.
-    fn stop(&mut self) {
-        terminate(&mut self.child, "yaam-server");
-    }
-}
-
-/// The value of one `setting=` field in a startup log line.
-fn setting(line: &str, name: &str) -> Option<String> {
-    if !line.contains(&format!("setting=\"{name}\"")) && !line.contains(&format!("setting={name}"))
-    {
-        return None;
-    }
-    line.split("value=")
-        .nth(1)?
-        .split_whitespace()
-        .next()
-        .map(|value| value.trim_matches('"').to_owned())
-}
-
-/// Starts a binary with its output piped, so a test can read what it says.
-fn spawn(binary: &str, args: &[&str]) -> Child {
-    Command::new(binary)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|error| panic!("spawn {binary}: {error}"))
-}
-
-/// Waits until a socket answers, then connects.
-///
-/// Connectability, not existence: a socket file exists for a moment before anybody is accepting on
-/// it, and a test that waited for the file would race the bind.
-fn await_socket(path: &Path) -> UnixStream {
-    let deadline = Instant::now() + PATIENCE;
-    while Instant::now() < deadline {
-        if let Ok(stream) = UnixStream::connect(path) {
-            return stream;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("{} never answered", path.display());
-}
-
-/// Sends `SIGTERM` and asserts the process exited cleanly.
-///
-/// `kill` rather than a signal call, because this workspace forbids unsafe and the libc wrapper would
-/// be a dependency bought for one line.
-fn terminate(child: &mut Child, name: &str) {
-    let killed = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill");
-    assert!(killed.success(), "could not signal {name}");
-
-    let deadline = Instant::now() + PATIENCE;
-    loop {
-        match child.try_wait().expect("wait") {
-            Some(status) => {
-                assert_eq!(
-                    status.code(),
-                    Some(0),
-                    "{name} did not shut down cleanly: {}",
-                    drained(child)
-                );
-                return;
-            }
-            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            None => {
-                let _ = child.kill();
-                panic!("{name} did not exit on SIGTERM");
-            }
-        }
-    }
-}
-
-/// Whatever a process left on its pipes, for a failure message.
-fn drained(child: &mut Child) -> String {
-    let mut text = String::new();
-    if let Some(err) = child.stderr.as_mut() {
-        let _ = err.read_to_string(&mut text);
-    }
-    text
-}
-
-/// A valid internal record, as a caller would write it.
-fn record() -> ActionRecord {
-    ActionRecord {
-        record_id: RecordId::generate(),
-        schema_ver: SchemaVer(1),
-        at: "2026-08-20T09:00:00Z".to_owned(),
-        received_at: "2026-08-20T09:00:00Z".to_owned(),
-        backfilled: false,
-        agent: "agent_a".to_owned(),
-        agent_ver: None,
-        correlation_id: None,
-        action: "deploy".to_owned(),
-        outcome: Outcome::Success,
-        attrs: BTreeMap::from([
-            ("service".to_owned(), attrs::Value::Text("api".to_owned())),
-            (
-                "environment".to_owned(),
-                attrs::Value::Text("staging".to_owned()),
-            ),
-        ]),
-        entities: vec![EntityRef {
-            kind: "ticket".to_owned(),
-            id: "PROJ-42".to_owned(),
-            role: entity::Role::Primary,
-            confidence: 1.0,
-        }],
-        subjects: Vec::new(),
-        visibility: Visibility::Org,
-        team: None,
-        data_class: DataClass::Internal,
-        redaction_policy: "default-v1".to_owned(),
-        fields_masked: Vec::new(),
-        tags: Vec::new(),
-        summary: BODY.to_owned(),
-    }
-}
-
-/// A record as it sits in the tree, for the drift case that needs a file with no index row.
-fn rendered(record: &ActionRecord) -> String {
-    yaam_md::Document {
-        record: record.clone(),
-        body: yaam_md::Body::Plain(BODY.to_owned()),
-    }
-    .render()
-}
-
-/// Copies a directory tree, which is how the repository's spec reaches a temporary root.
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).expect("create dir");
-    for entry in std::fs::read_dir(from).expect("read dir") {
-        let entry = entry.expect("entry");
-        let target = to.join(entry.file_name());
-        if entry.file_type().expect("file type").is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), target).expect("copy");
-        }
-    }
 }
