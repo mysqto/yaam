@@ -80,6 +80,13 @@ pub struct Request {
     pub deadline_ms: u64,
     /// What the caller this bundle is for may see. Defaults to nothing.
     pub scope: Scope,
+    /// Most records to return. `None` means [`MAX_RECORDS`], and a larger value is clamped to it.
+    ///
+    /// Applied to the source reads and not only to the result, so a caller asking for five records
+    /// does not make the store serialise a hundred structures and throw ninety-five away. That was
+    /// free while a row was a 26-byte identifier and stopped being free when a row became its
+    /// structure.
+    pub limit: Option<usize>,
 }
 
 /// Composes a bundle, degrading rather than failing when a source is slow.
@@ -94,6 +101,15 @@ pub fn compose(store: &yaam_store::Store, request: &Request) -> crate::Result<Bu
     let deadline = Instant::now() + Duration::from_millis(request.deadline_ms);
     let mut bundle = Bundle::default();
     let mut seen = HashSet::new();
+    let cap = request
+        .limit
+        .map_or(MAX_RECORDS, |asked| asked.min(MAX_RECORDS));
+    // One more than the cap, for the same reason the per-source read asks for one over its own: a
+    // source that returned exactly the cap is otherwise indistinguishable from one whose history is
+    // exactly that long, and "there is more than this" would become a guess.
+    let source_limit = u32::try_from(cap.saturating_add(1))
+        .unwrap_or(OVER_SOURCE_CAP)
+        .min(OVER_SOURCE_CAP);
 
     for (kind, id) in &request.entities {
         if Instant::now() >= deadline {
@@ -105,12 +121,12 @@ pub fn compose(store: &yaam_store::Store, request: &Request) -> crate::Result<Bu
             kind,
             id,
             MIN_CONFIDENCE,
-            Some(OVER_SOURCE_CAP),
+            Some(source_limit),
             &request.scope,
         )?;
         let source = format!("entity {kind}:{id}");
         let found = cap_source(&mut bundle, found, &source);
-        take(&mut bundle, &mut seen, found, &source);
+        take(&mut bundle, &mut seen, found, &source, cap);
     }
 
     if let Some(actor) = &request.actor {
@@ -119,14 +135,14 @@ pub fn compose(store: &yaam_store::Store, request: &Request) -> crate::Result<Bu
         } else {
             let filter = Filter {
                 agent: Some(actor.clone()),
-                limit: Some(OVER_SOURCE_CAP),
+                limit: Some(source_limit),
                 scope: request.scope.clone(),
                 ..Filter::default()
             };
             let found = query::by_filter_structures(store, &filter)?;
             let source = format!("actor {actor}");
             let found = cap_source(&mut bundle, found, &source);
-            take(&mut bundle, &mut seen, found, &source);
+            take(&mut bundle, &mut seen, found, &source, cap);
         }
     }
 
@@ -156,7 +172,7 @@ fn cap_source(
     found
 }
 
-/// Adds a source's records, up to the whole-bundle cap.
+/// Adds a source's records, up to `cap`.
 ///
 /// Duplicates are dropped rather than counted twice: two entities on the same record make it one
 /// record, and a token estimate that double-counted it would mislead the caller about the cost.
@@ -165,10 +181,11 @@ fn take(
     seen: &mut HashSet<String>,
     found: Vec<RecordStructure>,
     source: &str,
+    cap: usize,
 ) {
     let mut dropped = 0;
     for record in found {
-        if bundle.records.len() >= MAX_RECORDS {
+        if bundle.records.len() >= cap {
             dropped += 1;
             continue;
         }
@@ -179,7 +196,7 @@ fn take(
     if dropped > 0 {
         omit(
             bundle,
-            format!("{source}: {dropped} record(s) over the bundle cap of {MAX_RECORDS}"),
+            format!("{source}: {dropped} record(s) over the bundle cap of {cap}"),
         );
     }
 }
@@ -253,6 +270,7 @@ mod tests {
             actor: Some("agent_a".to_owned()),
             deadline_ms: 5_000,
             scope: Scope::Unrestricted,
+            limit: None,
         };
 
         let bundle = compose(&store, &request).expect("composed");
@@ -300,6 +318,7 @@ mod tests {
             ],
             deadline_ms: 5_000,
             scope: Scope::Unrestricted,
+            limit: None,
             ..Request::default()
         };
 
@@ -339,6 +358,7 @@ mod tests {
             entities: vec![("ticket".to_owned(), "PROJ-42".to_owned())],
             deadline_ms: 5_000,
             scope: Scope::Unrestricted,
+            limit: None,
             ..Request::default()
         };
 
@@ -357,6 +377,99 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_caps_the_bundle_and_says_what_it_left_out() {
+        let (harness, _, _) = populated_with();
+        let store = harness.pipeline.reader().expect("reader");
+        let request = Request {
+            entities: vec![("ticket".to_owned(), "PROJ-42".to_owned())],
+            actor: Some("agent_a".to_owned()),
+            deadline_ms: 5_000,
+            scope: Scope::Unrestricted,
+            limit: Some(1),
+        };
+
+        let bundle = compose(&store, &request).expect("composed");
+        assert_eq!(bundle.records.len(), 1);
+        // A short bundle must never be mistaken for a subject with no history.
+        assert!(bundle.degraded, "a capped bundle is incomplete");
+        assert!(
+            bundle
+                .omitted
+                .iter()
+                .any(|why| why.contains("bundle cap of 1")),
+            "{:?}",
+            bundle.omitted
+        );
+    }
+
+    #[test]
+    fn a_limit_of_zero_returns_nothing() {
+        let harness = populated();
+        let store = harness.pipeline.reader().expect("reader");
+        let bundle = compose(
+            &store,
+            &Request {
+                entities: vec![("ticket".to_owned(), "PROJ-42".to_owned())],
+                deadline_ms: 5_000,
+                scope: Scope::Unrestricted,
+                limit: Some(0),
+                ..Request::default()
+            },
+        )
+        .expect("composed");
+        assert!(bundle.records.is_empty());
+        assert_eq!(bundle.token_estimate, 0);
+    }
+
+    #[test]
+    fn a_limit_above_the_service_cap_is_clamped_not_refused() {
+        let harness = populated();
+        let store = harness.pipeline.reader().expect("reader");
+        let bundle = compose(
+            &store,
+            &Request {
+                entities: vec![("ticket".to_owned(), "PROJ-42".to_owned())],
+                deadline_ms: 5_000,
+                scope: Scope::Unrestricted,
+                limit: Some(MAX_RECORDS * 10),
+                ..Request::default()
+            },
+        )
+        .expect("composed");
+        assert!(bundle.records.len() <= MAX_RECORDS);
+        // Clamped, so it answers exactly as an absent limit would.
+        let unlimited = compose(
+            &store,
+            &Request {
+                entities: vec![("ticket".to_owned(), "PROJ-42".to_owned())],
+                deadline_ms: 5_000,
+                scope: Scope::Unrestricted,
+                limit: None,
+                ..Request::default()
+            },
+        )
+        .expect("composed");
+        assert_eq!(bundle.records.len(), unlimited.records.len());
+    }
+
+    #[test]
+    fn a_small_limit_narrows_the_source_read_and_not_only_the_answer() {
+        // The point of the whole change. A limit that only trimmed the result would leave the store
+        // serialising the cap and discarding the difference, which is what this used to do.
+        let mut bundle = Bundle::default();
+        let mut seen = HashSet::new();
+        let found = structures(u32::try_from(MAX_RECORDS).expect("a small cap") + 1);
+
+        take(&mut bundle, &mut seen, found, "entity ticket:PROJ-42", 3);
+        assert_eq!(
+            bundle.records.len(),
+            3,
+            "take must honour the cap it is given"
+        );
+        assert!(bundle.omitted[0].contains("bundle cap of 3"));
+    }
+
+    #[test]
     fn a_bundle_that_runs_out_of_time_says_what_it_left_out() {
         let harness = populated();
         let store = harness.pipeline.reader().expect("reader");
@@ -368,6 +481,7 @@ mod tests {
             actor: Some("agent_a".to_owned()),
             deadline_ms: 0,
             scope: Scope::Unrestricted,
+            limit: None,
         };
 
         let bundle = compose(&store, &request).expect("composed");
@@ -400,6 +514,7 @@ mod tests {
             entities: vec![("ticket".to_owned(), "PROJ-99".to_owned())],
             deadline_ms: 5_000,
             scope: Scope::Unrestricted,
+            limit: None,
             ..Request::default()
         };
         let bundle = compose(&store, &request).expect("composed");
@@ -463,7 +578,13 @@ mod tests {
         let mut seen = HashSet::new();
         let found = structures(u32::try_from(MAX_RECORDS).expect("a small cap") + 1);
 
-        take(&mut bundle, &mut seen, found, "entity ticket:PROJ-42");
+        take(
+            &mut bundle,
+            &mut seen,
+            found,
+            "entity ticket:PROJ-42",
+            MAX_RECORDS,
+        );
         assert_eq!(bundle.records.len(), MAX_RECORDS);
         assert!(bundle.degraded);
         assert_eq!(bundle.omitted.len(), 1);

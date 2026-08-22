@@ -368,6 +368,9 @@ impl Queries {
             // deadline rather than of the work.
             deadline_ms: 30_000,
             scope: reader(),
+            // Unset, so the measurement stays comparable with the figures already published: a
+            // limit would be measuring a smaller bundle, not a faster one.
+            limit: None,
         };
         Self {
             week: window(7),
