@@ -280,6 +280,11 @@ pub struct BundleQuery {
     pub actor: Option<String>,
     /// Budget for the whole composition.
     pub deadline_ms: Option<u64>,
+    /// Most records to return. Absent means the service's own cap.
+    ///
+    /// Worth setting: the caller that wants five records is charged for five rather than for the
+    /// cap, because this reaches the source reads and not merely the result.
+    pub limit: Option<u32>,
 }
 
 impl BundleQuery {
@@ -296,6 +301,8 @@ impl BundleQuery {
             entities,
             actor: self.actor,
             deadline_ms: self.deadline_ms.unwrap_or(DEFAULT_DEADLINE_MS),
+            // Clamped to the service cap by the composer, so saturating here loses nothing.
+            limit: self.limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
             ..bundle::Request::default()
         })
     }
@@ -816,6 +823,25 @@ mod tests {
         // Every *reference*, but not every row: an absent `limit` reaches the index as `None`, which
         // is its default cap and not the unbounded read.
         assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 0 None");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_passes_its_limit_through_to_the_composer() {
+        // The flag has to reach the composer, not merely parse. A limit accepted and dropped is
+        // worse than no limit: the caller is told it was honoured.
+        let fake = Arc::new(Fake::new());
+        let (status, _) = serve(
+            &fake,
+            get("/bundle?entity=ticket:T-1&limit=5", Some(READER)),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            fake.calls()[0].contains("limit: Some(5)"),
+            "the composer was called as {:?}",
+            fake.calls()[0]
+        );
     }
 
     #[tokio::test]

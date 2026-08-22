@@ -453,6 +453,7 @@ paths:
         - $ref: '#/components/parameters/entity'
         - $ref: '#/components/parameters/actor'
         - $ref: '#/components/parameters/deadline_ms'
+        - $ref: '#/components/parameters/bundle_limit'
       responses:
         '200':
           description: |
@@ -660,6 +661,29 @@ components:
         type: integer
         format: int64
       example: 1755763200000
+    bundle_limit:
+      name: limit
+      in: query
+      required: false
+      description: |
+        Most records the bundle may return. Absent means the service's own cap of `100`, and a larger
+        value is clamped to it rather than refused.
+
+        Distinct from the page size on `GET /records`, and worth setting: this reaches the source
+        reads, so a caller asking for five records is charged for five. It is not merely a trim of
+        the answer. That distinction was free while a row was a 26-byte identifier and stopped being
+        free when a row became the record's structure, at 600 to 1,500 bytes.
+
+        `0` returns no records, as it does elsewhere. A bundle capped below what its sources hold
+        reports the difference in `omitted` and sets `degraded`, so a short bundle is never confused
+        with a subject that has no history.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+        maximum: 100
+      example: 5
+
     limit:
       name: limit
       in: query
