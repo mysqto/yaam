@@ -130,12 +130,22 @@ Which callers the service authenticates, and what each may do. Never logged.
 }
 ```
 
-### What is not wrapped yet
+### Wrapping key material
 
-This build ships no `yaam_crypto::keystore::KeyWrapper`, so subject keys are stored exactly as
-written. `yaam-server` says so at startup and `yaam check` says so on every read: a key file
-recovered from a snapshot or a stale volume is a usable key. Right for development; fit a wrapper
-before the store holds anyone's data.
+`yaam_crypto::wrapper::PassphraseWrapper` derives a key-encryption key with argon2id and wraps
+subject keys with AES-256 key wrap. Fit it with `--key-passphrase-file` — a file rather than a value,
+because an argument is visible in `ps` to every user on the host.
+
+Without it the store falls back to `Passthrough` and a key file recovered from a snapshot, a stale
+volume or a decommissioned disk is a usable key. Both `yaam-server` at startup and `yaam check` on
+every read say which of the two is in force, and they ask the store rather than the configuration, so
+a wrapper that failed to take effect still warns.
+
+Every wrapped blob carries its own scheme, salt and cost. That is redundant per blob and bought
+deliberately: a wrong wrapper errors instead of handing plausible rubbish to the unwrap step, which is
+what keeps a destroyed key and an unreadable key distinguishable; passphrase plus blob is enough to
+recover, so there is no salt file to lose from the backup the key store is meant to be excluded from;
+and cost parameters recorded per blob make raising them a re-wrap at leisure rather than a flag day.
 
 ## The three shapes
 
