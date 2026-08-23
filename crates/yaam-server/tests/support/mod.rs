@@ -54,15 +54,6 @@ impl Tree {
         self.dir.path()
     }
 
-    /// The index the service writes, for the one read no route exposes.
-    ///
-    /// Full-text search lives in the query layer and no endpoint reaches it, so a test asking that
-    /// question opens the index the write path built. Derived from the same expression
-    /// [`Tree::new`] hands the service, so the two cannot drift into different files.
-    pub fn index(&self) -> PathBuf {
-        self.dir.path().join("index.sqlite")
-    }
-
     /// Whether a record's file is in the published tree.
     pub fn holds(&self, id: &RecordId) -> bool {
         walk(&self.root().join("records"))

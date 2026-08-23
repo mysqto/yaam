@@ -35,11 +35,9 @@ use yaam_contract::{
     SchemaVer, SubjectRef, Visibility, attrs,
     entity::{self, EntityRef},
 };
-use yaam_server::auth::{self, Caller, Credential, Keyring, Role};
+use yaam_server::auth::{self, Credential, Keyring, Role};
 use yaam_server::routes::{AppState, router};
 use yaam_server::service::Service;
-use yaam_store::Store;
-use yaam_store::query::{self, Scope};
 
 use support::{POLICY, Tree};
 
@@ -61,9 +59,9 @@ enum Attr {
 
 /// The callers this set authenticates, and what each may see.
 ///
-/// One table, feeding both the keyring the router verifies against and the scope a search reads
-/// with — a caller whose entitlements differed between the two would make every scope assertion
-/// here describe nothing.
+/// Entitlements reach a read from the credential the signature proved and from nowhere else, so this
+/// one table is the whole of what makes the scoped rows below assert something: change a caller's
+/// teams here and its answers change.
 const AGENTS: &[(&str, Role, &[&str])] = &[
     ("deploy_bot", Role::Writer, &["platform"]),
     ("ledger_bot", Role::Writer, &["platform"]),
@@ -282,11 +280,11 @@ enum Ask {
     Ordered(&'static str),
     /// A signed read with no promised order — a bundle merges several reads, so its row is a set.
     Unordered(&'static str),
-    /// A full-text needle, as an FTS5 expression.
+    /// A full-text needle, as an FTS5 expression, asked at `GET /search`.
     ///
-    /// Answered by the query layer over the index the write path built, because no route exposes
-    /// full text. The row still asserts on structure: the identifiers this returns are looked up in
-    /// the same caller's `GET /records` answer, which is what an operator does with them anyway.
+    /// No promised order beyond best match first, which is not an order a row can state, so a
+    /// full-text row is a set like a bundle's. It asserts at the same layer as every row above: the
+    /// needle is signed into the request target and the answer is the structure the route returned.
     Search(&'static str),
 }
 
@@ -455,6 +453,29 @@ const GOLDEN: &[Case] = &[
         finds: &["deploy_ok", "deploy_failed", "deploy_stale"],
         needs: &[Needs::Field("action", "deploy")],
     },
+    // Full text is scoped by the same predicate as every other read, and this is the pair that says
+    // so: one caller's team holds the only body naming the needle, and a caller in no team asks the
+    // same question. A search that tested visibility after matching — or not at all — would answer
+    // both rows the same way, and would be a way to read a record no other read admits.
+    Case {
+        question: "which record mentions being refused, asked from inside the team",
+        ask: Ask::Search("refused"),
+        window: None,
+        agent: "chat_bot",
+        finds: &["reply_support"],
+        needs: &[
+            Needs::Field("action", "reply"),
+            Needs::Field("visibility", "team"),
+        ],
+    },
+    Case {
+        question: "which record mentions being refused, asked by a caller in no team",
+        ask: Ask::Search("refused"),
+        window: None,
+        agent: "audit_reader",
+        finds: &[],
+        needs: &[],
+    },
     // ---- and the rows that must return nothing ----
     Case {
         question: "did any transaction succeed",
@@ -534,15 +555,6 @@ fn keyring() -> Keyring {
         .fold(Keyring::new(), |ring, (agent, role, teams)| {
             ring.with(Credential::new(*agent, *role, support::KEY).in_teams(teams.iter().copied()))
         })
-}
-
-/// One caller as the keyring would have resolved it.
-fn caller(agent: &str) -> Caller {
-    let (name, role, teams) = AGENTS
-        .iter()
-        .find(|(name, _, _)| *name == agent)
-        .expect("every case names a configured agent");
-    support::caller(name, *role, teams)
 }
 
 /// A fixture as the record an emitter would post.
@@ -690,19 +702,13 @@ fn parse_answer(raw: String) -> Answer {
     }
 }
 
-/// Asks one case's question, and returns the answer plus the records the *question* selected.
+/// Asks one case's question, and returns the answer.
 ///
-/// The two differ only for a full-text case: search answers with identifiers, so the structures come
-/// from the same caller's unfiltered read and the answer as a whole is what the absence checks run
-/// over.
-async fn ask(case: &Case, app: &axum::Router, store: &Store) -> (Answer, Vec<RecordStructure>) {
-    match case.ask {
-        Ask::Ordered(uri) | Ask::Unordered(uri) => {
-            let answer =
-                parse_answer(send(app, Method::GET, &target(case, uri), case.agent, b"").await);
-            let selected = answer.records.clone();
-            (answer, selected)
-        }
+/// One read per row, whichever endpoint answers it: what the question selected is what came back,
+/// so nothing here can assert about rows a request did not return.
+async fn ask(case: &Case, app: &axum::Router) -> Answer {
+    let uri = match case.ask {
+        Ask::Ordered(uri) | Ask::Unordered(uri) => target(case, uri),
         Ask::Search(needle) => {
             // Full text takes no window, so a row that named one would have it quietly dropped.
             assert!(
@@ -710,28 +716,10 @@ async fn ask(case: &Case, app: &axum::Router, store: &Store) -> (Answer, Vec<Rec
                 "`{}` names a window a full-text read cannot apply",
                 case.question
             );
-            let found = query::search(store, needle, SEARCH_LIMIT, &scope_of(case.agent))
-                .expect("a well-formed needle");
-            let answer = parse_answer(send(app, Method::GET, "/records", case.agent, b"").await);
-            let selected: Vec<RecordStructure> = answer
-                .records
-                .iter()
-                .filter(|record| found.contains(&record.record_id))
-                .cloned()
-                .collect();
-            assert_eq!(
-                found.len(),
-                selected.len(),
-                "`{needle}` matched records the same caller cannot read back: {found:?}"
-            );
-            (answer, selected)
+            format!("/search?q={needle}&limit={SEARCH_LIMIT}")
         }
-    }
-}
-
-/// The scope a caller reads with, taken from its credential rather than from the case.
-fn scope_of(agent: &str) -> Scope {
-    caller(agent).scope()
+    };
+    parse_answer(send(app, Method::GET, &uri, case.agent, b"").await)
 }
 
 /// A case's request target, with its window filled in.
@@ -839,11 +827,11 @@ async fn every_golden_query_finds_exactly_the_records_its_question_needs() {
         Arc::clone(&tree.service) as Arc<dyn Service>,
     ));
     let written = write_fixtures(&app).await;
-    let store = Store::open_read(&tree.index()).expect("the index the write path built");
 
     for case in GOLDEN {
         let question = case.question;
-        let (answer, selected) = ask(case, &app, &store).await;
+        let answer = ask(case, &app).await;
+        let selected = answer.records.clone();
         let found = labels(&selected, &written);
 
         // The exact set, so a positive case is also a check that nothing else came back. Order is

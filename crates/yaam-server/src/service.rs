@@ -38,6 +38,25 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
     /// caller to ask a question nothing can answer.
     fn query(&self, caller: &Caller, filter: &Filter) -> Result<Vec<RecordStructure>>;
 
+    /// Answers which records mention something, over their bodies.
+    ///
+    /// The needle reads the prose and the answer does not carry it: each match comes back as its
+    /// stored structure, exactly as on every other read. The asymmetry is the whole endpoint — a
+    /// caller may ask which record mentions a word without being handed the words back.
+    ///
+    /// `limit` is the page size, `None` meaning the index's own default cap.
+    ///
+    /// An implementation must narrow the match to [`Caller::scope`], and narrow it *inside* the
+    /// query. A search that tested visibility after matching would have read the rows first, which
+    /// is what the predicate exists to prevent; a search that did not test it at all would be a way
+    /// to read records no other read admits, which is worse than having no search.
+    fn search(
+        &self,
+        caller: &Caller,
+        needle: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<RecordStructure>>;
+
     /// Answers one page of what touches one entity.
     ///
     /// An implementation must canonicalise `kind` and `id` the way the write path does before
@@ -212,6 +231,17 @@ impl Service for CoreService {
         Ok(query::by_filter_structures(self.store()?, &scoped).map_err(yaam_core::Error::from)?)
     }
 
+    fn search(
+        &self,
+        caller: &Caller,
+        needle: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<RecordStructure>> {
+        // The scope goes into the match's own statement, and the request carries no way to name one.
+        query::search_structures(self.store()?, needle, limit, &caller.scope())
+            .map_err(read_failure)
+    }
+
     fn entity(
         &self,
         caller: &Caller,
@@ -250,6 +280,20 @@ impl Service for CoreService {
             &mut self.pipeline(),
             subject,
         )?)
+    }
+}
+
+/// An index failure as the status it deserves.
+///
+/// Exactly one store failure is the caller's own, and only the full-text read can provoke it: a
+/// needle the match syntax will not take. Prefix and phrase syntax reaches the caller, so a mistake
+/// in it is a mistake in the request, and answering it as this service's fault would have the caller
+/// retry a needle that can never parse. Everything else keeps the `500` that tells a caller to stop
+/// retrying and raise it, which is what the other reads map to directly.
+fn read_failure(error: yaam_store::Error) -> Error {
+    match &error {
+        yaam_store::Error::BadNeedle { .. } => Error::Unprocessable(error.to_string()),
+        _ => Error::Core(error.into()),
     }
 }
 

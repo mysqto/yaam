@@ -139,6 +139,16 @@ impl Service for Fake {
         Ok(self.records.clone())
     }
 
+    fn search(
+        &self,
+        caller: &Caller,
+        needle: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<RecordStructure>> {
+        self.called(format!("search {} {needle} {limit:?}", caller.agent))?;
+        Ok(self.records.clone())
+    }
+
     fn entity(
         &self,
         caller: &Caller,

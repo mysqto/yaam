@@ -126,6 +126,7 @@ impl AppState {
 /// |---|---|
 /// | `POST /records` | Write a record. Idempotent on its identifier. |
 /// | `GET /records` | Filtered query. |
+/// | `GET /search` | Which records mention something. Full text over bodies, structure back. |
 /// | `GET /entities/{kind}/{id}` | One page of an entity's history, newest first. |
 /// | `GET /bundle` | Compose context for a request. |
 /// | `POST /erase` | Destroy a subject's keys. Operator only, and rebuilds the index. |
@@ -141,6 +142,7 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/records", post(write_record).get(query_records))
+        .route("/search", get(search_records))
         .route("/entities/{kind}/{id}", get(entity_records))
         .route("/bundle", get(compose_bundle))
         .route("/erase", post(erase_subject))
@@ -256,6 +258,19 @@ impl RecordQuery {
             ..Filter::default()
         })
     }
+}
+
+/// What a full-text read is looking for.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchQuery {
+    /// The needle, as a full-text match expression. Required: there is no spelling of "search for
+    /// nothing" that a caller means, and defaulting one would answer a question nobody asked.
+    pub q: String,
+    /// Page size. Absent means the index's default cap, not every match — the same rule the
+    /// filtered query follows, and it bites harder here: the matches examined are a multiple of
+    /// this, so a page size is what bounds the work as well as the answer.
+    pub limit: Option<u32>,
 }
 
 /// Options for entity history.
@@ -427,6 +442,20 @@ async fn query_records(
     let filter = params.into_filter()?;
     let service = state.service();
     let records = blocking(move || service.query(&caller, &filter)).await?;
+    Ok(Json(RecordsResponse::new(records)))
+}
+
+/// Answers which records mention something.
+///
+/// The needle is the caller's and the answer is structure: this is a read like the others, and the
+/// prose it matched on is no more returnable here than anywhere else.
+async fn search_records(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Query(params): Query<SearchQuery>,
+) -> Result<Json<RecordsResponse>> {
+    let service = state.service();
+    let records = blocking(move || service.search(&caller, &params.q, params.limit)).await?;
     Ok(Json(RecordsResponse::new(records)))
 }
 
@@ -704,6 +733,7 @@ mod tests {
             // The one people assume is public. Visibility is per caller, so a read has to know who
             // is asking as much as a write does.
             get("/records", None),
+            get("/search?q=shards", None),
             get("/entities/ticket/T-1", None),
             get("/bundle", None),
             post("/erase", None, "{}"),
@@ -757,6 +787,45 @@ mod tests {
         ] {
             assert!(call.contains(expected), "{expected} missing from {call}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_search_carries_its_needle_and_page_size_to_the_index() {
+        let held = [testing::record(WRITER)];
+        let fake = Arc::new(Fake::new().holding(&held));
+        let (status, body) = serve(&fake, get("/search?q=shards&limit=5", Some(READER))).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fake.calls()[0], "search agent-reader shards Some(5)");
+        // Structure, like every other read: the needle reached the prose and the answer does not
+        // carry it.
+        assert_eq!(body["records"][0]["record_id"], held[0].record_id.as_str());
+        assert!(body["records"][0].get("summary").is_none(), "{body}");
+        assert!(!body.to_string().contains("rolled out"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_search_that_names_no_page_size_leaves_the_cap_to_the_index() {
+        // `None` rather than a number chosen here: the default page size is a property of what a row
+        // costs, and the index is where that is decided for every read.
+        let fake = Arc::new(Fake::new());
+        let (status, _) = serve(&fake, get("/search?q=shards", Some(READER))).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fake.calls()[0], "search agent-reader shards None");
+    }
+
+    #[tokio::test]
+    async fn a_search_with_no_needle_is_refused_rather_than_answered() {
+        // A search for nothing is not a search for everything. Absent is refused before a handler
+        // runs, like any unparseable query string.
+        let fake = Arc::new(Fake::new());
+        let (status, _) = serve(&fake, get("/search", Some(READER))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = serve(&fake, get("/search?q=shards&needle=x", Some(READER))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(fake.calls().is_empty());
     }
 
     #[tokio::test]

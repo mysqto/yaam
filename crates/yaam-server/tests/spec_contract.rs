@@ -51,11 +51,12 @@ enum Mode {
     Duplicate,
     /// A write is held pending subject resolution.
     Quarantined,
-    /// The read names something this deployment cannot canonicalise.
+    /// The read names something this deployment cannot answer as it was spelled — an entity
+    /// identifier it cannot canonicalise, or a needle the match syntax will not parse.
     ///
-    /// A mode rather than a real registry: canonicalisation belongs to the service, so what this
-    /// file can check is that the router reports it as the document says. That it *is* refused, over
-    /// the repository's own `spec/entities.yaml`, is `end_to_end.rs`'s job.
+    /// A mode rather than a real registry or a real index: both belong to the service, so what this
+    /// file can check is that the router reports them as the document says. That they *are* refused,
+    /// over the repository's own `spec/entities.yaml` and a real index, is `end_to_end.rs`'s job.
     Unaskable,
     /// Everything is transiently unavailable.
     Unavailable,
@@ -107,6 +108,16 @@ impl Service for Fake {
         &self,
         _caller: &Caller,
         _filter: &Filter,
+    ) -> yaam_server::Result<Vec<RecordStructure>> {
+        self.gate()?;
+        Ok(Vec::new())
+    }
+
+    fn search(
+        &self,
+        _caller: &Caller,
+        _needle: &str,
+        _limit: Option<u32>,
     ) -> yaam_server::Result<Vec<RecordStructure>> {
         self.gate()?;
         Ok(Vec::new())
@@ -248,6 +259,7 @@ fn case(
 fn cases() -> Vec<Case> {
     let mut all = write_cases();
     all.extend(query_cases());
+    all.extend(search_cases());
     all.extend(entity_cases());
     all.extend(bundle_cases());
     all.extend(erase_cases());
@@ -377,6 +389,28 @@ fn query_cases() -> Vec<Case> {
         ),
         case("GET", path, path, Some(READER), "", Mode::Internal),
         case("GET", path, path, Some(READER), "", Mode::Unavailable),
+    ]
+}
+
+fn search_cases() -> Vec<Case> {
+    let path = "/search";
+    let uri = "/search?q=shards";
+    vec![
+        case("GET", path, uri, Some(READER), "", Mode::Stored),
+        // A needle nobody understood must not widen into a search for everything, and one the match
+        // syntax refuses is the caller's to fix.
+        case(
+            "GET",
+            path,
+            "/search?nonsense=1",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case("GET", path, uri, None, "", Mode::Stored),
+        case("GET", path, uri, Some(READER), "", Mode::Unaskable),
+        case("GET", path, uri, Some(READER), "", Mode::Internal),
+        case("GET", path, uri, Some(READER), "", Mode::Unavailable),
     ]
 }
 
@@ -739,6 +773,7 @@ async fn the_documented_query_parameters_are_the_ones_each_endpoint_accepts() {
     // against the handler's field names rather than against a second list kept here.
     let probes = [
         ("/records", "get", "/records?nonsense=1"),
+        ("/search", "get", "/search?nonsense=1"),
         (
             "/entities/{kind}/{id}",
             "get",
@@ -786,6 +821,27 @@ fn the_documented_default_row_cap_is_the_one_the_index_applies() {
         .expect("the parameter is described");
     let cap = format!("`{}`", yaam_store::query::DEFAULT_STRUCTURE_LIMIT);
     assert!(described.contains(&cap), "{described} does not name {cap}");
+}
+
+#[test]
+fn the_documented_full_text_ceiling_is_the_one_the_index_applies() {
+    // The whole of what a client has to know about a full-text page is that it can come back short,
+    // and the document says how short in numbers. A drifted multiple is a client that reads an empty
+    // page as "nothing matched" when the answer was "not within the cap".
+    let spec = spec();
+    let described = node(&spec, &["paths", "/search", "get", "description"])
+        .as_str()
+        .expect("the endpoint is described");
+    for named in [
+        yaam_store::query::SCOPE_HEADROOM,
+        yaam_store::query::MAX_CANDIDATES,
+    ] {
+        let literal = format!("`{named}`");
+        assert!(
+            described.contains(&literal),
+            "the search description does not name {literal}: {described}"
+        );
+    }
 }
 
 #[test]

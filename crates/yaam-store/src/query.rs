@@ -49,6 +49,12 @@ pub const SCOPE_HEADROOM: u32 = 20;
 /// prevent.
 pub const MAX_CANDIDATES: u32 = 5_000;
 
+/// How the full-text extension names itself in the messages it writes.
+///
+/// Dropped from what [`refused_needle`] reports, because the caller is being told what is wrong with
+/// its needle and the name of the index extension is not part of that.
+const FTS_PREFIX: &str = "fts5:";
+
 /// The predicate for a read that may return nothing.
 ///
 /// A predicate rather than an early return, so a scope that admits no record takes the same path as
@@ -246,8 +252,19 @@ impl Select {
 fn run_ids(store: &crate::Store, sql: &str, binds: Vec<SqlValue>) -> crate::Result<Vec<RecordId>> {
     let lease = store.lease()?;
     let mut stmt = lease.prepare(sql)?;
-    let rows = stmt.query_map(params_from_iter(binds), one_id)?;
-    collect(rows)
+    ids_of(&mut stmt, binds)
+}
+
+/// Steps a prepared statement whose one column is a record id.
+///
+/// Split from preparing it for the full-text reads' sake: which of the two steps failed is what
+/// says whether a failure was the caller's, so those two prepare for themselves and step through
+/// here. See [`refused_needle`].
+fn ids_of(
+    stmt: &mut rusqlite::Statement<'_>,
+    binds: Vec<SqlValue>,
+) -> crate::Result<Vec<RecordId>> {
+    collect(stmt.query_map(params_from_iter(binds), one_id)?)
 }
 
 /// Runs a statement whose columns are a record id and its stored frontmatter.
@@ -258,6 +275,14 @@ fn run_structures(
 ) -> crate::Result<Vec<RecordStructure>> {
     let lease = store.lease()?;
     let mut stmt = lease.prepare(sql)?;
+    structures_of(&mut stmt, binds)
+}
+
+/// Steps a prepared statement whose columns are a record id and its frontmatter, as [`ids_of`] does.
+fn structures_of(
+    stmt: &mut rusqlite::Statement<'_>,
+    binds: Vec<SqlValue>,
+) -> crate::Result<Vec<RecordStructure>> {
     let rows = stmt.query_map(params_from_iter(binds), |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -482,8 +507,59 @@ pub fn search(
     limit: u32,
     scope: &Scope,
 ) -> crate::Result<Vec<RecordId>> {
-    let (sql, binds) = search_sql(needle, limit, scope);
-    run_ids(store, &sql, binds)
+    let (sql, binds) = search_sql(needle, limit, scope, Select::Id);
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
+    ids_of(&mut stmt, binds).map_err(|error| refused_needle(needle, error))
+}
+
+/// Full-text search returning each match's structure rather than its identifier.
+///
+/// [`search`] with the wider select list: the same match, the same ceiling, the same scope test, and
+/// each hit's stored frontmatter. What a caller asking a full-text question wanted — the prose the
+/// needle matched is the one thing no read hands back, so an identifier would leave the caller
+/// holding a name it cannot resolve.
+///
+/// `limit` is the page size, `None` meaning [`DEFAULT_STRUCTURE_LIMIT`] and never unbounded. Every
+/// caveat on [`search`] holds unchanged, the recall one included: the ceiling is a multiple of
+/// whatever page was asked for, so the smaller default page here also examines fewer candidates.
+pub fn search_structures(
+    store: &crate::Store,
+    needle: &str,
+    limit: Option<u32>,
+    scope: &Scope,
+) -> crate::Result<Vec<RecordStructure>> {
+    let select = Select::Structure;
+    let limit = limit.unwrap_or_else(|| select.default_limit());
+    let (sql, binds) = search_sql(needle, limit, scope, select);
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
+    structures_of(&mut stmt, binds).map_err(|error| refused_needle(needle, error))
+}
+
+/// Reports a failure the needle caused as the caller's, and everything else as it arrived.
+///
+/// Only failures from *stepping* a full-text statement reach this, which is what makes the
+/// attribution sound rather than a guess at a message: the needle is a bound parameter, so the match
+/// expression is not read until the statement runs, while a statement this module spelled wrongly
+/// and an index missing its full-text table are both refused at prepare. What is left is the
+/// caller's own expression, whether or not the extension named itself in the message it wrote.
+fn refused_needle(needle: &str, error: crate::Error) -> crate::Error {
+    match &error {
+        crate::Error::Sqlite(rusqlite::Error::SqliteFailure(code, Some(detail)))
+            if code.code == rusqlite::ErrorCode::Unknown =>
+        {
+            crate::Error::BadNeedle {
+                needle: needle.to_owned(),
+                detail: detail
+                    .strip_prefix(FTS_PREFIX)
+                    .unwrap_or(detail)
+                    .trim()
+                    .to_owned(),
+            }
+        }
+        _ => error,
+    }
 }
 
 /// Matches the full-text index is allowed to hand to the scope test, for a page of `limit`.
@@ -498,7 +574,7 @@ fn candidate_ceiling(limit: u32) -> u32 {
 }
 
 /// Builds the full-text query and its bindings.
-fn search_sql(needle: &str, limit: u32, scope: &Scope) -> (String, Vec<SqlValue>) {
+fn search_sql(needle: &str, limit: u32, scope: &Scope, select: Select) -> (String, Vec<SqlValue>) {
     let mut binds: Vec<SqlValue> = vec![
         needle.to_owned().into(),
         i64::from(candidate_ceiling(limit)).into(),
@@ -508,18 +584,20 @@ fn search_sql(needle: &str, limit: u32, scope: &Scope) -> (String, Vec<SqlValue>
     // order, so nothing is sorted and nothing past the ceiling is visited. `rank` comes out with
     // each candidate — best-match order among the candidates is still worth having, and it costs
     // only the rows already read.
-    let mut sql = "WITH candidates AS (
+    let mut sql = format!(
+        "WITH candidates AS (
              SELECT rowid AS record_pk, rank AS relevance
              FROM records_fts
              WHERE records_fts MATCH ?
              ORDER BY rowid DESC
              LIMIT ?
          )
-         SELECT rec.record_id
+         SELECT {}
          FROM candidates
          JOIN records AS rec ON rec.id = candidates.record_pk
-         WHERE rec.sealed = 0"
-        .to_owned();
+         WHERE rec.sealed = 0",
+        select.columns()
+    );
     if let Some(predicate) = scope_predicate(scope, "rec", &mut binds) {
         sql.push_str(" AND ");
         sql.push_str(&predicate);
@@ -723,7 +801,24 @@ pub mod explain {
         limit: u32,
         scope: &Scope,
     ) -> crate::Result<String> {
-        let (sql, binds) = search_sql(needle, limit, scope);
+        let (sql, binds) = search_sql(needle, limit, scope, Select::Id);
+        plan(store, &sql, binds)
+    }
+
+    /// How [`super::search_structures`] would run.
+    ///
+    /// Its own helper for the reason [`by_entity_structures`] has one: the wider select list is the
+    /// difference between the read a rebuild makes and the read a request makes, and what the extra
+    /// column costs is a property of the plan rather than of the source text.
+    pub fn search_structures(
+        store: &crate::Store,
+        needle: &str,
+        limit: Option<u32>,
+        scope: &Scope,
+    ) -> crate::Result<String> {
+        let select = Select::Structure;
+        let limit = limit.unwrap_or_else(|| select.default_limit());
+        let (sql, binds) = search_sql(needle, limit, scope, select);
         plan(store, &sql, binds)
     }
 
@@ -956,7 +1051,7 @@ mod tests {
 
     #[test]
     fn a_full_text_read_caps_its_candidates_before_the_join() {
-        let (sql, binds) = search_sql("shards", 10, &reader());
+        let (sql, binds) = search_sql("shards", 10, &reader(), Select::Id);
         let plan = plan(&sql, binds.clone());
         assert!(
             plan.contains("records_fts"),
@@ -991,6 +1086,18 @@ mod tests {
         for select in [Select::Id, Select::Structure] {
             let (sql, _) = filter_sql(&Filter::default(), select);
             assert!(sql.contains("1 = 0"), "{select:?}: {sql}");
+            // The full-text read the same way. Its scope test cannot be pushed into the match, so
+            // it lands on the join instead — but it does land in the statement, so a record outside
+            // the scope is never selected rather than selected and then dropped. A needle is the one
+            // input a caller writes, and this is the read where that distinction is easiest to lose.
+            let (sql, _) = search_sql("shards", 10, &Scope::default(), select);
+            assert!(sql.contains("1 = 0"), "{select:?}: {sql}");
+            let (scoped, _) = search_sql("shards", 10, &reader(), select);
+            assert!(
+                scoped.contains("rec.visibility = ?"),
+                "{select:?}: {scoped}"
+            );
+            assert!(scoped.contains("rec.team IN"), "{select:?}: {scoped}");
         }
     }
 
@@ -1122,6 +1229,11 @@ mod tests {
         );
         assert!(
             super::explain::search(&store, "shards", 10, &reader())
+                .expect("a plan")
+                .contains("records_fts")
+        );
+        assert!(
+            super::explain::search_structures(&store, "shards", None, &reader())
                 .expect("a plan")
                 .contains("records_fts")
         );

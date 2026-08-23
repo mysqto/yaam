@@ -1,6 +1,6 @@
 //! The service surface.
 //!
-//! Five endpoints, all signed — reads included, because every read is narrowed to what the
+//! Six endpoints, all signed — reads included, because every read is narrowed to what the
 //! authenticated caller may see, and an anonymous request has no caller to narrow to. Reindex is
 //! deliberately *not* an endpoint: it is a command-line operation, so no request can trigger a
 //! rebuild.

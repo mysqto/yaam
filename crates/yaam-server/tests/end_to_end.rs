@@ -260,11 +260,8 @@ fn scoped_tree() -> (Tree, axum::Router, Vec<RecordId>) {
     (tree, app, ids)
 }
 
-/// One signed read, as text: what a caller actually receives, before anything parses it.
-///
-/// Text rather than a parsed value for the tests that assert on *absence* — a field nobody looked
-/// for is a field no parsed assertion notices.
-async fn read_as(app: &axum::Router, agent: &str, uri: &str) -> String {
+/// One signed read, as the response the caller receives.
+async fn read_response(app: &axum::Router, agent: &str, uri: &str) -> axum::response::Response {
     let request = Request::builder()
         .method(Method::GET)
         .uri(uri)
@@ -277,7 +274,15 @@ async fn read_as(app: &axum::Router, agent: &str, uri: &str) -> String {
         .body(Body::empty())
         .unwrap();
 
-    let response = app.clone().oneshot(request).await.unwrap();
+    app.clone().oneshot(request).await.unwrap()
+}
+
+/// One signed read, as text: what a caller actually receives, before anything parses it.
+///
+/// Text rather than a parsed value for the tests that assert on *absence* — a field nobody looked
+/// for is a field no parsed assertion notices.
+async fn read_as(app: &axum::Router, agent: &str, uri: &str) -> String {
+    let response = read_response(app, agent, uri).await;
     assert_eq!(response.status(), StatusCode::OK, "{uri} as {agent}");
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -300,6 +305,21 @@ async fn visible_to(app: &axum::Router, agent: &str) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+/// The records `agent` finds by full text, in identifier order.
+///
+/// Sorted rather than taken in the order they arrived: the route answers best match first, and every
+/// record in the scoped fixture holds the same body, so they all match equally well and their order
+/// is not something a test may pin. What is being asserted is *which* records, not their order.
+async fn found_by(app: &axum::Router, agent: &str, needle: &str) -> Vec<RecordId> {
+    let body = read_as(app, agent, &format!("/search?q={needle}")).await;
+    let answer: serde_json::Value = serde_json::from_str(&body).expect("a JSON answer");
+    let structures: Vec<yaam_contract::RecordStructure> =
+        serde_json::from_value(answer["records"].clone()).expect("structures");
+    let mut found = read_ids(&structures);
+    found.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    found
 }
 
 #[tokio::test]
@@ -370,6 +390,9 @@ async fn no_read_returns_a_body_for_either_data_class() {
 
     for uri in [
         "/records",
+        // The needle matches the plaintext body, so this read has prose in hand and still must not
+        // hand any back. The sealed record indexes no text and so cannot match at all.
+        "/search?q=shards",
         "/entities/ticket/PROJ-42",
         "/entities/order_ref/ord10014721",
         "/bundle?entity=ticket:PROJ-42,order_ref:ord10014721",
@@ -423,6 +446,7 @@ async fn a_caller_outside_a_records_scope_receives_neither_its_structure_nor_its
 
     for uri in [
         "/records",
+        "/search?q=shards",
         "/entities/ticket/PROJ-42",
         "/bundle?entity=ticket:PROJ-42",
     ] {
@@ -436,6 +460,60 @@ async fn a_caller_outside_a_records_scope_receives_neither_its_structure_nor_its
         // Not vacuous: the records this caller may read are there.
         assert!(body.contains(ids[0].as_str()), "{uri}: {body}");
         assert!(body.contains(ids[2].as_str()), "{uri}: {body}");
+    }
+}
+
+/// Full text is narrowed by the caller's scope, and narrowed by the query rather than after it.
+///
+/// The fixture is what makes this assert something: every record in it carries the same body, so the
+/// needle matches all five and only the scope predicate can tell the answers apart. A search that
+/// forgot it would hand every caller the whole tree — including the audit trail and another team's
+/// records, neither of which any other read admits.
+#[tokio::test]
+async fn a_full_text_read_is_scoped_to_the_caller_like_every_other_read() {
+    let (_tree, app, ids) = scoped_tree();
+    assert!(BODY.contains("shards"), "the fixture body moved: {BODY}");
+
+    // A reader on one team: the org-visible record and its own team's, and nothing else.
+    let support_reader = found_by(&app, "agent_b", "shards").await;
+    assert_eq!(support_reader, vec![ids[0].clone(), ids[2].clone()]);
+    // The other team's reader sees the mirror image, from the same needle.
+    let platform_writer = found_by(&app, "agent_a", "shards").await;
+    assert_eq!(platform_writer, vec![ids[0].clone(), ids[1].clone()]);
+    // The operator adds its own owner-visible record and the audit trail, and no other team's.
+    let operator_sees = found_by(&app, "agent_ops", "shards").await;
+    assert_eq!(
+        operator_sees,
+        vec![
+            ids[0].clone(),
+            ids[1].clone(),
+            ids[3].clone(),
+            ids[4].clone()
+        ],
+        "an operator's reach is the audit level, not every team"
+    );
+
+    // Not vacuous in the other direction either: a needle no body holds finds nothing for anybody.
+    assert!(
+        found_by(&app, "agent_ops", "unwrittenneedle")
+            .await
+            .is_empty()
+    );
+}
+
+/// A needle the match syntax will not take is the caller's mistake, and permanent.
+///
+/// `422` and not `500`: prefix and phrase syntax reaches the caller, so a needle that will not parse
+/// is a request to fix rather than a service to retry against. An empty needle is the same mistake
+/// spelled shorter — a search for nothing, which is not a search for everything.
+#[tokio::test]
+async fn a_needle_the_match_syntax_refuses_is_permanent_and_not_this_services_fault() {
+    let (_tree, app, _ids) = scoped_tree();
+
+    for needle in ["unbalanced%20%22%20quote", ""] {
+        let uri = format!("/search?q={needle}");
+        let status = read_response(&app, "agent_b", &uri).await.status();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
     }
 }
 
