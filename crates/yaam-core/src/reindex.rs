@@ -16,6 +16,7 @@
 //! outlived them would be appended to a second time by the fan-out this rebuild re-enqueues. Files
 //! and rows are one thing here, and this transaction is what holds them together.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -242,6 +243,50 @@ fn reregister_quarantine(batch: &mut Batch<'_>, paths: &[PathBuf]) -> Result<()>
         )?;
     }
     Ok(())
+}
+
+/// Reads the wanted records back out of the local cold manifests.
+///
+/// The manifests' other reader. A record archived out of the tree still has fan-out owed on it, and
+/// its manifest line is the last local copy of what it held — so the drain asks here for what it
+/// cannot find in the tree. It goes through [`manifest_record`], the parser [`index_manifests`]
+/// already uses: one format with two readers is how this store once ended up refusing records no
+/// writer could produce.
+///
+/// Takes the whole set of identifiers a caller wants, because a pass over the manifests costs the
+/// size of the archive: per record that cost would be paid per fan-out job. A wanted identifier no
+/// manifest holds is simply absent from the answer — whether that is a fault is the caller's call,
+/// not this function's.
+///
+/// A line that will not parse is skipped rather than fatal, as it is in a rebuild: one unreadable
+/// line must not stop the records around it from being found. The rebuild is what counts and reports
+/// those lines, so they are logged here at a lower level than there.
+pub(crate) fn cold_records(
+    root: &Path,
+    wanted: &BTreeSet<&str>,
+) -> Result<BTreeMap<String, ActionRecord>> {
+    let mut found = BTreeMap::new();
+    for path in fsutil::walk_files(&root.join(layout::COLD_DIR), "jsonl")? {
+        for line in fs::read_to_string(&path)?.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match manifest_record(line) {
+                Ok(record) if wanted.contains(record.record_id.as_str()) => {
+                    found.insert(record.record_id.as_str().to_owned(), record);
+                    // Everything asked for is in hand, so the rest of the archive stays unread.
+                    if found.len() == wanted.len() {
+                        return Ok(found);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(path = %path.display(), %error, "manifest line skipped");
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Reads one manifest line into a record.
@@ -476,10 +521,7 @@ mod tests {
         let mut harness = Harness::new();
         let archived = testkit::internal("2026-01-05T08:00:00Z");
         // The manifest format is the frontmatter projection, so the body is absent by construction.
-        let mut json = serde_json::to_value(&archived).expect("json");
-        json.as_object_mut().expect("object").remove("summary");
-        let mut lines = serde_json::to_string(&json).expect("line");
-        lines.push('\n');
+        let mut lines = testkit::manifest_line(&archived);
         lines.push_str("{\"not\": \"a record\"}\n");
         lines.push('\n');
         fs::write(harness.root().join("cold/2026-01.jsonl"), lines).expect("manifest");
@@ -505,6 +547,73 @@ mod tests {
                 .expect("by entity")
                 .len(),
             1
+        );
+    }
+
+    /// The data-loss path this closes.
+    ///
+    /// A rebuild deletes the timelines and rebuilds them from the fan-out it re-enqueues. A record
+    /// archived to a cold manifest has no file, so its jobs used to fail, retry and dead-letter —
+    /// and the lines it already had went with the rebuild that dropped them. Permanently: nothing
+    /// afterwards could put them back, because the only copy of the record was the manifest.
+    ///
+    /// The comparison is against the exact text the record produced while it still had a file. A
+    /// manifest line carries no `summary`, so "it fanned out" is not the claim worth testing — "it
+    /// fanned out to the same bytes" is.
+    #[test]
+    fn an_archived_records_timeline_and_audit_survive_a_rebuild() {
+        let mut harness = Harness::new();
+        let record = testkit::subject_derived("2026-08-20T09:00:00Z", &[testkit::subject('a')]);
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+        assert_eq!(harness.pipeline.drain_fanout(100).expect("drained"), 2);
+
+        let timeline = harness
+            .root()
+            .join("entities/order_ref/ord10014721/timeline.md");
+        let audit = harness
+            .root()
+            .join("audit/subjects")
+            .join(record.record_id.as_str().to_owned() + ".md");
+        let line = fs::read_to_string(&timeline).expect("timeline");
+        let entry = fs::read_to_string(&audit).expect("audit");
+
+        // Archived the way an archive is produced: the manifest line is the published record's own
+        // frontmatter, and the record file leaves the tree.
+        let path = harness.path_of(&record);
+        let published = yaam_md::Document::parse(&fs::read_to_string(&path).expect("record"))
+            .expect("a published record");
+        fs::write(
+            harness.root().join("cold/2026-08.jsonl"),
+            testkit::manifest_line(&published.record),
+        )
+        .expect("manifest");
+        fs::remove_file(&path).expect("remove");
+        // Removed so the assertion below is about the file being written again, not about a file
+        // the rebuild happened to leave alone.
+        fs::remove_file(&audit).expect("remove");
+
+        let report = reindex_all(&mut harness.pipeline).expect("rebuilt");
+        assert_eq!(report.from_tree, 0);
+        assert_eq!(report.from_manifests, 1);
+        assert!(!timeline.exists(), "the rebuild drops what it re-enqueues");
+
+        assert_eq!(
+            harness.pipeline.drain_fanout(100).expect("drained"),
+            2,
+            "an archived record's fan-out has to be doable, or a rebuild is what loses its history"
+        );
+        assert_eq!(
+            fs::read_to_string(&timeline).expect("timeline"),
+            line,
+            "the line an archived record produces has to be the line it produced with a file"
+        );
+        assert_eq!(
+            fs::read_to_string(&audit).expect("audit"),
+            entry,
+            "the same audit entry, from the same frontmatter"
         );
     }
 
