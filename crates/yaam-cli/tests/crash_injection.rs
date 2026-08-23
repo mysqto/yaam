@@ -193,10 +193,15 @@ fn a_kill_after_the_commit_and_before_fan_out_loses_no_work() {
         "the queued fan-out never drained after the restart:\n{}",
         restarted.log_text()
     );
-    assert_eq!(
+    // Waited for, not sampled. The mention row lands before the job is marked settled, so a read
+    // taken the instant the timeline appears can legitimately still see `claimed` -- which is how
+    // this passed here and failed on a slower runner.
+    let settled = vec![format!("{}/bundle/done", id.as_str())];
+    assert!(
+        eventually(CONVERGENCE, || fanout(&deployment) == settled),
+        "the job is settled, not left to be claimed again: {:?}\n{}",
         fanout(&deployment),
-        vec![format!("{}/bundle/done", id.as_str())],
-        "the job is settled, not left to be claimed again"
+        restarted.log_text()
     );
 
     converged_after_a_replay(&deployment, &mut restarted, &record);
