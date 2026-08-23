@@ -4,11 +4,16 @@
 //! actually got, which is what makes a test on an ephemeral port possible — and a test that cannot
 //! bind an ephemeral port is a test that fights over a fixed one.
 //!
-//! The service also does the maintenance its store needs, on a timer: fan-out is queued inside the
-//! write transaction and drained afterwards, and the sweeper is what closes the crash windows the
-//! write path leaves open. Neither has any other caller in a running deployment, so a service that
-//! only answered requests would answer them correctly while its entity timelines never appeared and
-//! its backlog only grew.
+//! The service also does the maintenance its store needs, at boot and then on a timer: fan-out is
+//! queued inside the write transaction and drained afterwards, and the sweeper is what closes the
+//! crash windows the write path leaves open. Neither has any other caller in a running deployment,
+//! so a service that only answered requests would answer them correctly while its entity timelines
+//! never appeared and its backlog only grew.
+//!
+//! At boot as well as on the timer, because what the last process left owed is owed before any
+//! interval elapses. Waiting one out first means a service restarted and stopped again inside one
+//! never converges at all — and a restart loop is precisely the condition under which a store has
+//! work outstanding.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -24,14 +29,6 @@ use yaam_server::service::CoreService;
 use crate::config::ServerSettings;
 use crate::error::{Result, failed};
 use crate::keyring;
-
-/// How often the service does the maintenance its store needs.
-///
-/// Seconds rather than milliseconds: both halves are idempotent and bounded, and neither is on the
-/// path of a request. What it costs to be late is that an entity timeline appears a moment after the
-/// record it describes — those files are derived views, and a reader that needs the record itself
-/// has the index.
-pub const DEFAULT_MAINTENANCE_MS: u64 = 30_000;
 
 /// Fan-out jobs one maintenance round takes.
 ///
@@ -97,7 +94,7 @@ pub async fn bind(settings: &ServerSettings) -> Result<Bound> {
         listener,
         router: routes::router(state),
         service,
-        maintenance: Duration::from_millis(DEFAULT_MAINTENANCE_MS),
+        maintenance: settings.maintenance,
         address,
     })
 }
@@ -119,14 +116,18 @@ where
     } = bound;
 
     let (closing, closed) = watch::channel(false);
+    // The boot round lives in this task rather than ahead of the accept loop on purpose: a sweep
+    // walks the tree, so a round awaited before serving is a startup as slow as the backlog is
+    // deep — and a health check that times out restarts the very service that was converging.
     let timer = tokio::spawn(maintenance_loop(service, maintenance, closed));
 
     let served = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await;
 
-    // After the requests, not before: a request being finished may still enqueue fan-out, and the
-    // round below is the one that would have taken it.
+    // After the requests, not before: a request being finished may still enqueue fan-out, and a
+    // round already in flight is the one that would have taken it. What a shutdown still leaves
+    // queued is what the next boot's first round is for.
     let _ = closing.send(true);
     let _ = timer.await;
     served.map_err(|error| failed("serving", &error))
@@ -136,17 +137,17 @@ where
 ///
 /// The work is filesystem and database work, so each round runs on a blocking thread: doing it on a
 /// runtime worker would park that worker for the length of a sweep, and the sweep walks the tree.
+///
+/// A round happens before the first sleep, and a failing one is logged like any other: a store that
+/// cannot be swept is a reason to say so and serve, not a reason to refuse to come up. The failure
+/// this shape has to survive is the one that repeats — a round that fails at boot fails on the timer
+/// too — so the loop cannot be allowed to treat either as fatal.
 async fn maintenance_loop(
     service: Arc<CoreService>,
     interval: Duration,
     mut closed: watch::Receiver<bool>,
 ) {
     loop {
-        tokio::select! {
-            biased;
-            _ = closed.changed() => return,
-            () = tokio::time::sleep(interval) => {}
-        }
         let round = Arc::clone(&service);
         match tokio::task::spawn_blocking(move || round.maintain(MAINTENANCE_JOBS)).await {
             Ok(Ok(report)) if report.did_nothing() => {}
@@ -160,6 +161,11 @@ async fn maintenance_loop(
             ),
             Ok(Err(error)) => tracing::warn!(%error, "maintenance round failed"),
             Err(error) => tracing::error!(%error, "maintenance round panicked"),
+        }
+        tokio::select! {
+            biased;
+            _ = closed.changed() => return,
+            () = tokio::time::sleep(interval) => {}
         }
     }
 }
@@ -183,6 +189,13 @@ fn announce(
     tracing::info!(
         setting = "keyring",
         value = %settings.keyring.display(),
+        "configuration"
+    );
+    // Worth a line of its own: it is how far behind a timeline may be, and an operator reading a
+    // stale one needs to know whether the interval or the sweeper is the reason.
+    tracing::info!(
+        setting = "maintenance-ms",
+        value = settings.maintenance.as_millis(),
         "configuration"
     );
     if let Some(public) = sealing_public_key {
@@ -215,9 +228,16 @@ fn announce(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MAINTENANCE_MS, bind, serve};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use yaam_contract::RecordId;
+    use yaam_server::service::CoreService;
+
+    use super::{bind, serve};
     use crate::cli::{ServerArgs, StoreArgs};
-    use crate::config::{Env, ServerSettings};
+    use crate::config::{DEFAULT_MAINTENANCE_MS, Env, ServerSettings};
     use crate::exit::Exit;
     use crate::fixtures;
 
@@ -240,6 +260,11 @@ mod tests {
         }
 
         fn settings(&self, listen: &str) -> ServerSettings {
+            self.settings_with(listen, None)
+        }
+
+        /// The same, naming an interval, which is what a test that waits on a round needs.
+        fn settings_with(&self, listen: &str, maintenance_ms: Option<u64>) -> ServerSettings {
             let flags = ServerArgs {
                 store: StoreArgs {
                     root: Some(self.dir.path().to_path_buf()),
@@ -250,8 +275,14 @@ mod tests {
                 listen: Some(listen.to_owned()),
                 keyring: Some(self.dir.path().join("keyring.json")),
                 unseal_key_file: Some(self.dir.path().join("unseal.key")),
+                maintenance_ms,
             };
             ServerSettings::resolve(&flags, &Env::default()).expect("resolved")
+        }
+
+        /// The timeline the fixture record's entity gets, which only fan-out materialises.
+        fn timeline(&self) -> std::path::PathBuf {
+            self.dir.path().join("entities/ticket/PROJ-42/timeline.md")
         }
     }
 
@@ -338,43 +369,166 @@ mod tests {
         assert_eq!(error.exit(), Exit::Config);
     }
 
-    /// The maintenance timer is what makes fan-out and the sweeper run at all, so it has to run.
+    /// A store with work outstanding converges at boot, rather than an interval later.
+    ///
+    /// The interval is set to ten minutes, so a timer round cannot be what drained the queue. This
+    /// is the case a service that came up and went down inside one interval used to lose entirely:
+    /// the fan-out a killed process left queued sat there through every restart.
     #[tokio::test]
-    async fn the_maintenance_timer_drains_the_queue_a_write_left_behind() {
+    async fn a_store_with_work_outstanding_converges_at_boot() {
         let deployment = Deployment::new();
-        let mut bound = bind(&deployment.settings("127.0.0.1:0"))
+        let bound = bind(&deployment.settings_with("127.0.0.1:0", Some(600_000)))
             .await
             .expect("bound");
-        bound.maintenance = std::time::Duration::from_millis(10);
+        assert_eq!(bound.maintenance, Duration::from_mins(10));
 
-        let pipeline_root = deployment.dir.path().to_path_buf();
-        let record = fixtures::record("2026-08-20T09:00:00Z");
-        let caller = yaam_server::auth::Caller {
-            agent: record.agent.clone(),
-            role: yaam_server::auth::Role::Writer,
-            teams: Vec::new(),
-        };
-        yaam_server::service::Service::write(&*bound.service, &caller, record, fixtures::BODY)
-            .expect("written");
+        // Queued before anything serves, which is the state a crash leaves the store in.
+        write_one(&bound.service);
+        let timeline = deployment.timeline();
+        assert!(!timeline.exists(), "nothing has drained it yet");
 
         let (stop, wait) = tokio::sync::oneshot::channel::<()>();
         let serving = tokio::spawn(serve(bound, async move {
             let _ = wait.await;
         }));
-        // The timeline is fan-out work, so its file only exists because the timer ran.
-        let timeline = pipeline_root.join("entities/ticket/PROJ-42/timeline.md");
-        for _ in 0..400 {
-            if timeline.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        let converged = appears(&timeline).await;
         stop.send(()).expect("still serving");
         serving.await.expect("join").expect("clean shutdown");
 
         assert!(
-            timeline.exists(),
-            "nothing else drains fan-out in a running deployment"
+            converged,
+            "the round at boot is the only one that could have run"
         );
+    }
+
+    /// And the timer keeps rounds coming after the one at boot.
+    ///
+    /// Two writes, because one proves nothing about which round drained it: the second is written
+    /// only once a round has demonstrably completed, and there is exactly one round at boot.
+    #[tokio::test]
+    async fn the_maintenance_timer_drains_a_queue_the_boot_round_never_saw() {
+        let deployment = Deployment::new();
+        let bound = bind(&deployment.settings_with("127.0.0.1:0", Some(20)))
+            .await
+            .expect("bound");
+        let service = Arc::clone(&bound.service);
+        let timeline = deployment.timeline();
+        write_one(&service);
+
+        let (stop, wait) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(serve(bound, async move {
+            let _ = wait.await;
+        }));
+        let first = appears(&timeline).await;
+        let second = write_one(&service);
+        let later = mentions(&timeline, &second).await;
+        stop.send(()).expect("still serving");
+        serving.await.expect("join").expect("clean shutdown");
+
+        assert!(first, "nothing else drains fan-out in a running deployment");
+        assert!(later, "no round ran after the one at boot");
+    }
+
+    /// A round that cannot run is a line in the log, not a service that fails to serve.
+    ///
+    /// The worst shape a round at boot could have taken is one that wedges startup, so the round
+    /// here is made to fail: a store the sweeper cannot walk is exactly the state somebody has to
+    /// reach the service to find out about. A round drains fan-out before it sweeps, which is what
+    /// makes the failure observable — the timeline says the round ran, and the error at the end says
+    /// it did not finish.
+    #[tokio::test]
+    async fn a_failing_boot_round_still_leaves_a_service_that_answers() {
+        let deployment = Deployment::new();
+        let bound = bind(&deployment.settings_with("127.0.0.1:0", Some(600_000)))
+            .await
+            .expect("bound");
+        let address = bound.address;
+        let service = Arc::clone(&bound.service);
+        write_one(&service);
+
+        // A file where the staging directory should be: the sweep cannot walk it. A directory made
+        // unreadable would not do — these tests may be running as a user permissions ignore.
+        let staging = deployment.dir.path().join(".staging");
+        std::fs::remove_dir_all(&staging).expect("the pipeline made it at startup");
+        std::fs::write(&staging, b"not a directory").expect("write");
+
+        let (stop, wait) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(serve(bound, async move {
+            let _ = wait.await;
+        }));
+        let ran = appears(&deployment.timeline()).await;
+        let answer = unsigned_request(address).await;
+        stop.send(()).expect("still serving");
+        serving.await.expect("join").expect("clean shutdown");
+
+        assert!(ran, "the round at boot never got as far as the fan-out");
+        assert!(
+            answer.starts_with("HTTP/1.1 401"),
+            "an unsigned request is refused, and a refusal is an answer: {answer}"
+        );
+        assert!(
+            service.maintain(1).is_err(),
+            "a round has to be failing in this state, or this test proves nothing"
+        );
+    }
+
+    /// Writes one record, leaving the fan-out it queued for a round to drain.
+    fn write_one(service: &CoreService) -> RecordId {
+        let record = fixtures::record("2026-08-20T09:00:00Z");
+        let id = record.record_id.clone();
+        let caller = yaam_server::auth::Caller {
+            agent: record.agent.clone(),
+            role: yaam_server::auth::Role::Writer,
+            teams: Vec::new(),
+        };
+        yaam_server::service::Service::write(service, &caller, record, fixtures::BODY)
+            .expect("written");
+        id
+    }
+
+    /// Waits for a file to turn up. Polled, because what puts it there is another task.
+    async fn appears(path: &std::path::Path) -> bool {
+        settles(|| path.exists()).await
+    }
+
+    /// Waits for a timeline to name a record.
+    async fn mentions(timeline: &std::path::Path, id: &RecordId) -> bool {
+        settles(|| std::fs::read_to_string(timeline).is_ok_and(|text| text.contains(id.as_str())))
+            .await
+    }
+
+    /// Polls a condition until it holds, or gives up.
+    ///
+    /// Generous rather than tight: what it waits for is a round on a blocking thread, and the
+    /// interval these tests set is milliseconds, so a wait that ends is a wait that ended early.
+    async fn settles(mut state: impl FnMut() -> bool) -> bool {
+        for _ in 0..400 {
+            if state() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        state()
+    }
+
+    /// One unsigned request, and whatever came back.
+    ///
+    /// Unsigned deliberately: the assertion is that something answered, and a refusal is an answer.
+    /// Assembled by hand on a blocking thread, because this crate's tokio carries no `io-util` and a
+    /// client library bought for one request would be a dependency for one line.
+    async fn unsigned_request(address: SocketAddr) -> String {
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read as _, Write as _};
+
+            let mut socket = std::net::TcpStream::connect(address).expect("connect");
+            socket
+                .write_all(b"GET /records HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .expect("write");
+            let mut answer = String::new();
+            let _ = socket.read_to_string(&mut answer);
+            answer
+        })
+        .await
+        .expect("join")
     }
 }

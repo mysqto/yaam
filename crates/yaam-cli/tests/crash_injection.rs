@@ -17,16 +17,15 @@
 //! - the backlog drains: the service converges without an operator running anything.
 //!
 //! Slow by nature. The windows are opened by a checkpoint the binary is armed with
-//! ([`yaam_core::crash`]) and closed by a signal, and convergence waits on the service's own
-//! maintenance timer in another process — so these are `#[ignore]`d out of `cargo test` and run
-//! by name:
+//! ([`yaam_core::crash`]) and closed by a signal, and convergence waits on rounds of maintenance in
+//! another process — so these are `#[ignore]`d out of `cargo test` and run by name:
 //!
 //! ```sh
 //! cargo test -p yaam-cli --test crash_injection -- --ignored
 //! ```
 //!
 //! `ci/check.sh` runs exactly that, so the gate covers them; the ignore keeps a routine
-//! `cargo test --workspace` from paying for three restarts and their timers.
+//! `cargo test --workspace` from paying for three kills and three restarts.
 
 #![forbid(unsafe_code)]
 
@@ -46,9 +45,10 @@ use support::{
 
 /// How long a test waits for another process to converge.
 ///
-/// Generous on purpose: what it waits for is that process's maintenance timer, and the point of the
-/// wait is convergence rather than latency. A test that allowed one interval would start failing the
-/// day the interval moved.
+/// Generous on purpose: what it waits for is a round of maintenance in that process, and the point
+/// of the wait is convergence rather than latency. A test that allowed one interval would start
+/// failing the day the interval moved — and the interval these services run on is
+/// [`support::MAINTENANCE_MS`], so what this bound actually costs is nothing when the claim holds.
 const CONVERGENCE: Duration = Duration::from_mins(3);
 
 /// Comfortably past the sweeper's grace period for a staging file.

@@ -61,6 +61,12 @@ pub struct ServerArgs {
     /// `YAAM_UNSEAL_KEY_FILE`.
     #[arg(long, value_name = "PATH")]
     pub unseal_key_file: Option<PathBuf>,
+    /// How often the service drains fan-out and sweeps, in milliseconds.
+    ///
+    /// Defaults to 30 s; also read from `YAAM_MAINTENANCE_MS`. A round runs at startup whatever this
+    /// says, so the interval is how long convergence can lag, not how long it waits to begin.
+    #[arg(long, value_name = "MS")]
+    pub maintenance_ms: Option<u64>,
 }
 
 /// Serve the local sidecar: one socket per caller, sealing and signing on their behalf.
