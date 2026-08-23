@@ -54,7 +54,12 @@ spec/             the contract bundle other implementations vendor
 Three binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
 `--key-store` default to sitting under it, and every setting is also read from the environment
 (`YAAM_ROOT`, `YAAM_INDEX`, `YAAM_KEY_STORE`, `YAAM_LISTEN`, `YAAM_KEYRING`,
-`YAAM_UNSEAL_KEY_FILE`, `YAAM_AGENT_STATE`, `YAAM_LOG`). A flag beats the environment.
+`YAAM_UNSEAL_KEY_FILE`, `YAAM_MAINTENANCE_MS`, `YAAM_AGENT_STATE`, `YAAM_LOG`). A flag beats the
+environment.
+
+The service drains fan-out and sweeps every `--maintenance-ms` (30 s by default) *and* once at
+startup, so a process that comes up over an interrupted write converges without waiting an interval
+out.
 
 ```sh
 # The service. Refuses to start on a misconfiguration, and logs the effective one — never a key.

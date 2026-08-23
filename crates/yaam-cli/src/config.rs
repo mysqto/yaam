@@ -18,6 +18,7 @@
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use yaam_core::Paths;
 
@@ -39,6 +40,8 @@ pub const ENV_LISTEN: &str = "YAAM_LISTEN";
 pub const ENV_KEYRING: &str = "YAAM_KEYRING";
 /// Environment variable naming the file holding the service's sealing secret key.
 pub const ENV_UNSEAL_KEY: &str = "YAAM_UNSEAL_KEY_FILE";
+/// Environment variable setting how often the service runs maintenance, in milliseconds.
+pub const ENV_MAINTENANCE_MS: &str = "YAAM_MAINTENANCE_MS";
 /// Environment variable naming the sidecar's state directory.
 pub const ENV_AGENT_STATE: &str = "YAAM_AGENT_STATE";
 /// Environment variable setting the log level.
@@ -49,6 +52,17 @@ pub const ENV_LOG: &str = "YAAM_LOG";
 /// Loopback, not `0.0.0.0`. Every request is signed, but a default that is reachable from the
 /// network is a deployment exposed by omission rather than by decision.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
+
+/// How often the service does the maintenance its store needs, when nothing names an interval.
+///
+/// Seconds rather than milliseconds: both halves are idempotent and bounded, and neither is on the
+/// path of a request. What it costs to be late is that an entity timeline appears a moment after the
+/// record it describes — those files are derived views, and a reader that needs the record itself
+/// has the index.
+///
+/// Settable at all because the wait is the whole cost of a test that asserts convergence, and a
+/// figure chosen for a deployment is the wrong one for a test.
+pub const DEFAULT_MAINTENANCE_MS: u64 = 30_000;
 
 /// The environment as the process found it.
 ///
@@ -69,6 +83,8 @@ pub struct Env {
     pub keyring: Option<OsString>,
     /// [`ENV_UNSEAL_KEY`].
     pub unseal_key_file: Option<OsString>,
+    /// [`ENV_MAINTENANCE_MS`].
+    pub maintenance_ms: Option<OsString>,
     /// [`ENV_AGENT_STATE`].
     pub agent_state: Option<OsString>,
     /// [`ENV_LOG`].
@@ -90,6 +106,7 @@ impl Env {
             listen: std::env::var_os(ENV_LISTEN),
             keyring: std::env::var_os(ENV_KEYRING),
             unseal_key_file: std::env::var_os(ENV_UNSEAL_KEY),
+            maintenance_ms: std::env::var_os(ENV_MAINTENANCE_MS),
             agent_state: std::env::var_os(ENV_AGENT_STATE),
             log: std::env::var_os(ENV_LOG),
         }
@@ -287,6 +304,8 @@ pub struct ServerSettings {
     /// deployment whose callers post directly, and a misconfiguration for one that runs sidecars —
     /// which is why the startup log says which of the two it is.
     pub unseal_key_file: Option<PathBuf>,
+    /// How often the service runs the maintenance its store needs.
+    pub maintenance: Duration,
 }
 
 impl ServerSettings {
@@ -315,7 +334,38 @@ impl ServerSettings {
                 flags.unseal_key_file.as_deref(),
                 env.unseal_key_file.as_deref(),
             ),
+            maintenance: Self::maintenance(flags, env)?,
         })
+    }
+
+    /// How often maintenance runs: a flag, then the environment, then [`DEFAULT_MAINTENANCE_MS`].
+    ///
+    /// Only the environment half can fail to parse — clap has already refused a flag that is not a
+    /// number — and an unreadable one is a refusal rather than a fall back to the default, because a
+    /// deployment that set the interval and did not get it would be running on nobody's decision.
+    fn maintenance(flags: &ServerArgs, env: &Env) -> Result<Duration> {
+        // No flag layer in the `pick_str`: the flag is already a number, so only the text half is
+        // left to pick and parse.
+        let named = match flags.maintenance_ms {
+            Some(ms) => Some(ms),
+            None => pick_str(None, env.maintenance_ms.as_deref())
+                .map(|text| {
+                    text.trim().parse::<u64>().map_err(|error| {
+                        config(format!(
+                            "{ENV_MAINTENANCE_MS} {text} is not a count of milliseconds ({error})"
+                        ))
+                    })
+                })
+                .transpose()?,
+        };
+        let ms = named.unwrap_or(DEFAULT_MAINTENANCE_MS);
+        if ms == 0 {
+            return Err(config(
+                "--maintenance-ms 0 would sweep the store in a tight loop, and the sweep walks the \
+                 tree",
+            ));
+        }
+        Ok(Duration::from_millis(ms))
     }
 }
 
@@ -625,6 +675,7 @@ mod tests {
             listen: listen.map(str::to_owned),
             keyring: keyring.map(Path::to_path_buf),
             unseal_key_file: None,
+            maintenance_ms: None,
         }
     }
 
@@ -662,6 +713,53 @@ mod tests {
         )
         .expect("port zero is a legitimate ask");
         assert_eq!(ephemeral.listen.port(), 0);
+    }
+
+    /// The maintenance interval follows the one precedence every other setting follows.
+    #[test]
+    fn the_maintenance_interval_takes_the_flag_then_the_environment_then_the_default() {
+        let dir = tree();
+        let keyring = dir.path().join("keyring.json");
+        let resolved = |flag: Option<u64>, from_env: Option<&str>| {
+            let mut flags = server_args(dir.path(), None, Some(&keyring));
+            flags.maintenance_ms = flag;
+            let env = Env {
+                maintenance_ms: from_env.map(Into::into),
+                ..Env::default()
+            };
+            ServerSettings::resolve(&flags, &env).map(|settings| settings.maintenance)
+        };
+
+        assert_eq!(
+            resolved(Some(50), Some("900")).expect("resolved"),
+            std::time::Duration::from_millis(50),
+            "the flag beats the environment, as everywhere else"
+        );
+        assert_eq!(
+            resolved(None, Some(" 900 ")).expect("resolved"),
+            std::time::Duration::from_millis(900)
+        );
+        assert_eq!(
+            resolved(None, Some("")).expect("resolved"),
+            std::time::Duration::from_millis(super::DEFAULT_MAINTENANCE_MS),
+            "an empty variable is not a setting"
+        );
+        assert_eq!(
+            resolved(None, None).expect("resolved"),
+            std::time::Duration::from_millis(super::DEFAULT_MAINTENANCE_MS)
+        );
+
+        // An interval nobody chose is worse than a refusal: convergence would lag by the default
+        // while the deployment that set the variable believed it had asked for something else.
+        let unreadable = resolved(None, Some("half a minute")).expect_err("not a number");
+        assert_eq!(unreadable.exit(), Exit::Config);
+        assert!(
+            unreadable.to_string().contains("YAAM_MAINTENANCE_MS"),
+            "{unreadable}"
+        );
+
+        let zero = resolved(Some(0), None).expect_err("a tight loop");
+        assert!(zero.to_string().contains("--maintenance-ms"), "{zero}");
     }
 
     fn agent_args(state: Option<&Path>) -> AgentArgs {

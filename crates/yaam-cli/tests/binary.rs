@@ -16,7 +16,8 @@ use std::io::{BufRead, BufReader, Write};
 mod support;
 
 use support::{
-    Deployment, SIGNING_KEY, Service, await_socket, record, rendered, spawn, terminate, yaam,
+    Deployment, MAINTENANCE_MS, SIGNING_KEY, Service, await_socket, record, rendered, setting,
+    spawn, terminate, yaam,
 };
 
 /// Every documented code has to come out of the real process, or it is not an interface.
@@ -89,6 +90,16 @@ fn a_record_written_to_a_socket_reaches_the_tree_through_the_service() {
     let root = deployment.root_str();
 
     let mut service = Service::start(&deployment);
+    // The interval this harness sets through the environment, read back out of the process that was
+    // given it. A variable the binary ignored would leave every convergence wait in these tests on
+    // the 30-second default, and pass anyway.
+    assert_eq!(
+        setting(&service.log_text(), "maintenance-ms").as_deref(),
+        Some(MAINTENANCE_MS),
+        "the service did not take the interval it was given:\n{}",
+        service.log_text()
+    );
+
     let state = deployment.root().join("agent");
     std::fs::create_dir_all(&state).expect("state dir");
     std::fs::write(

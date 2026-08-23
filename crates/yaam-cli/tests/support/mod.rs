@@ -41,6 +41,15 @@ pub const BODY: &str = "Rolled out the api service to staging across two of thre
 /// How long any wait here is allowed to take before the test gives up.
 pub const PATIENCE: Duration = Duration::from_secs(30);
 
+/// The maintenance interval every service started here runs on, in milliseconds.
+///
+/// Short on purpose. What these tests wait for is a round in *another* process, and at the
+/// deployment default of 30 s a handful of such waits is minutes of sitting still — which is the
+/// whole cost of the crash tests. Passed through the environment rather than a flag so that half of
+/// the precedence is exercised by a real process; a test may still override it, since the
+/// per-test variables are applied after this one.
+pub const MAINTENANCE_MS: &str = "250";
+
 /// A memory tree with this repository's own spec, a keyring, and a sealing key.
 pub struct Deployment {
     dir: tempfile::TempDir,
@@ -152,6 +161,7 @@ impl Service {
                 "--unseal-key-file",
                 key_file.to_str().expect("utf-8"),
             ])
+            .env("YAAM_MAINTENANCE_MS", MAINTENANCE_MS)
             .stdout(Stdio::null())
             .stderr(Stdio::from(handle));
         for (name, value) in env {
