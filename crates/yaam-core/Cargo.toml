@@ -10,6 +10,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Crash checkpoints are test instrumentation, and a release has no business being able to park a
+# write half done. Off by default so the code is absent from a shipped build rather than merely
+# unarmed in one; the crash tests are what turn it on. See `crash`.
+crash-points = []
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true

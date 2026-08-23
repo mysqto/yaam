@@ -28,14 +28,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `crash-points` gates code the run above cannot see — the crash test is
+      # `required-features` and its checkpoints compile out — so lint it under the feature too.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # The published schemas, and the three shapes they are generated from. Also a `cargo test`
       # assertion, so a green test run cannot hide it — this is here for the readable failure.
       - run: cargo xtask check
       - run: cargo test --workspace
       # Kills a real service at each durability window and asserts a restarted one converges.
       # Ignored by the run above because it waits minutes on maintenance timers — see ci/check.sh.
+      # `--features crash-points` is what puts the checkpoints in the spawned binaries; every other
+      # step here, and every release, is built without them. The test target requires the feature,
+      # so dropping this flag fails the build instead of running a test that cannot crash anything.
       - name: Crash injection (kill -9 at each durability window)
-        run: cargo test -p yaam-cli --test crash_injection -- --ignored
+        run: cargo test -p yaam-cli --features crash-points --test crash_injection -- --ignored
       # `yaam-bench` is built by the steps above so it cannot rot, and never run: it has no tests,
       # and its entry point is a `--release` binary that takes minutes. Excluded from coverage
       # because it is measurement code — see ci/check.sh.
