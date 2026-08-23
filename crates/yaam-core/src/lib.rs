@@ -38,6 +38,7 @@ pub mod backup;
 pub mod bundle;
 #[cfg(feature = "crash-points")]
 pub mod crash;
+pub mod drain;
 pub mod erase;
 pub mod error;
 pub mod health;

@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use yaam_core::drain;
 
 use crate::exit;
 
@@ -100,7 +101,8 @@ pub struct AgentArgs {
     pub retry_interval_ms: Option<u64>,
 }
 
-/// Operate a memory store: rebuild the index, erase a subject, copy it, read its health.
+/// Operate a memory store: rebuild the index, run its queued work, erase a subject, copy it, read
+/// its health.
 #[derive(Debug, Parser)]
 #[command(
     name = "yaam",
@@ -130,6 +132,20 @@ pub enum Command {
         /// Rebuild everything. The only rebuild there is; accepted for the procedures that name it.
         #[arg(long)]
         all: bool,
+    },
+    /// Run the queued fan-out: materialise entity timelines and subject audit records.
+    ///
+    /// A service does this on its maintenance timer, so a deployment needs it only to catch up in a
+    /// hurry. A store driven by this command line alone has no timer, and this is what converges it:
+    /// fan-out is enqueued by a write and by every rebuild, and until it runs an entity's timeline is
+    /// a file that is not there.
+    Drain {
+        /// Jobs to settle before reporting and returning.
+        ///
+        /// A bound, not a target. Draining until the queue is empty can be held open indefinitely
+        /// by a writer filling it, so this settles what it can and reports the remainder.
+        #[arg(long, value_name = "N", default_value_t = drain::MAX_JOBS)]
+        max_jobs: usize,
     },
     /// Destroy a subject's keys, making their record bodies permanently unreadable.
     ///

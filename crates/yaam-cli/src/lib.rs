@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `yaam-server` | The HTTP service, plus the maintenance its store needs. |
 //! | `yaam-agent` | The local sidecar: one socket per caller, sealing and signing on their behalf. |
-//! | `yaam` | The operator command line: rebuild, erase, verify, back up, restore, read health. |
+//! | `yaam` | The operator command line: rebuild, drain, erase, verify, back up, restore, read health. |
 //!
 //! One crate, because the first two open the same store and have to agree about where it is. Three
 //! crates would be three argument parsers, and the first setting one of them spelled differently
@@ -26,7 +26,8 @@
 //! # Where the logic is
 //!
 //! Not here. Every judgement these binaries appear to make is a library call:
-//! [`yaam_core::reindex::reindex_all`], [`yaam_core::erase`], [`yaam_core::backup`],
+//! [`yaam_core::reindex::reindex_all`], [`yaam_core::drain`], [`yaam_core::erase`],
+//! [`yaam_core::backup`],
 //! [`yaam_core::health::check`], [`yaam_agent::listener::serve_until`],
 //! [`yaam_server::routes::router`]. What is here is argument parsing, refusals that belong before
 //! anything starts, signal handling, rendering and exit codes.
@@ -161,6 +162,7 @@ fn run_operator(cli: &OperatorCli, env: &Env, out: &mut dyn Write) -> Result<Exi
         // `--all` changes nothing: a rebuild reads the whole tree either way. It is accepted because
         // the recovery procedures name it, and ignoring an unknown flag would be worse.
         Command::Reindex { all: _ } => ops::reindex(&mut pipeline, out),
+        Command::Drain { max_jobs } => ops::drain(&mut pipeline, *max_jobs, out),
         Command::Erase {
             subject,
             confirm_destroy_keys,

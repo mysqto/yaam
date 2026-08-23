@@ -7,7 +7,9 @@
 //!
 //! In process rather than through a running service, but through the real `yaam` binary for the
 //! rebuild itself: the rebuild is an operator action, and what it does to the tree is the half a
-//! library test would not see.
+//! library test would not see. The rebuild drains the fan-out it queues before it returns, so the
+//! state asserted after it is the state an operator is handed — not an intermediate one that only a
+//! later drain resolves.
 
 #![forbid(unsafe_code)]
 
@@ -53,17 +55,13 @@ fn a_rebuild_past_two_rollovers_leaves_the_record_listed_once() {
     );
     let said = String::from_utf8_lossy(&rebuilt.stdout);
     assert!(said.contains("timelines dropped   3"), "{said}");
+    assert!(said.contains("jobs still queued   0"), "{said}");
 
-    // Files and rows went together. Either one surviving the other is a duplicate or a line nothing
-    // will write again, so this is asserted rather than left to the count below.
-    assert_eq!(timeline_mentions(&timeline, &id), 0, "the files are gone");
+    // Files and rows went together, and the fan-out that follows them is part of the command: the
+    // frozen parts are gone with the rows that accounted for their lines, and one head carries the
+    // line exactly once.
     assert!(!timeline.join("timeline-0001.md").exists());
-    assert_eq!(mention_rows(&deployment), 0, "and so are the rows");
-
-    {
-        let mut pipeline = Pipeline::new(deployment.root()).expect("pipeline");
-        assert_eq!(pipeline.drain_fanout(10).expect("drained"), 1);
-    }
+    assert!(!timeline.join("timeline-0002.md").exists());
     assert_eq!(
         timeline_mentions(&timeline, &id),
         1,
@@ -76,6 +74,14 @@ fn a_rebuild_past_two_rollovers_leaves_the_record_listed_once() {
         "the timeline was rebuilt, not appended to beside the parts it replaced"
     );
     assert_eq!(mention_rows(&deployment), 1);
+
+    // Nothing is left for a later drain, and a re-drive of the append would not duplicate the line
+    // anyway: the row is what says it is already there.
+    {
+        let mut pipeline = Pipeline::new(deployment.root()).expect("pipeline");
+        assert_eq!(pipeline.drain_fanout(10).expect("drained"), 0);
+    }
+    assert_eq!(timeline_mentions(&timeline, &id), 1);
 }
 
 /// Rows in the index accounting for the lines of every timeline.

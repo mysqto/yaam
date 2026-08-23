@@ -55,7 +55,12 @@ fn every_documented_exit_code_comes_out_of_the_binary() {
         (
             vec!["--root", root, "reindex", "--all"],
             0,
-            "a rebuild works",
+            "a rebuild works, and drains what it re-enqueued",
+        ),
+        (
+            vec!["--root", root, "drain"],
+            0,
+            "nothing is queued, because the rebuild already ran it",
         ),
     ];
 

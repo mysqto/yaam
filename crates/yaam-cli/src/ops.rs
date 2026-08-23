@@ -1,4 +1,4 @@
-//! The six operator commands.
+//! The seven operator commands.
 //!
 //! Thin on purpose: each one opens a pipeline, calls the library operation the documentation names,
 //! and renders the report. Every judgement they make — what drift is, what a backlog is, what an
@@ -17,6 +17,7 @@ use std::path::Path;
 
 use yaam_contract::SubjectHash;
 use yaam_core::backup::{self, BackupReport};
+use yaam_core::drain::{self, DrainReport};
 use yaam_core::erase::{self, ErasePreview};
 use yaam_core::health::{self, HealthReport};
 use yaam_core::reindex;
@@ -34,7 +35,17 @@ const RETAINED: &str = "frontmatter, attributes, entity references and timelines
      still answers that this subject was named, when, and about what — only what the records said \
      becomes unreadable";
 
-/// Rebuilds the index from the tree.
+/// Rebuilds the index from the tree, then runs the fan-out that rebuild re-enqueued.
+///
+/// The drain is part of the command rather than a step to remember, for the same reason the restore
+/// carries its rebuild: a rebuild drops every materialised timeline along with the index rows that
+/// account for their lines, so a command that returned there would leave `entities/` empty — for
+/// ever, on a store with no service to converge it, while `--help` and the contract both say
+/// timelines are retained.
+///
+/// [`Exit::Degraded`] when the drain leaves work behind, because that is the state `check` calls
+/// degraded over the same queue. Re-running a rebuild is safe, and the narrower remedy the report
+/// names is `yaam drain`.
 pub fn reindex(pipeline: &mut Pipeline, out: &mut dyn Write) -> Result<Exit> {
     let index = pipeline.paths().index.clone();
     let report =
@@ -49,7 +60,7 @@ pub fn reindex(pipeline: &mut Pipeline, out: &mut dyn Write) -> Result<Exit> {
     if report.timelines_dropped > 0 {
         text.push_str(
             "a materialised timeline is dropped with the index rows that say which lines it \
-             already holds; the fan-out this queued writes them again\n",
+             already holds; the fan-out this queued writes them again, which is the drain below\n",
         );
     }
     if report.skipped > 0 {
@@ -58,8 +69,13 @@ pub fn reindex(pipeline: &mut Pipeline, out: &mut dyn Write) -> Result<Exit> {
              its rows are not in the index\n",
         );
     }
+    let converged = settle_fanout(pipeline, &mut text);
     emit(out, &text)?;
-    Ok(Exit::Ok)
+    if converged {
+        Ok(Exit::Ok)
+    } else {
+        Ok(Exit::Degraded)
+    }
 }
 
 /// Destroys a subject's keys, once the operator has said so explicitly.
@@ -67,6 +83,11 @@ pub fn reindex(pipeline: &mut Pipeline, out: &mut dyn Write) -> Result<Exit> {
 /// Without `confirmed` this prints what would be destroyed and stops. That is the whole reason the
 /// preview exists in the library: a confirmation over a 64-character pseudonym nobody can read at a
 /// glance is not a check, and a count of what is about to become unreadable is.
+///
+/// A confirmed erasure ends in a rebuild, so it owes the same drain a rebuild does — the timelines
+/// this command's own wording says are *retained* are dropped by that rebuild, and something has to
+/// write them again. Unlike [`reindex`], what the drain manages does not reach the exit code: see the
+/// comment on the success below.
 pub fn erase(
     pipeline: &mut Pipeline,
     subject: &str,
@@ -97,6 +118,8 @@ pub fn erase(
     line(&mut text, "keys destroyed", report.keys_destroyed);
     line(&mut text, "quarantine settled", report.quarantine_settled);
     let _ = writeln!(text, "  tombstone           {}", report.tombstone_id);
+    // Reported, and deliberately not folded into the exit code below.
+    let _ = settle_fanout(pipeline, &mut text);
     let _ = writeln!(
         text,
         "\ncompleteness cannot be asserted until the key backup window has passed. Confirm with:\n  \
@@ -104,6 +127,12 @@ pub fn erase(
         report.tombstone_id
     );
     emit(out, &text)?;
+    // Success, whatever the drain above managed. This command was asked to destroy keys and it did;
+    // the destruction is irreversible and already stands. A fan-out job that could not run is a
+    // separate and recoverable thing, so saying otherwise here would report the one outcome nobody
+    // can act on by re-running the command — and would invite exactly that. What is still owed is in
+    // the report, and `yaam check` is where "does this store want an operator" is a scriptable
+    // question.
     Ok(Exit::Ok)
 }
 
@@ -192,6 +221,84 @@ pub fn check(pipeline: &Pipeline, out: &mut dyn Write) -> Result<Exit> {
         Ok(Exit::Degraded)
     } else {
         Ok(Exit::Ok)
+    }
+}
+
+/// Runs queued fan-out work: the entity timelines and subject audit records a bundle reads.
+///
+/// The command a store with no service behind it needs. `max_jobs` is a bound and not a target: this
+/// settles up to that many jobs and reports, rather than waiting for a queue that a concurrent
+/// writer can keep filling.
+///
+/// [`Exit::Degraded`] when anything is left, which is the judgement `check` makes about the same
+/// queue read from the same place.
+pub fn drain(pipeline: &mut Pipeline, max_jobs: usize, out: &mut dyn Write) -> Result<Exit> {
+    let root = pipeline.paths().root.clone();
+    let report = drain::drain(pipeline, max_jobs)
+        .map_err(|error| failed("draining the fan-out queue", &error))?;
+    let mut text = format!("drained {}\n", root.display());
+    describe_drain(&report, &mut text);
+    emit(out, &text)?;
+    if report.needs_attention() {
+        Ok(Exit::Degraded)
+    } else {
+        Ok(Exit::Ok)
+    }
+}
+
+/// Runs the fan-out a rebuild re-enqueued, and describes it in the caller's own report.
+///
+/// Never an error, and never a report of one. Both callers have already done the thing they were
+/// asked to do — an index rebuilt, a subject's keys destroyed — and fan-out that could not run is a
+/// separate, recoverable thing: the queue is derived, the work is still queued, and a later
+/// `yaam drain` or a running service does it. `false` says the store did not converge, which is a
+/// judgement the caller is free to spend its exit code on or not.
+fn settle_fanout(pipeline: &mut Pipeline, text: &mut String) -> bool {
+    text.push_str("\nfan-out the rebuild queued:\n");
+    match drain::drain_backlog(pipeline) {
+        Ok(report) => {
+            describe_drain(&report, text);
+            !report.needs_attention()
+        }
+        Err(error) => {
+            let _ = writeln!(
+                text,
+                "  could not be drained: {error}\nnothing is lost — the queue is derived and the \
+                 work is still in it. Run `yaam drain` once the cause is fixed, or let a running \
+                 service converge it"
+            );
+            false
+        }
+    }
+}
+
+/// A finished drain, as an operator reads it.
+///
+/// One description shared by the explicit command and the drains a rebuild and an erasure run on
+/// their own behalf: three accounts of one queue would drift, and the numbers are the same numbers.
+fn describe_drain(report: &DrainReport, text: &mut String) {
+    line(text, "jobs settled", report.settled);
+    line(text, "jobs still queued", report.remaining);
+    line(text, "set aside", report.dead_lettered);
+    line(text, "bound", report.budget);
+    if report.hit_bound() {
+        text.push_str(
+            "the bound stopped this drain, not an empty queue: it is one pass over the work, so \
+             that a command cannot be held open by a writer filling the queue beside it. Run \
+             `yaam drain` again for the rest.\n",
+        );
+    } else if report.remaining > 0 {
+        text.push_str(
+            "what is left failed and is waiting out its retry delay. It stays queued: run \
+             `yaam drain` again in a moment, or let a running service converge it.\n",
+        );
+    }
+    if report.dead_lettered > 0 {
+        text.push_str(
+            "`.dead-letter/` holds fan-out that ran out of attempts. Nothing will retry it, and no \
+             record was lost: each file names the job and why it failed, and `yaam reindex --all` \
+             queues that work again once the cause is gone.\n",
+        );
     }
 }
 
@@ -291,6 +398,11 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
              own; a backlog that does not shrink means nothing is draining it.\n",
         );
     }
+    if report.sweeper_backlog.fanout_pending > 0 {
+        // Named here because this is the figure `yaam drain` reports back, and a backlog with no
+        // command beside it reads as something only a service can fix.
+        text.push_str("run `yaam drain` to run the queued fan-out now.\n");
+    }
     text
 }
 
@@ -315,7 +427,7 @@ mod tests {
 
     use yaam_core::{Paths, Pipeline};
 
-    use super::{backup, check, erase, reindex, restore, verify_erasure};
+    use super::{backup, check, drain, erase, reindex, restore, verify_erasure};
     use crate::exit::Exit;
     use crate::fixtures::{self, BODY};
 
@@ -382,6 +494,75 @@ mod tests {
         let (_, printed) = run(|out| reindex(&mut tree.pipeline, out));
         assert!(printed.contains("timelines dropped   1"), "{printed}");
         assert!(printed.contains("writes them again"), "{printed}");
+    }
+
+    /// The gap this drain closes: a rebuild used to return with `entities/` empty, and on a store
+    /// driven only by this command line nothing came along to fill it again.
+    #[test]
+    fn a_rebuild_leaves_the_timeline_it_dropped_materialised_again() {
+        let mut tree = Tree::new();
+        let record = fixtures::record("2026-08-20T09:00:00Z");
+        let id = record.record_id.clone();
+        tree.pipeline.accept(record, BODY).expect("accepted");
+        tree.pipeline.drain_fanout(100).expect("drained");
+        let timeline = tree.root().join("entities/ticket/PROJ-42/timeline.md");
+        assert!(timeline.is_file());
+
+        let (exit, printed) = run(|out| reindex(&mut tree.pipeline, out));
+        assert_eq!(exit, Exit::Ok, "{printed}");
+        assert!(printed.contains("jobs still queued   0"), "{printed}");
+        assert!(
+            fs::read_to_string(&timeline)
+                .expect("the timeline is back")
+                .contains(&format!("[[record:{}", id.as_str())),
+            "the rebuild left the record's line out of the timeline it dropped"
+        );
+    }
+
+    #[test]
+    fn a_drain_reports_what_it_settled_and_what_it_left() {
+        let mut tree = Tree::new();
+        tree.pipeline
+            .accept(fixtures::record("2026-08-20T09:00:00Z"), BODY)
+            .expect("accepted");
+
+        let (exit, printed) = run(|out| drain(&mut tree.pipeline, 10, out));
+        assert_eq!(exit, Exit::Ok, "{printed}");
+        assert!(printed.contains("jobs settled        1"), "{printed}");
+        assert!(printed.contains("jobs still queued   0"), "{printed}");
+        assert!(
+            printed.contains("bound               10"),
+            "the bound has to be in the report, or a remainder cannot be read: {printed}"
+        );
+    }
+
+    /// A bound reached is a remainder, and a remainder is what `check` calls degraded.
+    #[test]
+    fn a_drain_that_reaches_its_bound_reports_the_remainder_and_is_degraded() {
+        let mut tree = Tree::new();
+        tree.pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &fixtures::subject('a')),
+                BODY,
+            )
+            .expect("accepted");
+
+        let (exit, printed) = run(|out| drain(&mut tree.pipeline, 1, out));
+        assert_eq!(exit, Exit::Degraded, "{printed}");
+        assert!(printed.contains("jobs settled        1"), "{printed}");
+        assert!(printed.contains("jobs still queued   1"), "{printed}");
+        assert!(
+            printed.contains("the bound stopped this drain"),
+            "{printed}"
+        );
+
+        // The number the remainder is reported as is the number `check` reports for the same queue.
+        let (_, health) = run(|out| check(&tree.pipeline, out));
+        assert!(health.contains("fan-out pending 1"), "{health}");
+
+        let (exit, printed) = run(|out| drain(&mut tree.pipeline, 10, out));
+        assert_eq!(exit, Exit::Ok, "{printed}");
+        assert!(printed.contains("jobs still queued   0"), "{printed}");
     }
 
     #[test]
@@ -542,6 +723,40 @@ mod tests {
         // Stamped complete, so asking again answers from the log rather than re-checking.
         let (exit, _) = run(|out| verify_erasure(&mut pipeline, "tomb-old", out));
         assert_eq!(exit, Exit::Ok);
+    }
+
+    /// Erasure is the irreversible half, and it has happened by the time the drain runs. A job that
+    /// could not run is recoverable and separate, so it is reported and does not touch the exit code:
+    /// a failure here would send an operator to re-run the one command that must never be re-run for
+    /// a reason it did not have.
+    #[test]
+    fn an_erasure_whose_fan_out_cannot_run_still_reports_success() {
+        let mut tree = Tree::new();
+        let subject = fixtures::subject('f');
+        tree.pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &subject),
+                BODY,
+            )
+            .expect("accepted");
+
+        // A file where the audit record's directory has to be, so the job that writes it cannot
+        // succeed. It survives the rebuild inside the erasure, which is what makes it reach the
+        // drain — where the timelines under `entities/` are dropped and made again.
+        fs::write(tree.root().join("audit/subjects"), "not a directory").expect("in the way");
+
+        let (exit, printed) = run(|out| erase(&mut tree.pipeline, subject.as_str(), true, out));
+        assert_eq!(
+            exit,
+            Exit::Ok,
+            "the keys were destroyed; that is what this command was asked for: {printed}"
+        );
+        assert!(printed.contains("keys destroyed      1"), "{printed}");
+        assert!(
+            printed.contains("jobs still queued   1"),
+            "the job that could not run has to be said out loud: {printed}"
+        );
+        assert!(printed.contains("yaam drain"), "{printed}");
     }
 
     #[test]
