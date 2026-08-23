@@ -538,6 +538,28 @@ pub fn indexed(deployment: &Deployment) -> BTreeMap<String, i64> {
 }
 
 /// Every queued fan-out job as `record_id/job_kind/state`, in a stable order.
+/// The jobs in the queue, by identity and not by state.
+///
+/// For assertions about whether a *second* job appeared. A job's state legitimately advances while a
+/// service is running -- `claimed` becomes `done` as the sweeper finishes it -- so comparing the state
+/// too makes such an assertion a race, and one that only loses on a loaded machine.
+pub fn fanout_jobs(deployment: &Deployment) -> Vec<String> {
+    let conn = index_of(deployment);
+    let mut statement = conn
+        .prepare("SELECT record_id, job_kind FROM fanout_queue ORDER BY record_id, job_kind")
+        .expect("prepare");
+    let rows = statement
+        .query_map([], |row| {
+            Ok(format!(
+                "{}/{}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?
+            ))
+        })
+        .expect("query");
+    rows.map(|row| row.expect("row")).collect()
+}
+
 pub fn fanout(deployment: &Deployment) -> Vec<String> {
     let conn = index_of(deployment);
     let mut statement = conn

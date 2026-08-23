@@ -39,8 +39,9 @@ use yaam_core::crash;
 mod support;
 
 use support::{
-    BODY, Deployment, PATIENCE, Service, age, age_fanout_claims, eventually, fanout, indexed,
-    post_record, post_unanswered, record, record_files, timeline_mentions, write_request, yaam,
+    BODY, Deployment, PATIENCE, Service, age, age_fanout_claims, eventually, fanout, fanout_jobs,
+    indexed, post_record, post_unanswered, record, record_files, timeline_mentions, write_request,
+    yaam,
 };
 
 /// How long a test waits for another process to converge.
@@ -309,7 +310,7 @@ fn converged_after_a_replay(
     record: &yaam_contract::ActionRecord,
 ) {
     let files = record_files(deployment.root());
-    let queued = fanout(deployment);
+    let queued = fanout_jobs(deployment);
     let mentions = timeline_mentions(&dir(deployment), &record.record_id);
 
     let answer = post_record(service.address, record, BODY);
@@ -325,7 +326,7 @@ fn converged_after_a_replay(
     );
 
     assert_eq!(record_files(deployment.root()), files, "no second file");
-    assert_eq!(fanout(deployment), queued, "no second job");
+    assert_eq!(fanout_jobs(deployment), queued, "no second job");
     assert_eq!(
         timeline_mentions(&dir(deployment), &record.record_id),
         mentions,
