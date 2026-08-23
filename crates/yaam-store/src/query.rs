@@ -602,7 +602,10 @@ fn search_sql(needle: &str, limit: u32, scope: &Scope, select: Select) -> (Strin
         sql.push_str(" AND ");
         sql.push_str(&predicate);
     }
-    sql.push_str(" ORDER BY candidates.relevance, rec.received_ms DESC LIMIT ?");
+    // `rec.id` last, as every other read here does: relevance and `received_ms` both tie
+    // readily -- two records carrying the same text score the same, and a batch written in one
+    // millisecond shares a timestamp -- and an order that is not total makes a page arbitrary.
+    sql.push_str(" ORDER BY candidates.relevance, rec.received_ms DESC, rec.id DESC LIMIT ?");
     binds.push(i64::from(limit).into());
     (sql, binds)
 }
@@ -1077,6 +1080,24 @@ mod tests {
         // is still served in full — a candidate set under the page would cap the answer twice.
         assert_eq!(candidate_ceiling(MAX_CANDIDATES), MAX_CANDIDATES);
         assert_eq!(candidate_ceiling(u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn a_full_text_page_is_ordered_totally() {
+        // Relevance and `received_ms` both tie readily: two records carrying the same text score the
+        // same, and a batch written inside one millisecond shares a timestamp. Without the primary
+        // key last the page order is arbitrary, which is how a scope test passed eight runs in nine.
+        for select in [Select::Id, Select::Structure] {
+            let (sql, _) = search_sql("shards", 10, &reader(), select);
+            let order = sql
+                .rsplit_once("ORDER BY")
+                .map(|(_, tail)| tail.to_owned())
+                .expect("an ordered page");
+            assert!(
+                order.contains("rec.id"),
+                "the page order must end at the primary key: {order}"
+            );
+        }
     }
 
     #[test]
