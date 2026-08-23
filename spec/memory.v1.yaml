@@ -11,12 +11,12 @@ openapi: 3.1.0
 info:
   title: yaam memory service
   version: 1.0.0
-  summary: Signed HTTP surface over an agent memory store — five endpoints, no rebuild endpoint.
+  summary: Signed HTTP surface over an agent memory store — six endpoints, no rebuild endpoint.
   license:
     name: MIT
     identifier: MIT
   description: |
-    Five endpoints. Markdown is the source of truth underneath; the index this service reads is
+    Six endpoints. Markdown is the source of truth underneath; the index this service reads is
     derived and disposable.
 
     ## Every request is signed, reads included
@@ -62,10 +62,14 @@ info:
 
     ## A read returns structure, and never a body
 
-    Every read — `GET /records`, `GET /entities/{kind}/{id}`, `GET /bundle` — answers with each
-    matching record's stored frontmatter: identifiers, timestamps, agent, action, outcome, declared
-    attributes, entity references, subject pseudonyms, visibility, data class and tags. That is a
-    `RecordStructure`, and it is the whole of what a read hands back.
+    Every read — `GET /records`, `GET /search`, `GET /entities/{kind}/{id}`, `GET /bundle` — answers
+    with each matching record's stored frontmatter: identifiers, timestamps, agent, action,
+    outcome, declared attributes, entity references, subject pseudonyms, visibility, data class and
+    tags. That is a `RecordStructure`, and it is the whole of what a read hands back.
+
+    `GET /search` is the one read whose *input* is prose, and it is not an exception to any of this:
+    the needle goes in and structure comes out. A caller can ask which record mentions a word
+    without being handed the words, which is the only shape a full-text read can take here.
 
     The body is never in it. Not for a sealed record and not for a plaintext one: the rule does not
     branch on `data_class`, because a read that returned prose for `internal` records would be
@@ -352,6 +356,65 @@ paths:
                 $ref: '#/components/schemas/Error'
               example:
                 error: 'unprocessable: a window needs both `from_ms` and `to_ms`'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /search:
+    get:
+      tags: [records]
+      operationId: searchRecords
+      summary: Which records mention something
+      description: |
+        Full text over record bodies, best match first. The needle reaches the prose and the answer
+        does not carry it: each hit comes back as its stored structure, in the same
+        `RecordsResponse` as `GET /records`. The question is which record mentions this, and the
+        answer is which record — never the words it mentioned it with.
+
+        Only plaintext bodies are searchable. A sealed body holds no text to index, so a
+        `subject_derived` record never matches whatever its prose said before it was sealed, and the
+        query refuses one explicitly rather than trusting the index to hold nothing. Full text is
+        the obvious way around sealing, and this is where that is closed.
+
+        Scoped like every other read, and the scope test is part of the query rather than a filter
+        over what it answered: no record outside the caller's scope is ever selected, and there is no
+        spelling of `q` that widens what the credential may see.
+
+        **A short page is not proof that nothing else matched.** Neither a row cap nor a scope
+        predicate can be pushed into a full-text match, so the matches examined are capped at `20`
+        times `limit`, never more than `5000`, taken from the most recently indexed end of what
+        matched — and the scope test runs over those. A caller entitled to a small share of what
+        matched can get a short page, up to an empty one, while records it may read sit past the
+        cap. That is a deliberate loss of recall bought for a bounded read: narrow the needle rather
+        than raising `limit` to walk the corpus.
+
+        There is no window, no attribute filter and no ordering parameter here. A full-text read is
+        one question; combining it with the filtered query would be a second endpoint pretending to
+        be a parameter of this one.
+      parameters:
+        - $ref: '#/components/parameters/q'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          $ref: '#/components/responses/Records'
+        '400':
+          $ref: '#/components/responses/BadQuery'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          description: |
+            Permanent. `q` is not an expression the match syntax admits — an unbalanced quote, a
+            dangling operator, or an empty needle, which is a search for nothing rather than a
+            search for everything. Fix the needle; the same one will never parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: >-
+                  unprocessable: full-text needle `unbalanced " quote` is not a match expression:
+                  unterminated string
         '500':
           $ref: '#/components/responses/Internal'
         '503':
@@ -684,6 +747,24 @@ components:
         maximum: 100
       example: 5
 
+    q:
+      name: q
+      in: query
+      required: true
+      description: |
+        The needle, as an `FTS5` match expression over record bodies: a bare word, several words —
+        which match a record holding all of them, anywhere in its body — a prefix as `roll*`, or a
+        phrase in double quotes. Required, because a search for nothing is not a search for
+        everything, and one this document defaulted would answer a question nobody asked.
+
+        Matched against plaintext bodies only, so it never reaches a sealed one. Whatever it
+        matches, it comes back as structure: the needle is the caller's and the answer is the
+        record, not the prose.
+      schema:
+        type: string
+        minLength: 1
+      example: 'rolled back'
+
     limit:
       name: limit
       in: query
@@ -693,7 +774,8 @@ components:
         every match: a page size with no default and no cursor is a trap, and the first caller to
         omit it would read the whole index into memory. A value given here is honoured as given.
         There is no cursor, so page by narrowing the request — a window on `GET /records`, a
-        confidence floor on an entity's history — rather than by walking an offset.
+        confidence floor on an entity's history, a narrower needle on `GET /search` — rather than by
+        walking an offset.
 
         The default is a property of what a row costs. Each row is a record's frontmatter, 600 to
         1,500 bytes depending on how many attributes, entities and tags it carries, so a page of 200
@@ -1113,7 +1195,7 @@ components:
       type: object
       description: |
         One record as a read returns it: every frontmatter key, and no body. The shape of
-        `GET /records`, `GET /entities/{kind}/{id}` and each entry of a bundle.
+        `GET /records`, `GET /search`, `GET /entities/{kind}/{id}` and each entry of a bundle.
 
         It is `ActionRecord` without `summary`, and that is the whole difference — the key set is the
         Markdown frontmatter's, checked against it in the implementation's own build rather than kept
@@ -1285,8 +1367,9 @@ components:
         copies key destruction cannot erase. A body is read from the Markdown tree, by something with
         access to the tree.
 
-        The answer to `GET /records` and to `GET /entities/{kind}/{id}` alike: what a read returns is
-        a property of this service, not of which read was made.
+        The answer to `GET /records`, `GET /search` and `GET /entities/{kind}/{id}` alike: what a
+        read returns is a property of this service, not of which read was made — including the read
+        whose input was prose.
       required: [records, token_estimate]
       properties:
         records:

@@ -268,6 +268,50 @@ fn full_text_finds_a_plaintext_body_and_never_a_sealed_one() {
     assert!(!frontmatter.contains("distinctivetoken"));
 }
 
+/// The projection a request reads full text with: the row itself, and never the prose that matched.
+#[test]
+fn a_full_text_read_answers_with_structure_and_pages_like_every_other_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    let mut first = record("deploy", Outcome::Success, T10);
+    first.summary = "the second shard stalled and the rollout stopped".to_owned();
+    publish(&mut writer, &first).expect("publish");
+    let mut second = record("deploy", Outcome::Failure, T11);
+    second.summary = "a later attempt stalled on the same shard".to_owned();
+    publish(&mut writer, &second).expect("publish");
+
+    let store = Store::open_read(&path).expect("open read");
+    let found = query::search_structures(&store, "stalled", None, &ALL).expect("search");
+    assert_eq!(found.len(), 2, "{:?}", structure_ids(&found));
+    // The structure the record was stored with, and no field carrying what the needle matched.
+    for structure in &found {
+        let written = [&first, &second]
+            .into_iter()
+            .find(|doc| doc.record_id == structure.record_id)
+            .expect("a record this test wrote");
+        assert_eq!(structure, &yaam_contract::RecordStructure::from(written));
+        let json = serde_json::to_string(structure).expect("serialisable");
+        assert!(!json.contains("stalled"), "the body came back: {json}");
+    }
+
+    // The page size means what it means everywhere else: a number is honoured, and zero is a page
+    // of no rows rather than a page size nobody named.
+    assert_eq!(
+        query::search_structures(&store, "stalled", Some(1), &ALL)
+            .expect("search")
+            .len(),
+        1
+    );
+    assert!(
+        query::search_structures(&store, "stalled", Some(0), &ALL)
+            .expect("search")
+            .is_empty(),
+        "zero rows is a page a caller may ask for"
+    );
+}
+
 #[test]
 fn full_text_stays_consistent_across_insert_update_and_delete() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -553,6 +597,19 @@ fn every_read_path_applies_the_scope() {
             .is_empty(),
         "the caller's own team must still be searchable"
     );
+    // And the projection a request reads with, which is the one that would hand over the row
+    // itself: the wider select list must not widen the match's scope test either.
+    assert!(
+        query::search_structures(&store, "support", None, &scope)
+            .expect("search")
+            .is_empty(),
+        "the other team's body was reachable as structure"
+    );
+    assert!(
+        !query::search_structures(&store, "platform", None, &scope)
+            .expect("search")
+            .is_empty()
+    );
 
     // Correlation: each side carries its own scope, so a pair needs both ends visible.
     let left = Filter {
@@ -586,6 +643,11 @@ fn a_read_with_no_scope_returns_nothing_rather_than_everything() {
     );
     assert!(
         query::search(&store, "visible", 10, &Scope::default())
+            .expect("search")
+            .is_empty()
+    );
+    assert!(
+        query::search_structures(&store, "visible", None, &Scope::default())
             .expect("search")
             .is_empty()
     );
@@ -980,8 +1042,17 @@ fn a_malformed_full_text_query_is_reported() {
     Writer::open(&path).expect("open writer");
     let store = Store::open_read(&path).expect("open read");
 
-    let error = query::search(&store, "unbalanced \" quote", 5, &ALL).expect_err("must fail");
-    assert!(matches!(error, yaam_store::Error::Sqlite(_)));
+    // Reported as the needle's own failure rather than as the index's: prefix and phrase syntax is
+    // offered to callers, so a mistake in it is a mistake in the request. An empty needle is one of
+    // them — there is no expression that matches everything, and inventing one here would answer a
+    // question nobody asked.
+    for needle in ["unbalanced \" quote", ""] {
+        let error = query::search(&store, needle, 5, &ALL).expect_err("must fail");
+        let yaam_store::Error::BadNeedle { needle: named, .. } = &error else {
+            panic!("`{needle}` was reported as {error:?}");
+        };
+        assert_eq!(named, needle, "the answer has to name what was asked");
+    }
 }
 
 #[test]

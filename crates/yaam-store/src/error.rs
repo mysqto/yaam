@@ -25,6 +25,19 @@ pub enum Error {
         /// What did not fit.
         detail: String,
     },
+    /// A full-text read carried a needle the match syntax does not admit.
+    ///
+    /// The caller's to fix rather than the index's to survive, and reported separately for the
+    /// reason above: prefix and phrase syntax is offered to callers, so a mistake in it is a client
+    /// error, and one that arrived as an opaque database failure would be answered as this
+    /// service's own fault.
+    #[error("full-text needle `{needle}` is not a match expression: {detail}")]
+    BadNeedle {
+        /// The needle as it arrived.
+        needle: String,
+        /// What the match syntax rejected.
+        detail: String,
+    },
     /// Schema version on disk is newer than this binary understands.
     #[error("index schema version {found} is newer than supported {supported}")]
     SchemaTooNew {
