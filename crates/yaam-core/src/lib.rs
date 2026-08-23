@@ -36,6 +36,7 @@
 
 pub mod backup;
 pub mod bundle;
+pub mod crash;
 pub mod erase;
 pub mod error;
 pub mod health;

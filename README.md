@@ -182,6 +182,23 @@ default that behaves exactly as not using them did.
 | `yaam_crypto::keystore::KeyWrapper` | Wraps subject keys before they reach the disk, so a key file recovered from a snapshot or a stale volume is inert without a call to external key custody. `FsKeyStore::unwrapped` is the development default, named so nobody gets it by accident. |
 | `yaam_core::resolve::SubjectResolver` | Decides the subjects a record names. `DeclaredSubjects` trusts the ones it carries; a lookup that is briefly down quarantines the record for a later retry rather than rejecting it. |
 
+## Crash tests
+
+Every durability window has a test that kills a real service inside it with `SIGKILL` and asserts
+what a *restarted* one makes of the state left behind: the staged write that never got renamed, the
+committed record whose fan-out never drained, the timeline rollover that froze the head and never
+made a new one. The windows are opened by a checkpoint the binary carries and arms only when
+`YAAM_CRASH_AT` names one — inert otherwise, and logged loudly when it is not.
+
+They wait on the service's own maintenance timer, so they take minutes and are kept out of a routine
+test run:
+
+```sh
+cargo test -p yaam-cli --test crash_injection -- --ignored
+```
+
+`ci/check.sh` and CI both run them.
+
 ## Status
 
 Early. See `AGENTS.md` for the invariants any contribution must hold.

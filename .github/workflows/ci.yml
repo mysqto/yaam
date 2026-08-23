@@ -18,7 +18,7 @@ jobs:
         run: bash ci/hygiene.sh
 
   test:
-    name: fmt · clippy · test · coverage
+    name: fmt · clippy · test · crash · coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +32,10 @@ jobs:
       # assertion, so a green test run cannot hide it — this is here for the readable failure.
       - run: cargo xtask check
       - run: cargo test --workspace
+      # Kills a real service at each durability window and asserts a restarted one converges.
+      # Ignored by the run above because it waits minutes on maintenance timers — see ci/check.sh.
+      - name: Crash injection (kill -9 at each durability window)
+        run: cargo test -p yaam-cli --test crash_injection -- --ignored
       # `yaam-bench` is built by the steps above so it cannot rot, and never run: it has no tests,
       # and its entry point is a `--release` binary that takes minutes. Excluded from coverage
       # because it is measurement code — see ci/check.sh.
