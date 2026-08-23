@@ -211,6 +211,20 @@ CREATE TABLE fanout_queue (
 -- readiness test, then the order jobs are handed out in.
 CREATE INDEX fanout_queue_claim ON fanout_queue (state, not_before_ms, enqueued_ms);
 
+-- One row per record line in an entity's materialised timeline, written in the same transaction as
+-- the append. This is what makes the append idempotent, and reading the files cannot be: a timeline
+-- is a growing set of frozen parts, so a bounded scan of the newest of them says nothing is there
+-- when the line was frozen into an older one, and a re-enqueued job then appends it a second time.
+-- Derived, and derived *with* the files: a rebuild drops these rows and the timelines together.
+CREATE TABLE timeline_mentions (
+    record_id  TEXT NOT NULL REFERENCES records(record_id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL,
+    entity_id  TEXT NOT NULL,
+    -- Compound rather than surrogate, for the reason fanout_queue's key is: a replayed append
+    -- collides here instead of putting a second line in a file nothing compares.
+    UNIQUE (record_id, kind, entity_id)
+) STRICT;
+
 -- Records held back until their subjects resolve. Pointers only: a body here would be an
 -- unsealed copy in a table the erasure path does not own. No foreign key, because the whole point
 -- is that the record is not in the index yet.

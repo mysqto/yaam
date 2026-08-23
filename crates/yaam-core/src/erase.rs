@@ -141,6 +141,11 @@ pub fn preview(pipeline: &Pipeline, subject: &SubjectHash) -> Result<ErasePrevie
 /// than one that has quietly stopped: the log entry comes first, because it is what
 /// [`crate::reindex::reindex_all`] replays, and the key store tombstone comes before the keys are
 /// destroyed, because a record arriving in between must not be able to mint a fresh key.
+///
+/// The rebuild takes the materialised timelines with it, so they are re-derived rather than kept:
+/// their lines are a function of the records, and the fan-out the rebuild re-enqueues writes them
+/// again. Nothing an erasure removes from a record can come back with them — the rebuild reads the
+/// erased tree.
 pub fn erase_subject(pipeline: &mut Pipeline, subject: &SubjectHash) -> Result<EraseReport> {
     let tombstone_id = format!("tomb-{}", RecordId::generate().as_str());
     append(
@@ -524,12 +529,20 @@ mod tests {
         assert_eq!(counts["record_subjects"], 1);
         // Three references: two from the unrelated internal record, one from the erased one.
         assert_eq!(counts["entity_refs"], 3);
-        // The entity timeline is structure too, and stays.
-        assert!(
-            harness
-                .root()
-                .join("entities/order_ref/ord10014721/timeline.md")
-                .exists()
+        // The entity timeline is structure too, and stays — re-derived rather than kept, because
+        // the rebuild an erasure ends in drops the timelines with the rows that account for them.
+        let timeline = harness
+            .root()
+            .join("entities/order_ref/ord10014721/timeline.md");
+        assert!(!timeline.exists(), "the rebuild took the timelines with it");
+        harness.pipeline.drain_fanout(100).expect("drained");
+        assert_eq!(
+            fs::read_to_string(&timeline)
+                .expect("timeline")
+                .matches(record.record_id.as_str())
+                .count(),
+            1,
+            "the erased record is still listed, once"
         );
 
         // What the index must not keep is key material.

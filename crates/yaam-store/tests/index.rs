@@ -184,11 +184,18 @@ fn deleting_a_record_cascades_to_everything_derived_from_it() {
     doc.attrs
         .insert("region".to_owned(), attrs::Value::Text("north".to_owned()));
     publish(&mut writer, &doc).expect("publish");
+    writer
+        .claim_timeline_mention(doc.record_id.as_str(), "ticket", "TCK-77")
+        .expect("claim")
+        .expect("a first claim")
+        .commit()
+        .expect("commit");
 
     let conn = raw(&path);
     assert_eq!(count(&conn, "entity_refs"), 2);
     assert_eq!(count(&conn, "record_subjects"), 1);
     assert_eq!(count(&conn, "record_attrs"), 1);
+    assert_eq!(count(&conn, "timeline_mentions"), 1);
     assert!(count(&conn, "fanout_queue") > 0);
 
     conn.execute_batch("DELETE FROM records").expect("delete");
@@ -196,6 +203,11 @@ fn deleting_a_record_cascades_to_everything_derived_from_it() {
     assert_eq!(count(&conn, "record_subjects"), 0);
     assert_eq!(count(&conn, "record_attrs"), 0);
     assert_eq!(count(&conn, "fanout_queue"), 0);
+    assert_eq!(
+        count(&conn, "timeline_mentions"),
+        0,
+        "a mention outliving its record would be a line nothing would ever write again"
+    );
 }
 
 #[test]
@@ -996,6 +1008,12 @@ fn truncate_derived_empties_every_table_and_keeps_the_schema() {
     doc.attrs
         .insert("region".to_owned(), attrs::Value::Text("north".to_owned()));
     publish(&mut writer, &doc).expect("publish");
+    writer
+        .claim_timeline_mention(doc.record_id.as_str(), "order_ref", "ORD-1001")
+        .expect("claim")
+        .expect("a first claim")
+        .commit()
+        .expect("commit");
 
     let conn = raw(&path);
     writer
@@ -1012,6 +1030,7 @@ fn truncate_derived_empties_every_table_and_keeps_the_schema() {
         "record_subjects",
         "entities",
         "fanout_queue",
+        "timeline_mentions",
         "quarantine_pending",
         "records_fts",
     ] {
@@ -1032,6 +1051,56 @@ fn truncate_derived_empties_every_table_and_keeps_the_schema() {
     assert_eq!(
         ids(&query::search(&store, "rollback", 10, &ALL).expect("search")),
         vec![doc.record_id.as_str()]
+    );
+}
+
+/// The claim is the whole idempotency argument for a timeline append, so each half is asserted:
+/// a first claim is granted, a second is refused, and one that is dropped rather than committed
+/// leaves nothing behind.
+///
+/// The dropped case is the one worth having a test for. It is what a failed append takes, and
+/// without it a directory that was briefly unwritable would leave a row saying the line is there.
+#[test]
+fn a_timeline_mention_is_claimed_once_and_a_dropped_claim_leaves_no_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    let mut doc = record("deploy", Outcome::Success, T10);
+    doc.entities = vec![entity_ref("ticket", "TCK-77", 1.0)];
+    publish(&mut writer, &doc).expect("publish");
+    let id = doc.record_id.as_str();
+
+    // Dropped without committing: the append it stood for did not happen.
+    drop(
+        writer
+            .claim_timeline_mention(id, "ticket", "TCK-77")
+            .expect("claim")
+            .expect("a first claim"),
+    );
+    let conn = raw(&path);
+    assert_eq!(count(&conn, "timeline_mentions"), 0);
+
+    writer
+        .claim_timeline_mention(id, "ticket", "TCK-77")
+        .expect("claim")
+        .expect("claimable again after a rollback")
+        .commit()
+        .expect("commit");
+    assert_eq!(count(&conn, "timeline_mentions"), 1);
+
+    assert!(
+        writer
+            .claim_timeline_mention(id, "ticket", "TCK-77")
+            .expect("claim")
+            .is_none(),
+        "a line already in the timeline must not be claimable a second time"
+    );
+    // Per entity, not per record: the same record names several, and each has its own timeline.
+    assert!(
+        writer
+            .claim_timeline_mention(id, "ticket", "TCK-78")
+            .expect("claim")
+            .is_some()
     );
 }
 

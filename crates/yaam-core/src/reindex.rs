@@ -10,9 +10,15 @@
 //! round trip rather than one per record — and what makes an interrupted rebuild safe: the truncate
 //! and the rows that replace it commit together or not at all, so a rebuild that dies half way
 //! leaves the index it started from rather than a shorter one that looks finished.
+//!
+//! It also removes the materialised timelines, which is not housekeeping. The index rows recording
+//! which lines a timeline already holds are derived and go with the truncate; a timeline file that
+//! outlived them would be appended to a second time by the fan-out this rebuild re-enqueues. Files
+//! and rows are one thing here, and this transaction is what holds them together.
 
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
@@ -33,6 +39,11 @@ pub struct ReindexReport {
     pub skipped: usize,
     /// Erasures re-applied from the tombstone log.
     pub tombstones_replayed: usize,
+    /// Materialised timeline files removed, because the rows that account for their lines went too.
+    ///
+    /// Reported rather than done quietly: between this rebuild and the fan-out it re-enqueued, an
+    /// entity's timeline is a file that is not there, and an operator is owed that.
+    pub timelines_dropped: usize,
 }
 
 /// Rebuilds the index in place.
@@ -44,13 +55,14 @@ pub struct ReindexReport {
 /// erased subject's record. The replay writes to the tree and the key store, not to the index, so it
 /// sits outside the transaction that follows.
 ///
-/// Everything after it — truncate, tree, manifests, quarantine register — is one transaction. A
-/// rebuild's cost at `synchronous = FULL` was two thirds durability, one commit per record; and a
-/// rebuild that truncated in its own transaction left a window in which the index was short, live and
-/// indistinguishable from a finished one. One transaction answers both. It is affordable because the
-/// index is derived and bounded by the tree, and it is preferable to a resumable batch boundary
-/// because there is nothing to resume from: a rebuild reads the whole tree either way, so a
-/// half-finished one has no partial state worth keeping.
+/// Everything after it — truncate, timelines, tree, manifests, quarantine register — is one
+/// transaction. A rebuild's cost at `synchronous = FULL` was two thirds durability, one commit per
+/// record; and a rebuild that truncated in its own transaction left a window in which the index was
+/// short, live and indistinguishable from a finished one. One transaction answers both, and it is
+/// also what holds the timelines and their rows together. It is affordable because the index is
+/// derived and bounded by the tree, and it is preferable to a resumable batch boundary because
+/// there is nothing to resume from: a rebuild reads the whole tree either way, so a half-finished
+/// one has no partial state worth keeping.
 ///
 /// The sources are listed before the transaction opens, which is also when the tree stops being
 /// consulted for *which* files exist. A file appearing during the rebuild is not indexed by it; the
@@ -61,9 +73,12 @@ pub struct ReindexReport {
 pub fn reindex_all(pipeline: &mut Pipeline) -> Result<ReindexReport> {
     let tombstones_replayed = crate::erase::replay_tombstones(pipeline)?;
     let sources = Sources::list(pipeline)?;
+    // Read before the batch borrows the writer, for the same reason the sources are.
+    let root = pipeline.root().to_path_buf();
 
     let mut batch = pipeline.writer_mut().batch()?;
     batch.truncate_derived()?;
+    let timelines_dropped = drop_timelines(&root)?;
     let (from_tree, tree_skipped) = index_tree(&mut batch, &sources.tree)?;
     let (from_manifests, manifest_skipped) = index_manifests(&mut batch, &sources.manifests)?;
     reregister_quarantine(&mut batch, &sources.quarantine)?;
@@ -74,7 +89,36 @@ pub fn reindex_all(pipeline: &mut Pipeline) -> Result<ReindexReport> {
         from_manifests,
         skipped: tree_skipped + manifest_skipped,
         tombstones_replayed,
+        timelines_dropped,
     })
+}
+
+/// Removes every materialised timeline, so the fan-out this rebuild re-enqueues writes them again.
+///
+/// Files and rows go together, and this is the half that is easy to leave out. The truncate above
+/// drops the mention rows that say which lines a timeline already holds; a file outliving its row
+/// is a line the next drain appends a second time — the duplication the mention table exists to
+/// prevent, arriving by a different route.
+///
+/// Inside the transaction rather than before it, because the batch holds the write lock: nothing
+/// can be appending to a timeline while its files go. A rebuild that fails after this leaves the
+/// rows it started with and no timelines, which is a rebuild to run again — timelines are derived,
+/// and the same command reproduces them. The other order has no such answer: rows gone and files
+/// kept is the duplicate itself, and nothing afterwards can tell that it happened.
+fn drop_timelines(root: &Path) -> Result<usize> {
+    let dir = root.join(layout::ENTITIES_DIR);
+    let dropped = fsutil::walk_files(&dir, "md")?.len();
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        // Nothing materialised yet, which is the state this leaves behind anyway.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Recreated empty: a store's layout is made once, at open, and a reader that finds the
+    // directory missing cannot tell a rebuilt store from a broken one.
+    fs::create_dir_all(&dir)?;
+    fsutil::sync_dir(&dir)?;
+    Ok(dropped)
 }
 
 /// The files one rebuild will read.
@@ -281,11 +325,69 @@ mod tests {
         assert_eq!(report.skipped, 0);
         assert_eq!(report.from_manifests, 0);
         assert_eq!(report.tombstones_replayed, 0);
+        assert_eq!(
+            report.timelines_dropped, 3,
+            "one timeline per entity the tree names, dropped with the rows for their lines"
+        );
+
+        // The rebuild re-enqueued the fan-out and this is what runs it, which is the only way the
+        // timeline mentions come back: they are written by the drain, not by the publish.
+        harness.pipeline.drain_fanout(100).expect("drained");
 
         // Logical equality, table by table: a `SQLite` file is not reproducible byte for byte, but
         // every row that is supposed to be derived from the tree has to be.
         assert_eq!(harness.snapshot(), before);
         assert_eq!(harness.counts(), counts);
+    }
+
+    /// The bug this rebuild used to cause, and the property that closes it.
+    ///
+    /// A rebuild re-enqueues fan-out for every record in the tree, so the append runs a second time
+    /// for a record that was already listed. Two rollovers on, the old check read two files that no
+    /// longer held the line and appended it again. Now the mention rows go with the truncate — and
+    /// the timeline files go with them, or the check would say "not listed" over a file that still
+    /// holds the line, which is the same duplicate by another route.
+    #[test]
+    fn a_rebuild_and_a_drain_leave_the_record_listed_exactly_once() {
+        let mut harness = Harness::new();
+        let record = testkit::internal("2026-08-20T09:00:00Z");
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+        assert_eq!(harness.pipeline.drain_fanout(100).expect("drained"), 1);
+
+        let dir = harness.root().join("entities/ticket/PROJ-42");
+        let head = dir.join("timeline.md");
+        assert_eq!(testkit::timeline_mentions(&dir, &record.record_id), 1);
+
+        // Two rollovers, by hand: the line is in a part that is no longer the newest.
+        fs::rename(&head, dir.join("timeline-0001.md")).expect("freeze");
+        fs::write(dir.join("timeline-0002.md"), "- older history\n").expect("a later part");
+        fs::write(&head, "").expect("a fresh head");
+
+        let report = reindex_all(&mut harness.pipeline).expect("rebuilt");
+        // Three files for this entity — the head and both parts — and the one head of the other
+        // entity the record names.
+        assert_eq!(report.timelines_dropped, 4);
+        assert!(
+            !head.exists() && !dir.join("timeline-0001.md").exists(),
+            "the files went with the rows; anything left here is a line nothing accounts for"
+        );
+
+        assert_eq!(harness.pipeline.drain_fanout(100).expect("drained"), 1);
+        assert_eq!(
+            testkit::timeline_mentions(&dir, &record.record_id),
+            1,
+            "the record is listed twice; the head holds {:?}",
+            fs::read_to_string(&head)
+        );
+        // Rebuilt, not appended to: the seeded parts are gone and one head carries the line.
+        assert_eq!(
+            fs::read_to_string(&head).expect("head").lines().count(),
+            1,
+            "the rebuilt timeline is one line, not a head beside the parts it replaced"
+        );
     }
 
     #[test]

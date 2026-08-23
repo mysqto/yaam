@@ -117,6 +117,32 @@ pub struct Batch<'a> {
     tx: Transaction<'a>,
 }
 
+/// A held claim on one line of one entity's timeline: the row is written, the file is not yet.
+///
+/// The reason this is a guard rather than a plain insert is that the row and the append have to
+/// agree, and they are not the same kind of write — one is a transaction, the other is an fsynced
+/// file append that cannot join it. So the transaction stays open across the append and commits
+/// after it: a caller that fails to write the line drops this instead of committing, and the row
+/// goes with it, which is what lets the fan-out job be retried rather than counted as done.
+///
+/// One window is left, and it is named rather than papered over: a crash between the append's
+/// `fsync` and this commit leaves a line no row accounts for, which the next drive of that job
+/// appends again. A file append cannot join a transaction, so no ordering closes it; what
+/// converges it is that the rows and the files are dropped together, and a rebuild re-derives both.
+#[derive(Debug)]
+pub struct TimelineMention<'a> {
+    /// Rolled back on drop, so an append that failed leaves no row claiming it happened.
+    tx: Transaction<'a>,
+}
+
+impl TimelineMention<'_> {
+    /// Makes the claim permanent, once the line is on disk.
+    pub fn commit(self) -> crate::Result<()> {
+        self.tx.commit()?;
+        Ok(())
+    }
+}
+
 /// Fan-out work every published record needs.
 const JOB_BUNDLE: &str = "bundle";
 /// Fan-out work only records naming subjects need.
@@ -369,6 +395,36 @@ impl Writer {
         )?)
     }
 
+    /// Claims the line naming `record_id` in one entity's timeline, or reports it already written.
+    ///
+    /// `None` means the line is already in the timeline, wherever in it: the answer is one index
+    /// lookup and reads no file, which is the point. The alternative — scanning the timeline — is
+    /// either bounded and wrong, because a line frozen into an older part is invisible to it, or
+    /// unbounded and priced by the entity's whole history.
+    ///
+    /// `Some` hands back an open transaction holding the claim. The caller appends the line and
+    /// then commits; dropping it instead rolls the claim back, so a failed append is work still
+    /// owed rather than a line nothing will ever write.
+    pub fn claim_timeline_mention(
+        &mut self,
+        record_id: &str,
+        kind: &str,
+        entity_id: &str,
+    ) -> crate::Result<Option<TimelineMention<'_>>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let claimed = tx.execute(
+            "INSERT INTO timeline_mentions (record_id, kind, entity_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT (record_id, kind, entity_id) DO NOTHING",
+            params![record_id, kind, entity_id],
+        )?;
+        if claimed == 0 {
+            return Ok(None);
+        }
+        Ok(Some(TimelineMention { tx }))
+    }
+
     /// Drops every derived row so the index can be rebuilt from the tree.
     ///
     /// On its own this leaves an empty index, which is a state no reader should ever see: a rebuild
@@ -414,10 +470,15 @@ impl Batch<'_> {
     }
 
     /// Drops every derived row so the index can be rebuilt from the tree.
+    ///
+    /// The timeline mentions go with them, which is why a rebuild has to remove the timeline files
+    /// too: a file surviving the row that records its line makes the next append write that line a
+    /// second time. [`crate::Writer::claim_timeline_mention`] has the argument in full.
     pub fn truncate_derived(&mut self) -> crate::Result<()> {
-        // Deleting records cascades to attrs, entity refs, subjects and queued fan-out, and the
-        // delete trigger unindexes each body. 'delete-all' then clears any full-text row whose
-        // record went missing without a trigger firing — a rebuild must not inherit a phantom.
+        // Deleting records cascades to attrs, entity refs, subjects, timeline mentions and queued
+        // fan-out, and the delete trigger unindexes each body. 'delete-all' then clears any
+        // full-text row whose record went missing without a trigger firing — a rebuild must not
+        // inherit a phantom.
         self.tx.execute_batch(
             "DELETE FROM records;
              DELETE FROM entities;
