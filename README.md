@@ -92,7 +92,8 @@ A backup carries the tree, the cold manifests, the subject audit trail, the eras
 and no materialised timelines: `yaam_core::backup::MANIFEST` declares the split, each exclusion with
 its reason, and both commands read that one list. The timelines are left behind because a rebuild
 reproduces them — it drops them along with the index rows that record which lines they already hold,
-and the fan-out it queues writes them again from the tree. The key store is the load-bearing exclusion — erasure works by
+and the fan-out it queues writes them again — from the tree, and from the cold manifests for the
+records the tree no longer holds. The key store is the load-bearing exclusion — erasure works by
 destroying keys, so a key surviving in a backup would make a restore un-erase a subject while live
 verification still reported the erasure complete. `restore` refuses a backup that carries one, and
 refuses a store that already holds records; it rebuilds the index and replays the restored

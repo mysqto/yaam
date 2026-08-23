@@ -18,7 +18,7 @@
 //! staging file loses to a later write of the same record, and a published file always beats the
 //! index, which the sweeper then catches up.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -243,7 +243,10 @@ impl Pipeline {
     /// not one of them: the caller asked what the queue got through, and that work is still owed.
     ///
     /// Fan-out is derived, so nothing here is lost for good: [`crate::reindex::reindex_all`]
-    /// re-enqueues every job from the tree.
+    /// re-enqueues every job from the tree — and from the cold manifests, which is why a job whose
+    /// record has been archived has to be doable. A rebuild removes the timelines it is about to
+    /// rebuild, so a drain that could only read the tree would lose an archived record's line for
+    /// good instead of merely delaying it.
     pub fn drain_fanout(&mut self, max_jobs: usize) -> Result<usize> {
         let limit = u32::try_from(max_jobs).unwrap_or(u32::MAX);
         if limit == 0 {
@@ -256,9 +259,10 @@ impl Pipeline {
         }
 
         let located = self.locate_records()?;
+        let archived = self.locate_archived(&jobs, &located)?;
         let mut settled = 0;
         for job in jobs {
-            let Err(reason) = self.run_job(&job, &located) else {
+            let Err(reason) = self.run_job(&job, &located, &archived) else {
                 self.writer.complete_fanout(job.id)?;
                 settled += 1;
                 continue;
@@ -642,18 +646,66 @@ impl Pipeline {
         Ok(located)
     }
 
+    /// The archived records this batch of jobs needs, out of the cold manifests.
+    ///
+    /// Only the jobs whose record has no file in the tree, and empty — with the manifests unread —
+    /// when there are none. A manifest pass costs the size of the archive, so it is made once per
+    /// batch, for the same reason [`Pipeline::locate_records`] walks the tree once per drain.
+    ///
+    /// Records rather than paths: the line has to be parsed to know which record it holds, so
+    /// keeping the answer costs one batch's worth of records and saves reading a manifest again.
+    ///
+    /// The index is not asked, though a rebuild derived a row from the very line this is looking
+    /// for. It records no provenance, so it cannot say which manifest to open — and the record it
+    /// does hold is derived where the manifest is authoritative. Reading it back would also make
+    /// this lookup unable to fail: a job row cannot exist without its record row, so a record
+    /// nothing local holds would fan out from the index instead of telling anyone it is gone.
+    fn locate_archived(
+        &self,
+        jobs: &[FanoutJob],
+        located: &BTreeMap<String, PathBuf>,
+    ) -> Result<BTreeMap<String, ActionRecord>> {
+        let wanted: BTreeSet<&str> = jobs
+            .iter()
+            .map(|job| job.record.as_str())
+            .filter(|id| !located.contains_key(*id))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        crate::reindex::cold_records(&self.paths.root, &wanted)
+    }
+
     /// The work one job stands for.
-    fn run_job(&mut self, job: &FanoutJob, located: &BTreeMap<String, PathBuf>) -> Result<()> {
-        let path = located.get(job.record.as_str()).ok_or_else(|| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("record `{}` is not in the tree", job.record.as_str()),
-            ))
-        })?;
-        let document = Document::parse(&fs::read_to_string(path)?)?;
+    ///
+    /// Both handlers need the record and nothing else, which is what makes an archived record's job
+    /// doable at all: its file is gone from the tree, and its manifest line is the same record.
+    ///
+    /// A record in neither the tree nor a manifest is still `NotFound`, and still reported the way
+    /// it was — the caller retries it and then dead-letters it. That is the right shape for both
+    /// causes: a file a replica has not caught up with is transient, and a record nothing local
+    /// holds is a fault an operator has to see rather than one this can decide is nothing.
+    fn run_job(
+        &mut self,
+        job: &FanoutJob,
+        located: &BTreeMap<String, PathBuf>,
+        archived: &BTreeMap<String, ActionRecord>,
+    ) -> Result<()> {
+        let record = match located.get(job.record.as_str()) {
+            Some(path) => Document::parse(&fs::read_to_string(path)?)?.record,
+            None => archived.get(job.record.as_str()).cloned().ok_or_else(|| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "record `{}` is not in the tree or a cold manifest",
+                        job.record.as_str()
+                    ),
+                ))
+            })?,
+        };
         match job.kind.as_str() {
-            JOB_BUNDLE => self.append_timelines(&document.record),
-            JOB_SUBJECT_LINK => self.write_subject_audit(&document.record),
+            JOB_BUNDLE => self.append_timelines(&record),
+            JOB_SUBJECT_LINK => self.write_subject_audit(&record),
             other => Err(invalid(format!("unknown fan-out job kind `{other}`"))),
         }
     }
@@ -1428,7 +1480,59 @@ mod tests {
             attempts: 1,
         };
         let located = harness.pipeline.locate_records().expect("located");
-        assert!(harness.pipeline.run_job(&job, &located).is_err());
+        let archived = harness
+            .pipeline
+            .locate_archived(std::slice::from_ref(&job), &located)
+            .expect("archived");
+        assert!(harness.pipeline.run_job(&job, &located, &archived).is_err());
+    }
+
+    /// A record archived out of the tree keeps its fan-out; a record nothing holds does not.
+    ///
+    /// The manifests answer for the records they hold and for no others. Turning "not found" into
+    /// "nothing to do" here would make a genuinely missing record silently correct — and a missing
+    /// record is the one thing a fan-out failure is supposed to be able to tell an operator about.
+    #[test]
+    fn a_record_in_neither_the_tree_nor_a_manifest_is_still_a_fault() {
+        let mut harness = Harness::new();
+        let record = testkit::internal(T09);
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+        fs::remove_file(harness.path_of(&record)).expect("remove");
+        // An archive holding some other record, so the lookup runs and comes back empty rather
+        // than never running at all.
+        fs::write(
+            harness.root().join("cold/2026-01.jsonl"),
+            testkit::manifest_line(&testkit::internal("2026-01-05T08:00:00Z")),
+        )
+        .expect("manifest");
+
+        let job = yaam_store::FanoutJob {
+            id: 1,
+            record: record.record_id.clone(),
+            kind: super::JOB_BUNDLE.to_owned(),
+            attempts: 1,
+        };
+        let located = harness.pipeline.locate_records().expect("located");
+        let archived = harness
+            .pipeline
+            .locate_archived(std::slice::from_ref(&job), &located)
+            .expect("archived");
+        assert!(archived.is_empty(), "no manifest holds this record");
+        let error = harness
+            .pipeline
+            .run_job(&job, &located, &archived)
+            .expect_err("a record nothing local holds is a real fault");
+        assert!(
+            matches!(&error, crate::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "the failure has to stay the kind a drain retries and then dead-letters: {error}"
+        );
+
+        // And the drain still treats it that way: nothing settled, the job back in the queue.
+        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 0);
+        assert_eq!(harness.fanout_row(), ("pending".to_owned(), 1));
     }
 
     #[test]

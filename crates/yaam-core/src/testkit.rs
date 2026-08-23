@@ -476,6 +476,20 @@ pub(crate) fn subject_derived(received_at: &str, subjects: &[SubjectHash]) -> Ac
     record
 }
 
+/// One cold manifest line for a record, newline included.
+///
+/// Nothing in this repo writes `cold/` — an archive is produced externally — so a test that reads a
+/// manifest has to write one, and every such test has to write the *same* thing: the frontmatter
+/// projection, which is a record minus its `summary`. Shared here so a test cannot quietly agree
+/// with a format only it believes in.
+pub(crate) fn manifest_line(record: &ActionRecord) -> String {
+    let mut json = serde_json::to_value(record).expect("json");
+    json.as_object_mut().expect("object").remove("summary");
+    let mut line = serde_json::to_string(&json).expect("line");
+    line.push('\n');
+    line
+}
+
 /// A body no configured redaction pattern matches.
 pub(crate) const BODY: &str = "Rolled out the api service to staging across two of three shards.";
 
