@@ -29,6 +29,12 @@
 //! Every exclusion carries its reason in [`Entry::reason`], stated where the exclusion is made
 //! rather than in a runbook nobody reads at the moment of restoring.
 //!
+//! `entities/` is on that list and used not to be. Its reason for travelling was that a rebuild did
+//! not reproduce a materialised timeline — true while an append decided for itself whether it had
+//! already happened, and false now that the index records each line and a rebuild drops the files
+//! and those rows together. A copy of them would be deleted by the rebuild [`restore`] ends in,
+//! which is a copy worth nothing and a promise worth less.
+//!
 //! One exclusion is worth reading twice: nothing beside the key store has to travel either. Key
 //! material wrapped at rest is self-describing — [`yaam_crypto::wrapper`] puts the salt and the
 //! cost parameters in the blob — precisely so that recovery needs a passphrase and the blob, and
@@ -104,16 +110,12 @@ pub const MANIFEST: &[Entry] = &[
                  manifest is the last local copy of what they held",
     },
     Entry {
-        name: layout::ENTITIES_DIR,
-        disposition: Disposition::Included,
-        reason: "materialised timelines. Fan-out writes them and a rebuild does not reproduce \
-                 them, so they are authoritative in practice however derived they look",
-    },
-    Entry {
         name: layout::AUDIT_DIR,
         disposition: Disposition::Included,
-        reason: "which records named which subjects. Written by fan-out, not reproduced by a \
-                 rebuild",
+        reason: "which records named which subjects. Written by fan-out from the record's own \
+                 frontmatter, but a rebuild only re-enqueues that work — and for a record the tree \
+                 no longer holds, because it was archived to a cold manifest, no drain can ever do \
+                 it. So the audit trail travels",
     },
     Entry {
         name: layout::TOMBSTONE_LOG,
@@ -147,6 +149,13 @@ pub const MANIFEST: &[Entry] = &[
         disposition: Disposition::Excluded,
         reason: "copies set aside for an operator to look at. Unpublished, unindexed, and pointing \
                  at a failure that belongs to the store they came from",
+    },
+    Entry {
+        name: layout::ENTITIES_DIR,
+        disposition: Disposition::Excluded,
+        reason: "materialised timelines, and derived after all: a rebuild removes them and the \
+                 index rows that account for their lines together, so a copy carried here would be \
+                 deleted by the rebuild a restore ends in. Fan-out writes them again from the tree",
     },
     Entry {
         name: layout::INDEX_FILE,
@@ -752,6 +761,56 @@ mod tests {
             query::by_entity(&store, "ticket", "PROJ-42", 1.0, None, &Scope::Unrestricted)
                 .expect("queried");
         assert_eq!(by_entity.len(), 1, "the entity index did not come back");
+    }
+
+    /// The manifest moved `entities/` from included to excluded, and this is the claim that move
+    /// rests on: nothing carries a materialised timeline, and a restored store produces it again.
+    ///
+    /// The drain is the second half and is not optional to the argument. A restore rebuilds the
+    /// index, which re-enqueues the fan-out; until something drains it the timelines are files that
+    /// are not there, which is exactly what `yaam check` reports as a backlog.
+    #[test]
+    fn a_restored_store_re_materialises_the_timeline_nothing_carried() {
+        let mut harness = Harness::new();
+        let record = testkit::internal(T09);
+        let id = record.record_id.clone();
+        harness.pipeline.accept(record, BODY).expect("accepted");
+        harness.pipeline.drain_fanout(100).expect("drained");
+        let relative = Path::new(layout::ENTITIES_DIR).join("ticket/PROJ-42/timeline.md");
+        assert!(
+            harness.root().join(&relative).is_file(),
+            "nothing is proved if the source store has no timeline either"
+        );
+
+        let drill = Drill::new();
+        let report = back_up(&harness.pipeline, &drill.backup()).expect("backed up");
+        assert!(
+            report
+                .excluded
+                .iter()
+                .any(|name| name == layout::ENTITIES_DIR),
+            "the timelines were present and the report does not say they were left behind"
+        );
+        assert!(!drill.backup().join(&relative).exists());
+
+        let paths = drill.destination();
+        restore(&paths, &drill.backup()).expect("restored");
+        assert!(
+            !paths.root.join(&relative).exists(),
+            "a restore rebuilds the timelines; it does not carry them"
+        );
+
+        let mut pipeline =
+            Pipeline::with_paths(paths.clone()).expect("a pipeline over the restore");
+        assert_eq!(pipeline.drain_fanout(100).expect("drained"), 1);
+        let rebuilt = std::fs::read_to_string(paths.root.join(&relative)).expect("the timeline");
+        assert_eq!(
+            rebuilt
+                .matches(&format!("[[record:{}", id.as_str()))
+                .count(),
+            1,
+            "the restored store has to list the record, once: {rebuilt}"
+        );
     }
 
     /// **The invariant, in one test.** A backup taken while a record was readable, restored after

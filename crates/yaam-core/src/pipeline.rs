@@ -72,8 +72,9 @@ const TIMELINE_PART: &str = "timeline-";
 
 /// Size at which a timeline head is frozen and a fresh one started.
 ///
-/// Bounded so the idempotency check on append stays a two-file read rather than growing with the
-/// entity's whole history.
+/// Bounded so a busy entity's timeline stays a set of files a reader can open rather than one that
+/// grows with its whole history. It used to bound the idempotency check too, which is what made
+/// that check wrong; the index answers it now, so this size is a readability choice again.
 const TIMELINE_MAX_BYTES: u64 = 64 * 1024;
 
 /// Outcome of accepting a record.
@@ -639,7 +640,7 @@ impl Pipeline {
     }
 
     /// The work one job stands for.
-    fn run_job(&self, job: &FanoutJob, located: &BTreeMap<String, PathBuf>) -> Result<()> {
+    fn run_job(&mut self, job: &FanoutJob, located: &BTreeMap<String, PathBuf>) -> Result<()> {
         let path = located.get(job.record.as_str()).ok_or_else(|| {
             Error::Io(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -676,10 +677,15 @@ impl Pipeline {
 
     /// Appends the record to the timeline of every entity it names.
     ///
-    /// Idempotent by inspection rather than by bookkeeping: the line is written only if the record's
-    /// wikilink is not already in the head, or in the part the head most recently became. Those are
-    /// the only two files a repeat of this job could have written to.
-    fn append_timelines(&self, record: &ActionRecord) -> Result<()> {
+    /// Idempotent by bookkeeping rather than by inspection: the index holds one row per line, and
+    /// the row is claimed in a transaction that commits only once the line is on disk. Inspection
+    /// was what this used to do, and it was wrong past a second rollover — the frozen part holding
+    /// the line stops being the newest one, and a re-enqueued job appended the same history again.
+    ///
+    /// A failed append leaves no row, so the job comes back and does the work. The claim's own
+    /// documentation carries the rest of the argument, including what a crash inside the commit
+    /// leaves behind.
+    fn append_timelines(&mut self, record: &ActionRecord) -> Result<()> {
         for entity in &record.entities {
             let dir = self
                 .paths
@@ -692,15 +698,22 @@ impl Pipeline {
             if head_is_full(&head)? {
                 roll_over(&dir, &head)?;
             }
+            // Keyed by the entity as the index knows it, not as the path spells it: the row sits
+            // beside `entity_refs`, and the directory name is an encoding of the same identity.
+            let Some(mention) = self.writer.claim_timeline_mention(
+                record.record_id.as_str(),
+                &entity.kind,
+                &entity.id,
+            )?
+            else {
+                continue;
+            };
             let link = yaam_md::wikilink::render(&yaam_contract::entity::EntityRef {
                 kind: "record".to_owned(),
                 id: record.record_id.as_str().to_owned(),
                 role: entity.role,
                 confidence: entity.confidence,
             });
-            if already_listed(&head, newest_part(&dir)?.as_deref(), &link)? {
-                continue;
-            }
             fsutil::append_line_sync(
                 &head,
                 &format!(
@@ -710,6 +723,7 @@ impl Pipeline {
                     outcome_text(record.outcome)
                 ),
             )?;
+            mention.commit()?;
         }
         Ok(())
     }
@@ -781,13 +795,6 @@ fn head_is_full(head: &Path) -> Result<bool> {
     }
 }
 
-/// The highest-numbered frozen part of a timeline, if there is one.
-fn newest_part(dir: &Path) -> Result<Option<PathBuf>> {
-    let number = next_part_number(dir)? - 1;
-    let path = dir.join(format!("{TIMELINE_PART}{number:04}.md"));
-    Ok(path.exists().then_some(path))
-}
-
 /// The number the next frozen part takes.
 fn next_part_number(dir: &Path) -> Result<u32> {
     let mut highest = 0;
@@ -802,16 +809,6 @@ fn next_part_number(dir: &Path) -> Result<u32> {
         }
     }
     Ok(highest + 1)
-}
-
-/// Whether a record's link is already in the head or in the part the head just became.
-fn already_listed(head: &Path, part: Option<&Path>, link: &str) -> Result<bool> {
-    for candidate in [Some(head), part].into_iter().flatten() {
-        if fsutil::read_to_string_opt(candidate)?.is_some_and(|text| text.contains(link)) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Indexes one document into an open transaction.
@@ -1459,7 +1456,7 @@ mod tests {
         assert!(live.contains(second.record_id.as_str()));
         assert!(live.len() < 1024, "the new head starts empty");
 
-        // The frozen part still counts for idempotency, so a replay adds nothing to the new head.
+        // The mention row still stands wherever the line was frozen, so a replay adds nothing.
         let third = testkit::internal("2026-08-22T09:14:03Z");
         harness.pipeline.accept(third, BODY).expect("accepted");
         harness.pipeline.drain_fanout(10).expect("drained");
@@ -1473,6 +1470,43 @@ mod tests {
                 .matches(second.record_id.as_str())
                 .count(),
             1
+        );
+    }
+
+    /// The bug this table exists for, in its second form: a job that appended and was handed out
+    /// again, two rollovers later.
+    ///
+    /// Two, because that is what the old check could not survive. It read the head and the part
+    /// the head most recently became — the only two files *one* rollover could have moved the line
+    /// into. After a second one the line sits in an older part, both files it read come back
+    /// without it, and the append happens again. The index does not care which file it is in.
+    #[test]
+    fn a_fan_out_job_re_driven_past_two_rollovers_lists_the_record_once() {
+        let mut harness = Harness::new();
+        let record = testkit::internal(T09);
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 1);
+
+        let dir = harness.root().join("entities/ticket/PROJ-42");
+        let head = dir.join("timeline.md");
+        assert_eq!(testkit::timeline_mentions(&dir, &record.record_id), 1);
+
+        // Two rollovers after the append, by hand: the line's file is no longer the newest part.
+        fs::rename(&head, dir.join("timeline-0001.md")).expect("freeze");
+        fs::write(dir.join("timeline-0002.md"), "- older history\n").expect("a later part");
+        fs::write(&head, "").expect("a fresh head");
+
+        // The job is handed out again — a claim its drain died holding, reclaimed by a sweep.
+        assert_eq!(harness.requeue_fanout(), 1);
+        assert_eq!(harness.pipeline.drain_fanout(10).expect("drained"), 1);
+        assert_eq!(
+            testkit::timeline_mentions(&dir, &record.record_id),
+            1,
+            "the record is listed twice; the head holds {:?}",
+            fs::read_to_string(&head)
         );
     }
 

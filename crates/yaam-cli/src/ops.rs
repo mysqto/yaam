@@ -44,7 +44,14 @@ pub fn reindex(pipeline: &mut Pipeline, out: &mut dyn Write) -> Result<Exit> {
     line(&mut text, "from the tree", report.from_tree);
     line(&mut text, "from cold manifests", report.from_manifests);
     line(&mut text, "erasures replayed", report.tombstones_replayed);
+    line(&mut text, "timelines dropped", report.timelines_dropped);
     line(&mut text, "files skipped", report.skipped);
+    if report.timelines_dropped > 0 {
+        text.push_str(
+            "a materialised timeline is dropped with the index rows that say which lines it \
+             already holds; the fan-out this queued writes them again\n",
+        );
+    }
     if report.skipped > 0 {
         text.push_str(
             "a skipped file is one whose frontmatter would not parse; it is still in the tree, and \
@@ -355,6 +362,26 @@ mod tests {
         assert_eq!(exit, Exit::Ok);
         assert!(printed.contains("from the tree       1"), "{printed}");
         assert!(printed.contains("erasures replayed   0"), "{printed}");
+        // Nothing has drained, so there is no materialised timeline to drop and nothing to explain.
+        assert!(printed.contains("timelines dropped   0"), "{printed}");
+        assert!(!printed.contains("writes them again"), "{printed}");
+    }
+
+    /// A rebuild takes the materialised timelines with it, and says so.
+    ///
+    /// Worth a line of output: between the rebuild and the fan-out it queued, an entity's timeline
+    /// is a file that is not there, and an operator reading a report is who needs to know.
+    #[test]
+    fn a_rebuild_says_it_dropped_the_timelines_it_will_write_again() {
+        let mut tree = Tree::new();
+        tree.pipeline
+            .accept(fixtures::record("2026-08-20T09:00:00Z"), BODY)
+            .expect("accepted");
+        tree.pipeline.drain_fanout(100).expect("drained");
+
+        let (_, printed) = run(|out| reindex(&mut tree.pipeline, out));
+        assert!(printed.contains("timelines dropped   1"), "{printed}");
+        assert!(printed.contains("writes them again"), "{printed}");
     }
 
     #[test]

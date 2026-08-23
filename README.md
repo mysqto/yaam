@@ -82,10 +82,12 @@ yaam --root /srv/memory backup --to /srv/backups/2026-08-20   # authoritative ha
 yaam --root /restored     restore --from /srv/backups/2026-08-20
 ```
 
-A backup carries the tree, the cold manifests, the materialised timelines, the erasure log and the
-`spec/` they are read under. It carries **no key store**, no quarantine spool, no staging and no
-index: `yaam_core::backup::MANIFEST` declares the split, each exclusion with its reason, and both
-commands read that one list. The key store is the load-bearing exclusion — erasure works by
+A backup carries the tree, the cold manifests, the subject audit trail, the erasure log and the
+`spec/` they are read under. It carries **no key store**, no quarantine spool, no staging, no index
+and no materialised timelines: `yaam_core::backup::MANIFEST` declares the split, each exclusion with
+its reason, and both commands read that one list. The timelines are left behind because a rebuild
+reproduces them — it drops them along with the index rows that record which lines they already hold,
+and the fan-out it queues writes them again from the tree. The key store is the load-bearing exclusion — erasure works by
 destroying keys, so a key surviving in a backup would make a restore un-erase a subject while live
 verification still reported the erasure complete. `restore` refuses a backup that carries one, and
 refuses a store that already holds records; it rebuilds the index and replays the restored

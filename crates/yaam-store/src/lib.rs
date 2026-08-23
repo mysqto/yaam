@@ -16,7 +16,7 @@ pub mod schema;
 pub mod store;
 
 pub use error::{Error, Result};
-pub use store::{Batch, FanoutJob, PublishInput, Store, Writer};
+pub use store::{Batch, FanoutJob, PublishInput, Store, TimelineMention, Writer};
 
 /// Rebuilds a record id from its stored text.
 ///

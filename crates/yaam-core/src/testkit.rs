@@ -172,6 +172,21 @@ impl Harness {
             .expect("release")
     }
 
+    /// Puts every settled fan-out job back in the queue, and says how many it moved.
+    ///
+    /// A re-drive, as the queue sees one: the work has been done and something is about to do it
+    /// again. That is what a reclaimed claim and a rebuild's re-enqueue both look like from here,
+    /// and it is the state in which an append has to decide whether it already happened.
+    pub(crate) fn requeue_fanout(&self) -> usize {
+        self.writable()
+            .execute(
+                "UPDATE fanout_queue
+                    SET state = 'pending', not_before_ms = 0, claimed_ms = NULL",
+                [],
+            )
+            .expect("requeue")
+    }
+
     /// Backdates every held fan-out claim, so a sweep sees the drain holding it as gone.
     pub(crate) fn age_fanout_claims(&self, by_ms: i64) -> usize {
         self.writable()
@@ -266,18 +281,23 @@ impl Harness {
 }
 
 /// Every table a rebuild has to reproduce.
-const DERIVED_TABLES: [&str; 7] = [
+///
+/// `timeline_mentions` is here for the same reason the rest are, with one wrinkle: its rows are
+/// written by the fan-out drain rather than by the publish, so a rebuild reproduces them only once
+/// the queue it re-enqueued has been drained.
+const DERIVED_TABLES: [&str; 8] = [
     "records",
     "record_attrs",
     "entity_refs",
     "record_subjects",
     "entities",
     "fanout_queue",
+    "timeline_mentions",
     "quarantine_pending",
 ];
 
 /// One query per derived table, ordered so two runs compare line by line.
-const SNAPSHOT_QUERIES: [(&str, &str); 7] = [
+const SNAPSHOT_QUERIES: [(&str, &str); 8] = [
     (
         "record",
         "SELECT record_id, schema_ver, frontmatter, body, at_ms, received_ms, action, outcome,
@@ -312,12 +332,43 @@ const SNAPSHOT_QUERIES: [(&str, &str); 7] = [
         "SELECT record_id, job_kind, enqueued_ms FROM fanout_queue ORDER BY record_id, job_kind",
     ),
     (
+        "mention",
+        "SELECT record_id, kind, entity_id FROM timeline_mentions
+         ORDER BY record_id, kind, entity_id",
+    ),
+    (
         // `first_seen_ms` is left out: it is the one column read from the clock rather than derived,
         // so a rebuild cannot be expected to reproduce it.
         "held",
         "SELECT record_id, qkek_date, staging_path FROM quarantine_pending ORDER BY record_id",
     ),
 ];
+
+/// How many times a record's link appears across a timeline head and all its frozen parts.
+///
+/// One number over every file, because "listed once" is a claim about the timeline as a whole: a
+/// count per file would pass while a re-drive wrote the same line into the head and into a part.
+pub(crate) fn timeline_mentions(dir: &Path, record: &RecordId) -> usize {
+    let needle = format!("[[record:{}", record.as_str());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("timeline"))
+        })
+        .map(|entry| {
+            fs::read_to_string(entry.path())
+                .unwrap_or_default()
+                .matches(&needle)
+                .count()
+        })
+        .sum()
+}
 
 /// Backdates a file's modification time, which is how a test reaches past a grace period.
 pub(crate) fn age(path: &Path, by_ms: u64) {
