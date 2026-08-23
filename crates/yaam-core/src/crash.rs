@@ -10,10 +10,17 @@
 //! stops in the window, the test signals it, and what is exercised afterwards is the real on-disk
 //! state rather than a reconstruction of it.
 //!
-//! Inert unless [`ENV_POINT`] names a checkpoint. The environment is read once, on the first
-//! checkpoint any thread reaches, and arming is logged at `warn`: a service that stops mid-write is
-//! not something anybody should discover by accident. A `#[cfg(test)]` seam would be cheaper and
-//! would not reach the shipped binaries, which is the one thing these tests are for.
+//! Compiled only under the `crash-points` feature, which is off by default: a release build does not
+//! contain this module, so a shipped service cannot be talked into stopping mid-write whatever its
+//! environment says. A `#[cfg(test)]` seam would be cheaper still, but it would not reach the built
+//! binaries the crash tests spawn, which is the one thing those tests are for. A feature does,
+//! because the test target that spawns them declares it in `required-features` — so the binaries
+//! `cargo` builds for that target are built with it too.
+//!
+//! Present is not armed. Within a build that has the feature, a checkpoint is inert unless
+//! [`ENV_POINT`] names it. The environment is read once, on the first checkpoint any thread reaches,
+//! and arming is logged at `warn`: a service that stops mid-write is not something anybody should
+//! discover by accident.
 
 use std::sync::OnceLock;
 use std::time::Duration;

@@ -25,6 +25,20 @@ path = "src/bin/yaam-server.rs"
 name = "yaam-agent"
 path = "src/bin/yaam-agent.rs"
 
+# `required-features`, not a runtime skip. Without the checkpoints the service never stops in a
+# window, and a crash test that ran anyway would pass by never opening the window it is named after.
+# Cargo refuses to build the target instead, so the omission is loud. `ci/check.sh` passes the flag.
+[[test]]
+name = "crash_injection"
+path = "tests/crash_injection.rs"
+required-features = ["crash-points"]
+
+[features]
+# Forwards to yaam-core, because the checkpoints have to be inside the *binaries* the crash tests
+# spawn. A dev-dependency cannot put them there: it is the bin targets of this package, not its
+# tests, that need the feature, and only a feature on this package reaches them.
+crash-points = ["yaam-core/crash-points"]
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true

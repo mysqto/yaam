@@ -32,6 +32,7 @@ use yaam_crypto::{Epoch, SealedBody};
 use yaam_md::{Body, Document};
 use yaam_store::{FanoutJob, PublishInput, Store, Writer};
 
+#[cfg(feature = "crash-points")]
 use crate::crash;
 use crate::fsutil;
 use crate::layout::{self, Stamp};
@@ -217,10 +218,12 @@ impl Pipeline {
         };
         let staged = self.stage(&document)?;
         // Two of the three windows a crash test stops a real process in. Inert unless armed.
+        #[cfg(feature = "crash-points")]
         crash::checkpoint(crash::STAGED);
         self.place(&document, &staged, &stamp)?;
         self.commit(&document)?;
         self.settle_quarantine(&id)?;
+        #[cfg(feature = "crash-points")]
         crash::checkpoint(crash::COMMITTED);
         Ok(Accepted::Stored(id))
     }
@@ -780,6 +783,7 @@ fn roll_over(dir: &Path, head: &Path) -> Result<()> {
     let part = dir.join(format!("{TIMELINE_PART}{:04}.md", next_part_number(dir)?));
     fs::rename(head, &part)?;
     fsutil::sync_dir(dir)?;
+    #[cfg(feature = "crash-points")]
     crash::checkpoint(crash::ROLLED_OVER);
     fsutil::write_sync(head, b"")?;
     fsutil::sync_dir(dir)?;

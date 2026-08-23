@@ -204,14 +204,16 @@ default that behaves exactly as not using them did.
 Every durability window has a test that kills a real service inside it with `SIGKILL` and asserts
 what a *restarted* one makes of the state left behind: the staged write that never got renamed, the
 committed record whose fan-out never drained, the timeline rollover that froze the head and never
-made a new one. The windows are opened by a checkpoint the binary carries and arms only when
-`YAAM_CRASH_AT` names one — inert otherwise, and logged loudly when it is not.
+made a new one. The windows are opened by a checkpoint that only exists in a build with the
+`crash-points` feature, and that arms itself only when `YAAM_CRASH_AT` names it — so a release
+contains no such code at all, and a build that does still does nothing until asked.
 
 They wait on the service's own maintenance timer, so they take minutes and are kept out of a routine
-test run:
+test run. The feature is what puts the checkpoints into the binaries the test spawns, and the test
+target requires it, so the flag is not optional:
 
 ```sh
-cargo test -p yaam-cli --test crash_injection -- --ignored
+cargo test -p yaam-cli --features crash-points --test crash_injection -- --ignored
 ```
 
 `ci/check.sh` and CI both run them.
