@@ -132,6 +132,37 @@ fn offset(rest: &str) -> Option<i64> {
     Some(sign * (hours * 60 + minutes))
 }
 
+/// Renders milliseconds since the Unix epoch in the form [`parse_ms`] reads back.
+///
+/// Here, beside the parser, rather than left to whoever needs a stamp. A record's timestamps decide
+/// its ordering, the windows it answers and the directory it is filed under, so a writer that
+/// spelled one a way this module cannot read is refused at the boundary with nothing to fix but a
+/// format string. One function and a round-trip test is what keeps the two spellings one spelling.
+///
+/// Always UTC with a `Z`. An offset is legal input, but emitting one would put two spellings of the
+/// same instant into the store for no reader's benefit.
+///
+/// # Examples
+/// ```
+/// use yaam_contract::timestamp;
+///
+/// let text = timestamp::format_ms(1_787_217_242_117);
+/// assert_eq!(text, "2026-08-20T09:14:02.117Z");
+/// assert_eq!(timestamp::parse_ms(&text), Some(1_787_217_242_117));
+/// ```
+#[must_use]
+pub fn format_ms(ms: i64) -> String {
+    let (year, month, day) = civil_from_ms(ms);
+    // Euclidean, so an instant before the epoch lands at a time of day on its own date rather than
+    // at a negative one.
+    let time = ms.rem_euclid(MS_PER_DAY);
+    let hour = time / 3_600_000;
+    let minute = (time / 60_000) % 60;
+    let second = (time / 1_000) % 60;
+    let millis = time % 1_000;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
 /// Days since 1970-01-01 for a civil date. Hinnant's `days_from_civil`.
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
@@ -179,7 +210,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{civil_from_days, civil_from_ms, days_from_civil, parse_ms};
+    use super::{civil_from_days, civil_from_ms, days_from_civil, format_ms, parse_ms};
 
     #[test]
     fn a_utc_timestamp_parses_to_its_own_date() {
@@ -241,6 +272,42 @@ mod tests {
         }
         // A space separator is accepted; the zone still is not optional.
         assert!(parse_ms("2026-08-20 09:14:02Z").is_some());
+    }
+
+    /// The property the pair exists for: whatever this module writes, it reads back unchanged.
+    #[test]
+    fn what_is_formatted_parses_back_to_the_same_instant() {
+        for ms in [
+            0,
+            1,
+            999,
+            1_000,
+            1_787_217_242_117,
+            // Day boundaries in both directions, and a leap day, because the calendar arithmetic
+            // is where a formatter and a parser drift apart without either being obviously wrong.
+            parse_ms("2024-02-29T23:59:59.999Z").expect("valid"),
+            parse_ms("2026-01-01T00:00:00Z").expect("valid"),
+            parse_ms("2100-03-01T00:00:00Z").expect("valid"),
+            // Before the epoch: a host with a badly set clock still has to produce a stamp that
+            // round-trips, or the failure it causes names a format rather than a clock.
+            -1,
+            -86_400_000,
+        ] {
+            let text = format_ms(ms);
+            assert_eq!(parse_ms(&text), Some(ms), "{ms} rendered as {text}");
+        }
+    }
+
+    /// A formatted stamp names the same civil date the instant falls on, in UTC.
+    #[test]
+    fn a_formatted_stamp_carries_its_own_utc_date() {
+        let ms = parse_ms("2026-08-20T00:30:00+09:00").expect("valid");
+        assert_eq!(civil_from_ms(ms), (2026, 8, 19));
+        assert!(
+            format_ms(ms).starts_with("2026-08-19T"),
+            "{}",
+            format_ms(ms)
+        );
     }
 
     #[test]

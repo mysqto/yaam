@@ -24,6 +24,16 @@ pub enum Error {
     /// A destructive command was asked for without its confirmation flag.
     #[error("{0}")]
     Unconfirmed(String),
+    /// A record will never be accepted as written, and this says why.
+    ///
+    /// Apart from [`Self::Usage`] because the two are refused by different parties, and a caller
+    /// fixes them by looking in different places: clap refuses arguments it cannot parse, and this
+    /// is the deployment refusing a record it parsed perfectly well.
+    #[error("rejected: {0}")]
+    Rejected(String),
+    /// A socket did not answer, and nothing was recorded.
+    #[error("unreachable: {0}")]
+    Unreachable(String),
     /// Anything else that stopped the command.
     #[error("{0}")]
     Failed(String),
@@ -37,6 +47,8 @@ impl Error {
             Self::Usage(_) => Exit::Usage,
             Self::Config(_) => Exit::Config,
             Self::Unconfirmed(_) => Exit::Unconfirmed,
+            Self::Rejected(_) => Exit::Rejected,
+            Self::Unreachable(_) => Exit::Unreachable,
             Self::Failed(_) => Exit::Failed,
         }
     }
@@ -67,6 +79,8 @@ mod tests {
             (Error::Usage("x".to_owned()), Exit::Usage),
             (Error::Config("x".to_owned()), Exit::Config),
             (Error::Unconfirmed("x".to_owned()), Exit::Unconfirmed),
+            (Error::Rejected("x".to_owned()), Exit::Rejected),
+            (Error::Unreachable("x".to_owned()), Exit::Unreachable),
             (Error::Failed("x".to_owned()), Exit::Failed),
         ];
         for (error, expected) in cases {

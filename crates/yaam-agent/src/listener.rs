@@ -608,40 +608,63 @@ fn trim_line(line: &[u8]) -> &[u8] {
     &line[..end]
 }
 
+/// What became of one record, in the vocabulary the answer line uses.
+///
+/// A type rather than a string literal at each end. Whoever wrote the record has to read this back
+/// to know what happened to it, and a caller that spelled `accepted` its own way would report every
+/// acceptance as a failure it could not name. Matching on it is exhaustive, so a status added here
+/// stops a caller's build instead of falling into its catch-all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    /// The service has the record.
+    Accepted,
+    /// The sidecar has it and will keep trying. Durable, and nothing is owed by the caller.
+    Spooled,
+    /// The spool is at its bound, so the record was not taken. Something wants an operator.
+    SpoolFull,
+    /// Nobody will ever accept this record. Only its sender can fix it.
+    Rejected,
+    /// The sidecar itself failed. The record went nowhere.
+    Error,
+}
+
 /// One answer per record, so a caller never has to guess.
-#[derive(Debug, Serialize)]
-struct Answer {
-    /// Outcome name from the module's table.
-    status: &'static str,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Answer {
+    /// What became of the record.
+    pub status: Status,
     /// Why, when the caller can act on it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl Answer {
     /// Renders one submission outcome.
-    fn of(outcome: &crate::Result<()>) -> Self {
+    #[must_use]
+    pub fn of(outcome: &crate::Result<()>) -> Self {
         match outcome {
             Ok(()) => Self {
-                status: "accepted",
+                status: Status::Accepted,
                 reason: None,
             },
             Err(Error::Spooled) => Self {
-                status: "spooled",
+                status: Status::Spooled,
                 reason: None,
             },
             Err(Error::SpoolFull) => Self {
-                status: "spool_full",
+                status: Status::SpoolFull,
                 reason: None,
             },
             Err(Error::Rejected(why)) => Self {
-                status: "rejected",
+                status: Status::Rejected,
                 reason: Some(why.clone()),
             },
             // Sealing and filesystem failures are the sidecar's own. The caller still needs to know
             // its record went nowhere.
             Err(other) => Self {
-                status: "error",
+                status: Status::Error,
                 reason: Some(other.to_string()),
             },
         }

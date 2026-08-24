@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use yaam_core::Paths;
 
-use crate::cli::{AgentArgs, ServerArgs, StoreArgs};
+use crate::cli::{AgentArgs, EmitArgs, ServerArgs, StoreArgs};
 use crate::error::{Error, Result, config, failed};
 
 /// Environment variable naming the memory tree root.
@@ -44,6 +44,13 @@ pub const ENV_UNSEAL_KEY: &str = "YAAM_UNSEAL_KEY_FILE";
 pub const ENV_MAINTENANCE_MS: &str = "YAAM_MAINTENANCE_MS";
 /// Environment variable naming the sidecar's state directory.
 pub const ENV_AGENT_STATE: &str = "YAAM_AGENT_STATE";
+/// Environment variable naming the caller socket an emitted record is written to.
+pub const ENV_SOCKET: &str = "YAAM_SOCKET";
+/// Environment variable naming the agent an emitted record is attributed to.
+///
+/// The pair above and here is what makes a one-line hook possible: a host that exports both leaves
+/// the caller with only what it alone knows to say.
+pub const ENV_AGENT: &str = "YAAM_AGENT";
 /// Environment variable setting the log level.
 pub const ENV_LOG: &str = "YAAM_LOG";
 
@@ -87,6 +94,10 @@ pub struct Env {
     pub maintenance_ms: Option<OsString>,
     /// [`ENV_AGENT_STATE`].
     pub agent_state: Option<OsString>,
+    /// [`ENV_SOCKET`].
+    pub socket: Option<OsString>,
+    /// [`ENV_AGENT`].
+    pub agent: Option<OsString>,
     /// [`ENV_LOG`].
     pub log: Option<OsString>,
 }
@@ -108,6 +119,8 @@ impl Env {
             unseal_key_file: std::env::var_os(ENV_UNSEAL_KEY),
             maintenance_ms: std::env::var_os(ENV_MAINTENANCE_MS),
             agent_state: std::env::var_os(ENV_AGENT_STATE),
+            socket: std::env::var_os(ENV_SOCKET),
+            agent: std::env::var_os(ENV_AGENT),
             log: std::env::var_os(ENV_LOG),
         }
     }
@@ -420,6 +433,46 @@ impl AgentSettings {
             spool_capacity: flags.spool_capacity,
             retry_interval_ms: flags.retry_interval_ms,
         })
+    }
+}
+
+/// Where an emitted record goes, and who it is attributed to.
+///
+/// No store settings for the reason the sidecar has none, and one more: this runs in the caller's own
+/// process tree, so a flag naming a tree would be a flag inviting a caller to open one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmitSettings {
+    /// The caller socket to write the record to, absent only for a dry run.
+    ///
+    /// Optional because a dry run sends nothing, and demanding a socket to print a record defeats the
+    /// one thing a dry run is for: seeing the JSON before there is a sidecar to send it to.
+    pub socket: Option<PathBuf>,
+    /// The agent the record is attributed to. Must be the one the socket belongs to.
+    pub agent: String,
+}
+
+impl EmitSettings {
+    /// Resolves an emitter's settings from flags and the environment.
+    ///
+    /// Both are refusals rather than guesses. A default socket path would be a caller writing into
+    /// a deployment it was never pointed at, and a default agent would be a record attributed to
+    /// whoever the sidecar happened to serve.
+    pub fn resolve(flags: &EmitArgs, env: &Env) -> Result<Self> {
+        // Not refused here: a dry run has no socket to name, and the send path is where the
+        // absence actually matters.
+        let socket = pick(flags.socket.as_deref(), env.socket.as_deref());
+        let agent = pick_str(flags.agent.as_deref(), env.agent.as_deref()).ok_or_else(|| {
+            config(format!(
+                "no agent: pass --agent or set {ENV_AGENT}. A record has to say who did the thing, \
+                 and the sidecar refuses one naming an agent other than the socket's own"
+            ))
+        })?;
+        if agent.trim().is_empty() {
+            return Err(config(
+                "--agent is blank: a record with no author attributes nothing",
+            ));
+        }
+        Ok(Self { socket, agent })
     }
 }
 

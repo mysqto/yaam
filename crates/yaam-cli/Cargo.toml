@@ -13,6 +13,9 @@ workspace = true
 # One crate for all three binaries, because they have to agree about where the store is. Three
 # crates would be three argument parsers, and the first setting one of them spelled differently
 # would be a service reading an index nothing writes.
+#
+# `yaam-emit` joined them for a related reason and not that one: it opens no store, but it does share
+# the exit table every script branches on, and a fourth crate would be a second copy of it.
 [[bin]]
 name = "yaam"
 path = "src/bin/yaam.rs"
@@ -24,6 +27,10 @@ path = "src/bin/yaam-server.rs"
 [[bin]]
 name = "yaam-agent"
 path = "src/bin/yaam-agent.rs"
+
+[[bin]]
+name = "yaam-emit"
+path = "src/bin/yaam-emit.rs"
 
 # `required-features`, not a runtime skip. Without the checkpoints the service never stops in a
 # window, and a crash test that ran anyway would pass by never opening the window it is named after.
