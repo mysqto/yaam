@@ -22,6 +22,7 @@ use yaam_core::erase::{self, ErasePreview};
 use yaam_core::health::{self, HealthReport};
 use yaam_core::reindex;
 use yaam_core::{Paths, Pipeline};
+use yaam_crypto::keystore::KeyMaterial;
 
 use crate::error::{Error, Result, config, failed};
 use crate::exit::Exit;
@@ -413,10 +414,11 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
     // Beside the two queue depths above, because it is the third answer to "how much work is this
     // store holding" — and the only one that no service converges on its own.
     let _ = writeln!(text, "dead-lettered      {}", report.dead_lettered);
-    // Said on every health read and not only at startup, and asked of the store rather than
-    // assumed: a key file recovered from a snapshot or a decommissioned disk is a usable key if
-    // this line says none.
-    let _ = writeln!(text, "key wrapping       {}", pipeline.key_wrapping());
+    // Said on every health read and not only at startup, and read off the key files rather than
+    // taken from the wrapper this command happens to hold: a key file recovered from a snapshot or a
+    // decommissioned disk is a usable key if this line says none, and an operator who ran this
+    // without a passphrase must not be told that about a store that is wrapped.
+    let _ = writeln!(text, "key wrapping       {}", report.key_material);
 
     if report.index_drift > 0 {
         let _ = writeln!(
@@ -439,6 +441,20 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
     if report.dead_lettered > 0 {
         text.push('\n');
         text.push_str(DEAD_LETTERED);
+    }
+    if let KeyMaterial::Mixed { unwrapped, .. } = report.key_material {
+        // The one key-material state a person has to settle, so it gets the sentence rather than
+        // being left to a reader of the line above. Both halves are wrong at once: the files with no
+        // marker are usable keys, and no single wrapper reads the whole store — the records sealed
+        // under whichever half this deployment cannot open stay unreadable until it can.
+        let _ = writeln!(
+            text,
+            "\n{unwrapped} key file(s) carry no wrapping marker while the rest do, which is what \
+             fitting a wrapper to a store that already held keys leaves behind. Each unmarked file \
+             is a usable key to anyone who can read it, and a process holding the wrapper cannot \
+             read those keys at all: the bodies sealed under them stay unreadable until they are \
+             wrapped with the same passphrase."
+        );
     }
     text
 }
@@ -485,6 +501,20 @@ mod tests {
         fn root(&self) -> &Path {
             self.dir.path()
         }
+    }
+
+    /// A wrapper cheap enough that a test is not an argon2 benchmark. Never a real store's cost.
+    fn cheap_wrapper() -> yaam_crypto::wrapper::PassphraseWrapper {
+        yaam_crypto::wrapper::PassphraseWrapper::with_salt(
+            b"a passphrase",
+            [7u8; 16],
+            yaam_crypto::wrapper::Cost {
+                memory_kib: 8,
+                passes: 1,
+                lanes: 1,
+            },
+        )
+        .expect("wrapper")
     }
 
     /// A backup destination outside every store, since a backup inside the tree it copies is
@@ -634,9 +664,16 @@ mod tests {
         assert_eq!(exit, Exit::Ok, "{printed}");
         assert!(printed.contains("index drift        0"), "{printed}");
         assert!(printed.contains("records indexed    1"), "{printed}");
+        // This store's one record is internal, so it has no subject key and there is nothing on
+        // disk to be wrapped or in the clear. Saying "none" here was the false statement: it read as
+        // key material lying about unprotected, over a key store holding none.
         assert!(
-            printed.contains("key wrapping       none"),
-            "unwrapped key storage has to be said out loud: {printed}"
+            printed.contains("key wrapping       nothing yet"),
+            "an empty key store has to claim neither: {printed}"
+        );
+        assert!(
+            !printed.contains("development only"),
+            "and must not call the store development-only: {printed}"
         );
 
         // The index is disposable, so this is the drift the documentation is about.
@@ -973,5 +1010,100 @@ mod tests {
             .expect_err("no such tombstone");
         assert_eq!(error.exit(), Exit::Failed);
         assert!(error.to_string().contains("tombstone"), "{error}");
+    }
+
+    /// The deployment this fixed: `yaam check` over a wrapped store, run with no passphrase, used to
+    /// answer from its own wrapper and report the keys unprotected and the store development-only.
+    #[test]
+    fn a_wrapped_store_names_its_scheme_to_a_check_run_without_a_passphrase() {
+        let Tree { dir, pipeline } = Tree::new();
+        let mut pipeline = pipeline.with_key_wrapper(cheap_wrapper()).expect("wrapped");
+        pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &fixtures::subject('a')),
+                BODY,
+            )
+            .expect("accepted");
+        pipeline.drain_fanout(100).expect("drained");
+        drop(pipeline);
+
+        // Reopened exactly as the operator ran it: no --key-passphrase-file, so this process cannot
+        // read a single one of those keys. The header can be read without them.
+        let plain = Pipeline::with_paths(Paths::under(dir.path())).expect("reopened");
+        let (exit, printed) = run(|out| check(&plain, out));
+        assert_eq!(exit, Exit::Ok, "{printed}");
+        assert!(
+            printed.contains("key wrapping       argon2id over a passphrase"),
+            "the scheme comes from the blob on disk: {printed}"
+        );
+        assert!(
+            !printed.contains("development only"),
+            "a wrapped store is not a development store: {printed}"
+        );
+    }
+
+    /// The one state that warning belongs to, and it names the count so it cannot be read as a
+    /// claim about a store with no keys at all.
+    #[test]
+    fn a_store_whose_keys_are_in_the_clear_says_so() {
+        let mut tree = Tree::new();
+        tree.pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &fixtures::subject('a')),
+                BODY,
+            )
+            .expect("accepted");
+        tree.pipeline.drain_fanout(100).expect("drained");
+
+        let (exit, printed) = run(|out| check(&tree.pipeline, out));
+        assert_eq!(
+            exit,
+            Exit::Ok,
+            "a development store is not a broken one: {printed}"
+        );
+        assert!(
+            printed.contains("key wrapping       none — 1 key file(s)"),
+            "{printed}"
+        );
+        assert!(printed.contains("development only"), "{printed}");
+    }
+
+    /// A store wrapped after it already held keys. Reporting either half alone hides the other: the
+    /// unmarked files are usable keys, and the marked ones are unreadable to a process without the
+    /// passphrase — so this is the one key-material state that asks for a person.
+    #[test]
+    fn a_store_holding_both_kinds_of_key_says_what_to_do_about_it() {
+        let Tree { dir, mut pipeline } = Tree::new();
+        pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &fixtures::subject('a')),
+                BODY,
+            )
+            .expect("accepted");
+        let mut pipeline = pipeline.with_key_wrapper(cheap_wrapper()).expect("wrapped");
+        pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T10:00:00Z", &fixtures::subject('b')),
+                BODY,
+            )
+            .expect("accepted");
+        pipeline.drain_fanout(100).expect("drained");
+        drop(pipeline);
+
+        let plain = Pipeline::with_paths(Paths::under(dir.path())).expect("reopened");
+        let (exit, printed) = run(|out| check(&plain, out));
+        assert_eq!(exit, Exit::Degraded, "{printed}");
+        assert!(
+            printed.contains("key wrapping       mixed — 1 key file(s)"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("1 key file(s) carry no wrapping marker"),
+            "the operator needs the sentence, not just the count: {printed}"
+        );
+        assert!(
+            printed.contains("stay unreadable until they are wrapped"),
+            "{printed}"
+        );
     }
 }

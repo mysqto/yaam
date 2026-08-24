@@ -66,15 +66,17 @@ pub trait KeyWrapper: Send + Sync {
     /// erased, and the store keeps those two apart on the strength of this contract.
     fn unwrap(&self, wrapped: &[u8]) -> crate::Result<Vec<u8>>;
 
-    /// How this wrapper protects key material, for a health report.
+    /// How this wrapper protects the key material it writes.
     ///
-    /// Defaulted so a deployment's own wrapper need not implement it, and never a secret: this
-    /// reaches a startup log, which is the most widely copied text a deployment produces.
+    /// About the wrapper, not about the store: what is already on disk was written by whatever was
+    /// in force then, and [`FsKeyStore::key_material`] is what answers for that. Defaulted so a
+    /// deployment's own wrapper need not implement it, and never a secret: this reaches a startup
+    /// log, which is the most widely copied text a deployment produces.
     fn scheme(&self) -> &'static str {
         "an unnamed wrapper"
     }
 
-    /// Whether this wrapper actually protects key material.
+    /// Whether this wrapper actually protects the key material it writes.
     ///
     /// Separate from [`KeyWrapper::scheme`] so a caller deciding whether to warn asks a predicate
     /// rather than matching on prose. Defaulted to `true`, because a wrapper that protects nothing is
@@ -107,6 +109,93 @@ impl KeyWrapper for Passthrough {
 
     fn unwrap(&self, wrapped: &[u8]) -> crate::Result<Vec<u8>> {
         Ok(wrapped.to_vec())
+    }
+}
+
+/// What the key material on disk says about its own protection.
+///
+/// Read from the files, never from the wrapper the reading process holds. The two are different
+/// facts — the wrapper is what the *next* key is written under, the files are what the store already
+/// holds — and answering the second question with the first is how a report comes to call a wrapped
+/// store development-only because the operator running it passed no passphrase.
+///
+/// Three states rather than two, because "no key material" is not "no wrapping": a store that has
+/// never sealed a record has nothing on disk to be in the clear, and saying otherwise about it is
+/// the falsehood this distinction exists to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMaterial {
+    /// The key store holds no key material, so neither claim is true of it.
+    Absent,
+    /// Every key file carries a wrapping marker.
+    Wrapped {
+        /// What those markers name, or `None` where the header names something this build cannot —
+        /// still wrapped, just not describable.
+        scheme: Option<crate::wrapper::Scheme>,
+        /// How many key files.
+        files: usize,
+    },
+    /// Key files exist and not one carries a marker: each file is a usable key.
+    Unwrapped {
+        /// How many key files.
+        files: usize,
+    },
+    /// Some carry a marker and some do not — the state fitting a wrapper to a store that already
+    /// held keys leaves behind.
+    Mixed {
+        /// Key files carrying a marker.
+        wrapped: usize,
+        /// Key files carrying none.
+        unwrapped: usize,
+    },
+}
+
+impl KeyMaterial {
+    /// Whether key material on disk is a usable key to whoever can read the files.
+    ///
+    /// False for [`KeyMaterial::Absent`]: nothing is on disk to be exposed, and a warning every
+    /// fresh store earns is a warning an operator learns to page past. True for
+    /// [`KeyMaterial::Mixed`], because one key file in the clear is one key in the clear.
+    #[must_use]
+    pub const fn exposed(&self) -> bool {
+        matches!(self, Self::Unwrapped { .. } | Self::Mixed { .. })
+    }
+}
+
+/// The words a health read and a startup log both use, so one store cannot be described two ways.
+impl std::fmt::Display for KeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str(
+                "nothing yet \u{2014} the key store holds no key material, so it is neither \
+                 wrapped nor in the clear",
+            ),
+            Self::Wrapped {
+                scheme: Some(scheme),
+                files,
+            } => write!(
+                f,
+                "{} \u{2014} every one of {files} key file(s) on disk carries the marker",
+                scheme.name()
+            ),
+            Self::Wrapped {
+                scheme: None,
+                files,
+            } => write!(
+                f,
+                "wrapped under a scheme this build cannot name \u{2014} every one of {files} key \
+                 file(s) on disk carries the marker"
+            ),
+            Self::Unwrapped { files } => write!(
+                f,
+                "none \u{2014} {files} key file(s) on disk carry no marker, so each one is a usable \
+                 key (development only)"
+            ),
+            Self::Mixed { wrapped, unwrapped } => write!(
+                f,
+                "mixed \u{2014} {wrapped} key file(s) on disk carry the marker and {unwrapped} do \
+                 not, so those {unwrapped} are usable keys"
+            ),
+        }
     }
 }
 
@@ -162,16 +251,86 @@ impl FsKeyStore {
         Self::new(root, Passthrough)
     }
 
-    /// How key material in this store is protected.
+    /// How the wrapper this store was opened with protects the keys it writes.
+    ///
+    /// Named for the wrapper rather than for the store, because that is all it knows: a store opened
+    /// with no passphrase over key material somebody else wrapped answers "none" here and is wrapped
+    /// on disk. [`FsKeyStore::key_material`] is the question about the store.
     #[must_use]
-    pub fn wrapping(&self) -> &'static str {
+    pub fn wrapper_scheme(&self) -> &'static str {
         self.wrapper.scheme()
     }
 
-    /// Whether key material in this store is protected at all.
+    /// Whether the wrapper this store was opened with protects the keys it writes.
     #[must_use]
-    pub fn protects(&self) -> bool {
+    pub fn wrapper_protects(&self) -> bool {
         self.wrapper.protects()
+    }
+
+    /// What the key material on disk says about its own protection.
+    ///
+    /// Reads each key file's leading bytes and nothing else: no unwrap, no derivation, so the answer
+    /// is the same whether or not this process holds the passphrase. That independence is the whole
+    /// point — the wrapper can only report what this process was configured with, and the question
+    /// an operator asks of a running deployment is about the store.
+    pub fn key_material(&self) -> crate::Result<KeyMaterial> {
+        let mut wrapped = 0usize;
+        let mut unwrapped = 0usize;
+        let mut named: Option<crate::wrapper::Scheme> = None;
+        let mut one_scheme = true;
+        for file in self.key_files()? {
+            match crate::wrapper::wrapping_of(&fs::read(file)?) {
+                crate::wrapper::Wrapping::Named(scheme) => {
+                    wrapped += 1;
+                    match named {
+                        None => named = Some(scheme),
+                        Some(seen) if seen != scheme => one_scheme = false,
+                        Some(_) => {}
+                    }
+                }
+                crate::wrapper::Wrapping::Unnamed => {
+                    wrapped += 1;
+                    one_scheme = false;
+                }
+                crate::wrapper::Wrapping::Absent => unwrapped += 1,
+            }
+        }
+        // A name only where every marker agrees on one. Two schemes at once is a store mid-migration,
+        // and naming either of them would describe the half an operator did not ask about.
+        let scheme = if one_scheme { named } else { None };
+        Ok(match (wrapped, unwrapped) {
+            (0, 0) => KeyMaterial::Absent,
+            (0, files) => KeyMaterial::Unwrapped { files },
+            (files, 0) => KeyMaterial::Wrapped { scheme, files },
+            (wrapped, unwrapped) => KeyMaterial::Mixed { wrapped, unwrapped },
+        })
+    }
+
+    /// Every key file in the store, one per subject and epoch.
+    ///
+    /// A key file that cannot be read is an error rather than a file skipped: a count that quietly
+    /// omitted what it could not open would under-report exactly the exposure it is there to find.
+    /// Tombstones are not consulted either — a key file that outlived the erasure of its subject is
+    /// still a file on disk, and unwrapped it is still a usable key.
+    fn key_files(&self) -> crate::Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        let subjects = match fs::read_dir(self.root.join("keys")) {
+            Ok(subjects) => subjects,
+            // A store whose tree was removed under it holds no key material, which is the same
+            // answer as one that has never held any.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(files),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        for subject in subjects {
+            let subject = subject?.path();
+            if !subject.is_dir() {
+                continue;
+            }
+            for epoch in fs::read_dir(&subject)? {
+                files.push(epoch?.path());
+            }
+        }
+        Ok(files)
     }
 
     /// Path of a subject's key directory, rejecting anything that could escape the root.
@@ -575,8 +734,8 @@ mod tests {
             same.get(&subject, &epoch()).unwrap().as_deref(),
             Some(minted.as_ref())
         );
-        assert!(same.protects(), "a passphrase wrapper protects");
-        assert!(same.wrapping().contains("argon2id"));
+        assert!(same.wrapper_protects(), "a passphrase wrapper protects");
+        assert!(same.wrapper_scheme().contains("argon2id"));
 
         // Reopened with the wrong one: an error, never an absence. An absence here would report a
         // key destroyed that is sitting on disk intact.
@@ -591,8 +750,163 @@ mod tests {
     fn an_unwrapped_store_says_so() {
         let dir = TempDir::new().unwrap();
         let store = FsKeyStore::unwrapped(dir.path()).unwrap();
-        assert!(!store.protects());
-        assert!(store.wrapping().starts_with("none"));
+        assert!(!store.wrapper_protects());
+        assert!(store.wrapper_scheme().starts_with("none"));
+    }
+
+    /// The report the passphrase is not needed for, which is the whole reason the header is outside
+    /// the ciphertext. A reader holding no passphrase used to answer this from its own wrapper and
+    /// call a wrapped store development-only.
+    #[test]
+    fn wrapped_key_material_names_its_scheme_to_a_store_holding_no_passphrase() {
+        use crate::wrapper::{Cost, PassphraseWrapper, Scheme};
+
+        let cheap = Cost {
+            memory_kib: 32,
+            passes: 1,
+            lanes: 1,
+        };
+        let dir = TempDir::new().unwrap();
+        FsKeyStore::new(
+            dir.path(),
+            PassphraseWrapper::with_salt(b"a passphrase", [3u8; 16], cheap).unwrap(),
+        )
+        .unwrap()
+        .mint(&subject(0), &epoch())
+        .unwrap();
+
+        // Opened with no wrapper at all: this store cannot read a single one of those keys, and it
+        // still reports what wrote them.
+        let reader = FsKeyStore::unwrapped(dir.path()).unwrap();
+        let state = reader.key_material().unwrap();
+        assert_eq!(
+            state,
+            KeyMaterial::Wrapped {
+                scheme: Some(Scheme::PassphraseArgon2id),
+                files: 1,
+            }
+        );
+        assert!(!state.exposed(), "wrapped key material is not in the clear");
+        assert!(state.to_string().contains("argon2id"), "{state}");
+        assert!(
+            !reader.wrapper_protects(),
+            "the reader's own wrapper protects nothing, which is the fact this must not report"
+        );
+    }
+
+    #[test]
+    fn key_material_written_in_the_clear_reports_unwrapped_and_counts_it() {
+        let (_dir, store) = store();
+        store.mint(&subject(0), &epoch()).unwrap();
+        store.mint(&subject(1), &epoch()).unwrap();
+        store
+            .mint(&subject(0), &Epoch::containing(1_600_000_000_000))
+            .unwrap();
+
+        let state = store.key_material().unwrap();
+        assert_eq!(state, KeyMaterial::Unwrapped { files: 3 });
+        assert!(state.exposed(), "each of those files is a usable key");
+        assert!(state.to_string().starts_with("none"), "{state}");
+    }
+
+    #[test]
+    fn a_key_store_holding_nothing_claims_neither_wrapped_nor_unwrapped() {
+        let (_dir, store) = store();
+
+        let state = store.key_material().unwrap();
+        assert_eq!(state, KeyMaterial::Absent);
+        assert!(
+            !state.exposed(),
+            "there is nothing on disk to be in the clear, so nothing to warn about"
+        );
+        let shown = state.to_string();
+        assert!(shown.contains("no key material"), "{shown}");
+        assert!(
+            !shown.contains("development only"),
+            "a fresh store is not a development store: {shown}"
+        );
+
+        // A tombstone is not key material either: it names a subject that may never hold one.
+        store.tombstone(&subject(0)).unwrap();
+        assert_eq!(store.key_material().unwrap(), KeyMaterial::Absent);
+    }
+
+    #[test]
+    fn a_store_wrapped_after_it_held_keys_reports_both_halves() {
+        use crate::wrapper::{Cost, PassphraseWrapper};
+
+        let cheap = Cost {
+            memory_kib: 32,
+            passes: 1,
+            lanes: 1,
+        };
+        let dir = TempDir::new().unwrap();
+        FsKeyStore::unwrapped(dir.path())
+            .unwrap()
+            .mint(&subject(0), &epoch())
+            .unwrap();
+        FsKeyStore::new(
+            dir.path(),
+            PassphraseWrapper::with_salt(b"a passphrase", [3u8; 16], cheap).unwrap(),
+        )
+        .unwrap()
+        .mint(&subject(1), &epoch())
+        .unwrap();
+
+        // Neither answer on its own is true of this store, and picking one file's answer at random
+        // would hide either a key in the clear or a key nothing can read.
+        let state = FsKeyStore::unwrapped(dir.path())
+            .unwrap()
+            .key_material()
+            .unwrap();
+        assert_eq!(
+            state,
+            KeyMaterial::Mixed {
+                wrapped: 1,
+                unwrapped: 1
+            }
+        );
+        assert!(
+            state.exposed(),
+            "one key in the clear is one key in the clear"
+        );
+        assert!(state.to_string().starts_with("mixed"), "{state}");
+    }
+
+    #[test]
+    fn key_material_a_header_this_build_cannot_name_still_reads_as_wrapped() {
+        let (_dir, store) = store();
+        let subject = subject(0);
+        store.mint(&subject, &epoch()).unwrap();
+        // A blob from the discriminant reserved for a key service: marked, and unreadable here.
+        fs::write(
+            store.key_path(&subject, &epoch()).unwrap(),
+            b"YAAMKW\x01\x02rest",
+        )
+        .unwrap();
+
+        let state = store.key_material().unwrap();
+        assert_eq!(
+            state,
+            KeyMaterial::Wrapped {
+                scheme: None,
+                files: 1
+            }
+        );
+        assert!(!state.exposed());
+        assert!(state.to_string().contains("cannot name"), "{state}");
+    }
+
+    #[test]
+    fn a_key_file_that_cannot_be_read_is_an_error_not_a_file_uncounted() {
+        // Under-reporting is the failure worth avoiding: a skipped file is a key that might be in
+        // the clear and is reported as though it were not there.
+        let (_dir, store) = store();
+        let subject = subject(0);
+        create_private_dir(&store.subject_dir(&subject).unwrap()).unwrap();
+        create_private_dir(&store.key_path(&subject, &epoch()).unwrap()).unwrap();
+
+        assert!(store.key_material().is_err());
     }
 
     #[test]
