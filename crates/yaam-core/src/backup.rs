@@ -48,7 +48,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -236,6 +236,42 @@ pub fn disposition_of(name: &str) -> Option<Disposition> {
         .iter()
         .find(|entry| entry.name == name)
         .map(|entry| entry.disposition)
+}
+
+/// Every path a copy of this deployment must never contain, each with the entry that says why.
+///
+/// The manifest names entries *under the root*, and two of them are relocatable
+/// ([`Paths::with_key_store`], [`Paths::with_index`]) — so "the key store is excluded" is a claim
+/// about a path and not about a spelling. That is the reasoning
+/// [`refuse_excluded_inside_included`] applies to a backup destination; this is the same reasoning
+/// offered to anything else that has to decide whether a path is one of these, a guard over a
+/// version-controlled copy included.
+///
+/// Derived from [`MANIFEST`] rather than listed again, because a second list is how one of these
+/// stops being protected: a newly excluded entry is covered by every caller of this the moment it
+/// is declared.
+#[must_use]
+pub fn excluded_paths(paths: &Paths) -> Vec<(PathBuf, &'static Entry)> {
+    excluded()
+        .map(|entry| (resolved(paths, entry), entry))
+        .collect()
+}
+
+/// Where one excluded entry actually sits for this deployment.
+///
+/// The journal files are matched by the suffix they add to [`layout::INDEX_FILE`] rather than by
+/// their own names, so a relocated index takes them with it — and an entry added for a third
+/// journal file needs nothing here.
+fn resolved(paths: &Paths, entry: &Entry) -> PathBuf {
+    if entry.name == layout::KEYSTORE_DIR {
+        return paths.key_store.clone();
+    }
+    if let Some(suffix) = entry.name.strip_prefix(layout::INDEX_FILE) {
+        let mut path = paths.index.clone().into_os_string();
+        path.push(suffix);
+        return PathBuf::from(path);
+    }
+    paths.root.join(entry.name)
 }
 
 /// Copies the store's authoritative half into `into`.
@@ -685,6 +721,48 @@ mod tests {
             Some(Disposition::Included),
             "the erasure log has to travel, or a restore resurrects erased structure"
         );
+    }
+
+    /// Every exclusion has a path, and the two relocatable ones follow the deployment.
+    ///
+    /// Asserted over the list rather than over a handful of names, so a later exclusion arrives
+    /// with a path the moment it is declared. The relocations are what make this more than
+    /// `root.join(name)`: a key store under `records/` is still the key store, and an index moved
+    /// out of the tree takes its journal with it.
+    #[test]
+    fn every_exclusion_resolves_to_where_this_deployment_keeps_it() {
+        let root = Path::new("/srv/memory");
+        let paths = Paths::under(root)
+            .with_key_store(root.join("records/keys"))
+            .with_index("/var/lib/memory/derived.sqlite");
+        let resolved = super::excluded_paths(&paths);
+        assert_eq!(
+            resolved.len(),
+            excluded().count(),
+            "every exclusion needs a path, or one of them is unprotected"
+        );
+        for (path, entry) in &resolved {
+            assert!(
+                path.is_absolute(),
+                "`{}` resolved to a relative path",
+                entry.name
+            );
+        }
+        let path_of = |name: &str| {
+            resolved
+                .iter()
+                .find(|(_, entry)| entry.name == name)
+                .map(|(path, _)| path.clone())
+                .expect("the manifest names it")
+        };
+        assert_eq!(path_of(layout::KEYSTORE_DIR), paths.key_store);
+        assert_eq!(path_of(layout::INDEX_FILE), paths.index);
+        assert_eq!(
+            path_of("index.sqlite-wal"),
+            Path::new("/var/lib/memory/derived.sqlite-wal"),
+            "the journal follows the index, or a relocated one leaves its write-ahead log behind"
+        );
+        assert_eq!(path_of(layout::QUARANTINE_DIR), root.join(".quarantine"));
     }
 
     /// Nothing on the exclusion list travels, asserted over the list itself.
