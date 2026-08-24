@@ -1,9 +1,9 @@
 //! A read-only account of whether the store needs attention.
 //!
-//! Four questions, chosen because they are the ones whose answers change what an operator does
+//! Five questions, chosen because they are the ones whose answers change what an operator does
 //! next: is the index a version this build can use, has the index fallen behind the tree, is there
-//! work the sweeper has not got through, and how many records are held back waiting for a subject to
-//! resolve.
+//! work the sweeper has not got through, how many records are held back waiting for a subject to
+//! resolve, and is anything set aside in `.dead-letter/` that only a person will clear.
 //!
 //! Every figure is derived the same way the operation that acts on it derives it —
 //! [`crate::sweeper`]'s own scans, not a second definition of them. A drift count that disagrees
@@ -35,6 +35,12 @@ pub struct HealthReport {
     /// The spool rather than the index register, because the spool is the authority: the register is
     /// derived from it, and a rebuild reproduces the register from these files.
     pub quarantine_depth: usize,
+    /// Fan-out jobs sitting in `.dead-letter/`, waiting for a person.
+    ///
+    /// The same figure [`crate::drain`] reports, counted by the same function: a job nothing will
+    /// retry is exactly the kind of thing a health read exists to surface, and a store where
+    /// `drain` asks for an operator while `check` says nothing has two answers to one question.
+    pub dead_lettered: usize,
 }
 
 impl HealthReport {
@@ -43,9 +49,13 @@ impl HealthReport {
     /// The schema version is reported but not judged here: an index newer than this build is refused
     /// by the writer when the pipeline opens, so a report that got this far was read from a file this
     /// build can use.
+    ///
+    /// A dead letter counts, and it is the one figure here that no amount of waiting reduces —
+    /// which is the same judgement [`crate::drain::DrainReport::needs_attention`] makes, so the two
+    /// commands cannot differ about whether one store wants somebody.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
-        self.index_drift > 0 || self.sweeper_backlog.total() > 0
+        self.index_drift > 0 || self.sweeper_backlog.total() > 0 || self.dead_lettered > 0
     }
 }
 
@@ -93,6 +103,7 @@ pub fn check(pipeline: &Pipeline) -> Result<HealthReport> {
             layout::RECORD_EXT,
         )?
         .len(),
+        dead_lettered: crate::drain::dead_lettered(pipeline)?,
     })
 }
 
@@ -122,7 +133,29 @@ mod tests {
         assert_eq!(report.index_drift, 0);
         assert_eq!(report.sweeper_backlog.total(), 0);
         assert_eq!(report.quarantine_depth, 0);
+        assert_eq!(report.dead_lettered, 0);
         assert!(!report.needs_attention());
+    }
+
+    /// A job set aside is the one figure here that no amount of waiting reduces, so it is the one a
+    /// clean health read would be most wrong about.
+    #[test]
+    fn a_job_set_aside_for_a_person_is_counted_and_wants_one() {
+        let harness = Harness::new();
+        fs::write(
+            harness.root().join(".dead-letter/some-record.bundle"),
+            "record: some-record\njob: bundle\nattempts: 5\nreason: gone\n",
+        )
+        .expect("a job set aside");
+
+        let report = check(&harness.pipeline).expect("health");
+        assert_eq!(report.dead_lettered, 1);
+        assert_eq!(
+            report.sweeper_backlog.total(),
+            0,
+            "nothing is queued: this is work that stopped, not work that is waiting"
+        );
+        assert!(report.needs_attention());
     }
 
     /// The figures an operator acts on: a record the index lost, and work still queued.

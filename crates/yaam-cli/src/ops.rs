@@ -35,6 +35,14 @@ const RETAINED: &str = "frontmatter, attributes, entity references and timelines
      still answers that this subject was named, when, and about what — only what the records said \
      becomes unreadable";
 
+/// What a file in `.dead-letter/` means, said the same way by every command that counts one.
+///
+/// `drain` and `check` both report that count, and a store is degraded to both of them for it. One
+/// sentence, so the two cannot end up recommending different things about the same directory.
+const DEAD_LETTERED: &str = "`.dead-letter/` holds fan-out that ran out of attempts. Nothing will retry it, and no record \
+     was lost: each file names the job and why it failed, and `yaam reindex --all` queues that work \
+     again once the cause is gone.\n";
+
 /// Rebuilds the index from the tree, then runs the fan-out that rebuild re-enqueued.
 ///
 /// The drain is part of the command rather than a step to remember, for the same reason the restore
@@ -69,7 +77,7 @@ pub fn reindex(pipeline: &mut Pipeline, out: &mut dyn Write) -> Result<Exit> {
              its rows are not in the index\n",
         );
     }
-    let converged = settle_fanout(pipeline, &mut text);
+    let converged = settle_fanout(drain::drain_backlog(pipeline), &mut text);
     emit(out, &text)?;
     if converged {
         Ok(Exit::Ok)
@@ -119,7 +127,7 @@ pub fn erase(
     line(&mut text, "quarantine settled", report.quarantine_settled);
     let _ = writeln!(text, "  tombstone           {}", report.tombstone_id);
     // Reported, and deliberately not folded into the exit code below.
-    let _ = settle_fanout(pipeline, &mut text);
+    let _ = settle_fanout(drain::drain_backlog(pipeline), &mut text);
     let _ = writeln!(
         text,
         "\ncompleteness cannot be asserted until the key backup window has passed. Confirm with:\n  \
@@ -181,10 +189,21 @@ pub fn backup(pipeline: &Pipeline, to: &Path, out: &mut dyn Write) -> Result<Exi
     }
 }
 
-/// Restores a backup into a store and rebuilds its index.
+/// Restores a backup into a store, rebuilds its index, and runs the fan-out that queued.
 ///
 /// Takes paths rather than an open pipeline: the destination reads its `spec/` from the backup, so
-/// the store has to be opened after the copy rather than before it.
+/// the store has to be opened after the copy rather than before it. Which is also why the drain
+/// opens a store of its own — the one the rebuild used is gone by the time this returns.
+///
+/// The drain is here for the reason it is in [`reindex`]: the rebuild inside a restore drops every
+/// materialised timeline and re-enqueues the work that writes them again, so a restore that
+/// returned there would hand over a store whose `entities/` is empty — and on a store with no
+/// service to converge it, empty for ever. A backup carries no timelines precisely because a
+/// rebuild reproduces them, and this is where that promise is kept.
+///
+/// [`Exit::Degraded`] when the drain leaves work behind, matching what `check` says about the same
+/// queue. Re-running the restore is not the remedy and the report does not offer it: the narrower
+/// one is `yaam drain`.
 pub fn restore(paths: &Paths, from: &Path, out: &mut dyn Write) -> Result<Exit> {
     let report =
         backup::restore(paths, from).map_err(|error| failed("restoring the backup", &error))?;
@@ -206,8 +225,20 @@ pub fn restore(paths: &Paths, from: &Path, out: &mut dyn Write) -> Result<Exit> 
          where their keys still are: recover the key store from its own copy if this store is \
          meant to read them\n",
     );
+    // A store of this command's own, opened over what it has just written: the pipeline the rebuild
+    // ran on belonged to the restore and is closed. Its failure is the drain's failure and is
+    // reported as one — the files are in place either way, and the queue that is left is derived.
+    let converged = settle_fanout(
+        Pipeline::with_paths(paths.clone())
+            .and_then(|mut pipeline| drain::drain_backlog(&mut pipeline)),
+        &mut text,
+    );
     emit(out, &text)?;
-    Ok(Exit::Ok)
+    if converged {
+        Ok(Exit::Ok)
+    } else {
+        Ok(Exit::Degraded)
+    }
 }
 
 /// Reads the store's health.
@@ -246,16 +277,19 @@ pub fn drain(pipeline: &mut Pipeline, max_jobs: usize, out: &mut dyn Write) -> R
     }
 }
 
-/// Runs the fan-out a rebuild re-enqueued, and describes it in the caller's own report.
+/// Describes the fan-out a rebuild re-enqueued, drained on the caller's behalf.
 ///
-/// Never an error, and never a report of one. Both callers have already done the thing they were
-/// asked to do — an index rebuilt, a subject's keys destroyed — and fan-out that could not run is a
-/// separate, recoverable thing: the queue is derived, the work is still queued, and a later
-/// `yaam drain` or a running service does it. `false` says the store did not converge, which is a
-/// judgement the caller is free to spend its exit code on or not.
-fn settle_fanout(pipeline: &mut Pipeline, text: &mut String) -> bool {
+/// Never an error, and never a report of one. Every caller has already done the thing it was asked
+/// to do — an index rebuilt, a subject's keys destroyed, a backup put back — and fan-out that could
+/// not run is a separate, recoverable thing: the queue is derived, the work is still queued, and a
+/// later `yaam drain` or a running service does it. `false` says the store did not converge, which
+/// is a judgement the caller is free to spend its exit code on or not.
+///
+/// The drain is passed in rather than run here because a restore has no open store to run it on
+/// until it has finished copying, and opening one is then part of the same attempt.
+fn settle_fanout(drained: yaam_core::Result<DrainReport>, text: &mut String) -> bool {
     text.push_str("\nfan-out the rebuild queued:\n");
-    match drain::drain_backlog(pipeline) {
+    match drained {
         Ok(report) => {
             describe_drain(&report, text);
             !report.needs_attention()
@@ -294,11 +328,7 @@ fn describe_drain(report: &DrainReport, text: &mut String) {
         );
     }
     if report.dead_lettered > 0 {
-        text.push_str(
-            "`.dead-letter/` holds fan-out that ran out of attempts. Nothing will retry it, and no \
-             record was lost: each file names the job and why it failed, and `yaam reindex --all` \
-             queues that work again once the cause is gone.\n",
-        );
+        text.push_str(DEAD_LETTERED);
     }
 }
 
@@ -380,6 +410,9 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
         report.sweeper_backlog.stale_claims
     );
     let _ = writeln!(text, "quarantine depth   {}", report.quarantine_depth);
+    // Beside the two queue depths above, because it is the third answer to "how much work is this
+    // store holding" — and the only one that no service converges on its own.
+    let _ = writeln!(text, "dead-lettered      {}", report.dead_lettered);
     // Said on every health read and not only at startup, and asked of the store rather than
     // assumed: a key file recovered from a snapshot or a decommissioned disk is a usable key if
     // this line says none.
@@ -402,6 +435,10 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
         // Named here because this is the figure `yaam drain` reports back, and a backlog with no
         // command beside it reads as something only a service can fix.
         text.push_str("run `yaam drain` to run the queued fan-out now.\n");
+    }
+    if report.dead_lettered > 0 {
+        text.push('\n');
+        text.push_str(DEAD_LETTERED);
     }
     text
 }
@@ -627,6 +664,27 @@ mod tests {
         assert!(printed.contains("nothing is draining it"), "{printed}");
     }
 
+    /// A queue that is empty and still owes somebody an afternoon. `drain` has always reported this
+    /// and exited degraded over it; `check` did not count it at all, so a monitor reading the one
+    /// command whose job is this question was told the store was fine.
+    #[test]
+    fn a_job_set_aside_reports_degraded_and_names_what_clears_it() {
+        let tree = Tree::new();
+        fs::write(
+            tree.root().join(".dead-letter/some-record.bundle"),
+            "record: some-record\njob: bundle\nattempts: 5\nreason: gone\n",
+        )
+        .expect("a job set aside");
+
+        let (exit, printed) = run(|out| check(&tree.pipeline, out));
+        assert_eq!(exit, Exit::Degraded, "{printed}");
+        assert!(printed.contains("dead-lettered      1"), "{printed}");
+        assert!(
+            printed.contains("`yaam reindex --all`"),
+            "a count with no remedy beside it is a count nobody acts on: {printed}"
+        );
+    }
+
     #[test]
     fn an_unconfirmed_erasure_previews_and_destroys_nothing() {
         let mut tree = Tree::new();
@@ -818,13 +876,9 @@ mod tests {
     fn a_restore_rebuilds_the_index_and_says_the_erasure_log_was_replayed() {
         let mut source = Tree::new();
         let subject = fixtures::subject('e');
-        source
-            .pipeline
-            .accept(
-                fixtures::subject_record("2026-08-20T09:00:00Z", &subject),
-                BODY,
-            )
-            .expect("accepted");
+        let record = fixtures::subject_record("2026-08-20T09:00:00Z", &subject);
+        let id = record.record_id.clone();
+        source.pipeline.accept(record, BODY).expect("accepted");
         let held = elsewhere();
         let into = held.path().join("backup");
         let (_, printed) = run(|out| backup(&source.pipeline, &into, out));
@@ -852,13 +906,26 @@ mod tests {
             "a restore must not have produced key material"
         );
 
+        // The timeline the backup deliberately did not carry, on disk with the record in it. This
+        // used to be the state a restore left behind — a store whose `entities/` was empty and
+        // nothing to fill it — and "the command exited 0" was true of that too.
+        let timeline = paths
+            .root
+            .join("entities/order_ref/ord10014721/timeline.md");
+        assert!(
+            fs::read_to_string(&timeline)
+                .expect("the timeline the restore's own drain wrote")
+                .contains(&format!("[[record:{}", id.as_str())),
+            "{printed}"
+        );
+
         // The restored store answers, which is the half that files-on-disk does not prove.
         let restored = yaam_core::Pipeline::with_paths(paths).expect("the restored store");
         let (exit, health) = run(|out| check(&restored, out));
         assert_eq!(
             exit,
-            Exit::Degraded,
-            "fan-out is queued and nothing drains it here: {health}"
+            Exit::Ok,
+            "the restore drained what its rebuild queued, so nothing is owed: {health}"
         );
         assert!(health.contains("records indexed    1"), "{health}");
         assert!(health.contains("index drift        0"), "{health}");

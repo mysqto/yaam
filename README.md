@@ -60,8 +60,8 @@ environment.
 The service drains fan-out and sweeps every `--maintenance-ms` (30 s by default) *and* once at
 startup, so a process that comes up over an interrupted write converges without waiting an interval
 out. A store driven by the command line alone has no such timer: `yaam drain` runs the queue on
-demand, and `reindex` and `erase` drain what they re-enqueue before they return, so neither leaves a
-store with its entity timelines missing.
+demand, and `reindex`, `erase` and `restore` drain what they re-enqueue before they return, so none
+of them leaves a store with its entity timelines missing.
 
 ```sh
 # The service. Refuses to start on a misconfiguration, and logs the effective one — never a key.
@@ -80,7 +80,7 @@ curl --unix-socket /var/lib/yaam/agent/sockets/agent_a.read.sock \
      "http://localhost/records?limit=10"
 
 # The operator command line.
-yaam --root /srv/memory check                       # schema, drift, backlog, quarantine
+yaam --root /srv/memory check                       # schema, drift, backlog, quarantine, dead letters
 yaam --root /srv/memory reindex --all               # rebuild the index from the tree, then drain
 yaam --root /srv/memory drain                       # run queued fan-out: timelines, audit records
 yaam --root /srv/memory drain --max-jobs 500        # …up to a bound; the rest stays queued
@@ -88,7 +88,7 @@ yaam --root /srv/memory erase --subject s_…         # prints what it would des
 yaam --root /srv/memory erase --subject s_… --confirm-destroy-keys
 yaam --root /srv/memory verify-erasure --tombstone tomb-…
 yaam --root /srv/memory backup --to /srv/backups/2026-08-20   # authoritative half only
-yaam --root /restored     restore --from /srv/backups/2026-08-20
+yaam --root /restored     restore --from /srv/backups/2026-08-20   # copy, rebuild, then drain
 ```
 
 A backup carries the tree, the cold manifests, the subject audit trail, the erasure log and the
@@ -98,11 +98,11 @@ its reason, and both commands read that one list. The timelines are left behind 
 reproduces them — it drops them along with the index rows that record which lines they already hold,
 and the fan-out it queues writes them again — from the tree, and from the cold manifests for the
 records the tree no longer holds — which the same command then drains before it returns. The key
-store is the load-bearing exclusion — erasure works by
-destroying keys, so a key surviving in a backup would make a restore un-erase a subject while live
-verification still reported the erasure complete. `restore` refuses a backup that carries one, and
-refuses a store that already holds records; it rebuilds the index and replays the restored
-tombstone log as part of the same command.
+store is the load-bearing exclusion — erasure works by destroying keys, so a key surviving in a
+backup would make a restore un-erase a subject while live verification still reported the erasure
+complete. `restore` refuses a backup that carries one, and refuses a store that already holds
+records; it rebuilds the index, replays the restored tombstone log and drains the fan-out that
+rebuild queued, all as part of the same command.
 
 The key store has its own recovery path and is not part of this one. Restoring a tree without it
 gives a store that answers structure and no bodies, which is the honest outcome: bodies are
