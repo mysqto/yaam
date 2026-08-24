@@ -66,6 +66,7 @@ const AGENTS: &[(&str, Role, &[&str])] = &[
     ("deploy_bot", Role::Writer, &["platform"]),
     ("ledger_bot", Role::Writer, &["platform"]),
     ("release_bot", Role::Writer, &["platform"]),
+    ("review_bot", Role::Writer, &["platform"]),
     ("chat_bot", Role::Writer, &["platform", "support"]),
     ("ops_bot", Role::Operator, &["platform", "support"]),
     // In no team, which is what makes the team-scoped rows below assert something.
@@ -96,7 +97,7 @@ struct Fixture {
     subject: Option<char>,
 }
 
-/// The tree every case reads: ten records across four actions, four agents and two teams.
+/// The tree every case reads: thirteen records across five actions, five agents and two teams.
 ///
 /// Deliberately not one record per question. A store holding a single record cannot tell a query
 /// that discriminates from a query that matches everything, so each fixture is a near miss for some
@@ -270,6 +271,63 @@ const FIXTURES: &[Fixture] = &[
         body: "The reply was refused by the channel and never reached anybody.",
         subject: None,
     },
+    // Two passes over one pull request, an hour apart. A single review record could not tell a
+    // timeline that is ordered from one that happens to hold a single row, and the verdict is what
+    // changes between them: the question "is this still blocked" is answered by the newer one.
+    Fixture {
+        label: "review_changes",
+        agent: "review_bot",
+        received_at: "2026-08-20T15:00:00Z",
+        action: "review",
+        outcome: Outcome::Success,
+        attrs: &[
+            ("verdict", Attr::Text("changes_requested")),
+            ("findings", Attr::Int(2)),
+        ],
+        entities: &[
+            ("pull_request", "owner/repo#84"),
+            ("commit", "owner/repo@3f1c9ab"),
+        ],
+        visibility: Visibility::Org,
+        team: None,
+        body: "Read the whole diff and asked for two changes before it can go in.",
+        subject: None,
+    },
+    Fixture {
+        label: "review_approved",
+        agent: "review_bot",
+        received_at: "2026-08-20T16:00:00Z",
+        action: "review",
+        outcome: Outcome::Success,
+        attrs: &[
+            ("verdict", Attr::Text("approved")),
+            ("findings", Attr::Int(0)),
+        ],
+        entities: &[("pull_request", "owner/repo#84")],
+        visibility: Visibility::Org,
+        team: None,
+        body: "The two changes landed, so a second pass over the same diff let it through.",
+        subject: None,
+    },
+    // Same action and the same window as the pair above, by another agent and about another pull
+    // request. Without it, "this agent's reviews" and "this pull request's reviews" would both be
+    // satisfied by a read that ignored the thing it was asked about.
+    Fixture {
+        label: "review_other",
+        agent: "release_bot",
+        received_at: "2026-08-20T15:30:00Z",
+        action: "review",
+        outcome: Outcome::Partial,
+        attrs: &[
+            ("verdict", Attr::Text("commented")),
+            ("findings", Attr::Int(1)),
+        ],
+        entities: &[("pull_request", "owner/repo#85")],
+        visibility: Visibility::Org,
+        team: None,
+        body: "Got through the migration and left one note; the rest of the diff went unread.",
+        subject: None,
+    },
 ];
 
 /// How a golden row asks its question.
@@ -362,6 +420,20 @@ const GOLDEN: &[Case] = &[
             Needs::Attr("provider=gateway_one"),
         ],
     },
+    // The outcome the review group declares `partial` for: a diff read as far as the reviewer got.
+    // It is a different question from "which reviews asked for changes" — this one is about the
+    // reviewer having stopped, and nothing in the verdict says so.
+    Case {
+        question: "which reviews never got through the whole diff",
+        ask: Ask::Ordered("/records?action=review&outcome=partial"),
+        window: None,
+        agent: "ops_bot",
+        finds: &["review_other"],
+        needs: &[
+            Needs::Field("outcome", "partial"),
+            Needs::Entity("pull_request:owner/repo#85"),
+        ],
+    },
     // ---- find by entity reference: "what happened to this thing" ----
     Case {
         question: "what has happened to this ticket",
@@ -378,6 +450,33 @@ const GOLDEN: &[Case] = &[
         agent: "ops_bot",
         finds: &["lookup_sealed", "transact_declined"],
         needs: &[Needs::Entity("order_ref:ord10014721")],
+    },
+    // A deploy names itself `service/environment#build`, and a pull request `owner/repo#number`, so
+    // both ids carry the two characters a path cannot: the separator, and the one a URI reads as the
+    // start of a fragment. Written encoded here because that is what an operator's client has to
+    // send — and the row would pass a service that only ever answered single-word ids otherwise.
+    Case {
+        question: "what happened to this one deploy",
+        ask: Ask::Ordered("/entities/deploy/api%2Fproduction%231042"),
+        window: None,
+        agent: "ops_bot",
+        finds: &["deploy_failed"],
+        needs: &[
+            Needs::Entity("deploy:api/production#1042"),
+            Needs::Field("outcome", "failure"),
+            Needs::Attr("build=b1042"),
+        ],
+    },
+    Case {
+        question: "what happened to this pull request",
+        ask: Ask::Ordered("/entities/pull_request/owner%2Frepo%2384"),
+        window: None,
+        agent: "ops_bot",
+        finds: &["review_approved", "review_changes"],
+        needs: &[
+            Needs::Entity("pull_request:owner/repo#84"),
+            Needs::Field("action", "review"),
+        ],
     },
     Case {
         question: "what context is there for this ticket",
@@ -403,6 +502,19 @@ const GOLDEN: &[Case] = &[
         agent: "ops_bot",
         finds: &["lookup_sealed", "transact_failed", "transact_declined"],
         needs: &[Needs::Field("agent", "ledger_bot")],
+    },
+    // Another agent reviewed inside the same window, so the answer is the agent's reviews rather
+    // than the window's: this is the question asked of a reviewing agent before trusting it further.
+    Case {
+        question: "what did this reviewer review over the afternoon",
+        ask: Ask::Ordered("/records?action=review&agent=review_bot&from_ms={from}&to_ms={to}"),
+        window: Some(("2026-08-20T14:00:00Z", "2026-08-20T17:00:00Z")),
+        agent: "ops_bot",
+        finds: &["review_approved", "review_changes"],
+        needs: &[
+            Needs::Field("action", "review"),
+            Needs::Field("agent", "review_bot"),
+        ],
     },
     // ---- find by attribute value ----
     Case {
@@ -435,6 +547,32 @@ const GOLDEN: &[Case] = &[
         agent: "ops_bot",
         finds: &["deploy_failed", "deploy_ok", "deploy_stale"],
         needs: &[Needs::Attr("service=api"), Needs::Field("action", "deploy")],
+    },
+    // A review's `outcome` says it ran and its `verdict` says what it concluded, which is why the
+    // verdict is an attribute at all: every review here succeeded, so `outcome` cannot separate the
+    // one still asking for changes from the one that let the change through.
+    Case {
+        question: "which reviews are holding a change up",
+        ask: Ask::Ordered("/records?action=review&attr=verdict=changes_requested"),
+        window: None,
+        agent: "ops_bot",
+        finds: &["review_changes"],
+        needs: &[
+            Needs::Attr("verdict=changes_requested"),
+            Needs::Attr("findings=2"),
+            Needs::Field("outcome", "success"),
+        ],
+    },
+    // `findings: 0` is the whole reason the count is recorded: a change that went in unchallenged is
+    // the one somebody comes looking for, and it is otherwise indistinguishable from an approval
+    // that had plenty to say first.
+    Case {
+        question: "which reviews raised nothing at all",
+        ask: Ask::Ordered("/records?action=review&attr=findings=0"),
+        window: None,
+        agent: "ops_bot",
+        finds: &["review_approved"],
+        needs: &[Needs::Attr("findings=0"), Needs::Attr("verdict=approved")],
     },
     // ---- full text over the body ----
     Case {
@@ -489,6 +627,38 @@ const GOLDEN: &[Case] = &[
         question: "did anything touch a canary environment",
         ask: Ask::Ordered("/records?attr=environment=canary"),
         window: None,
+        agent: "ops_bot",
+        finds: &[],
+        needs: &[],
+    },
+    // A build that was never rolled out, spelled exactly like one that was. An entity read that
+    // matched on the kind, or on a prefix of the id, would answer this with somebody else's deploy —
+    // and "what happened to deploy X" is the question an incident starts from.
+    Case {
+        question: "what happened to a deploy nobody ever recorded",
+        ask: Ask::Ordered("/entities/deploy/api%2Fproduction%239999"),
+        window: None,
+        agent: "ops_bot",
+        finds: &[],
+        needs: &[],
+    },
+    // A verdict this deployment writes no record with. `attrs` is a declared map and not a closed
+    // one, so an unwritten value is a miss rather than a refusal — which is what makes the two
+    // verdict rows above assert something.
+    Case {
+        question: "did any review reject a change outright",
+        ask: Ask::Ordered("/records?action=review&attr=verdict=rejected"),
+        window: None,
+        agent: "ops_bot",
+        finds: &[],
+        needs: &[],
+    },
+    // The reviewer's own day before, which is the row that makes the windowed question above mean
+    // "over the afternoon" rather than "ever".
+    Case {
+        question: "did this reviewer review anything the day before",
+        ask: Ask::Ordered("/records?action=review&agent=review_bot&from_ms={from}&to_ms={to}"),
+        window: Some(("2026-08-19T00:00:00Z", "2026-08-20T00:00:00Z")),
         agent: "ops_bot",
         finds: &[],
         needs: &[],

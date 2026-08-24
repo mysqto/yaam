@@ -278,6 +278,7 @@ mod tests {
             Class::Sensitive
         );
         assert_eq!(s.class_of("reply", "chunks").unwrap(), Class::Structural);
+        assert_eq!(s.class_of("review", "verdict").unwrap(), Class::Structural);
     }
 
     #[test]
@@ -367,6 +368,7 @@ mod tests {
         assert_eq!(s.type_of("deploy", "service").unwrap(), "string");
         assert_eq!(s.type_of("deploy", "duration_ms").unwrap(), "integer");
         assert_eq!(s.type_of("transact", "amount_minor").unwrap(), "integer");
+        assert_eq!(s.type_of("review", "findings").unwrap(), "integer");
         // Same failure as `class_of`: nothing is declared for a key or an action the spec omits.
         assert!(matches!(
             s.type_of("deploy", "who"),
@@ -383,6 +385,9 @@ mod tests {
             Some(["success", "failure"].map(str::to_owned).as_slice())
         );
         assert_eq!(s.outcomes_for("deploy").unwrap().len(), 3);
+        // A review that stopped part-way through a diff is neither a pass nor a failure, so the
+        // group declares the same three a deploy does.
+        assert_eq!(s.outcomes_for("review").unwrap().len(), 3);
         assert_eq!(s.outcomes_for("no_such_action"), None);
     }
 

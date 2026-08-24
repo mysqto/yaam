@@ -105,6 +105,110 @@ fn one_command_line_puts_a_record_in_the_tree() {
     service.stop();
 }
 
+/// The two shapes this deployment emits first, each as the one command line an operator would type.
+///
+/// Separate from the case above because what it asserts is not the command line but the *spec*: the
+/// service refuses an attribute key `spec/attrs-schema.yaml` does not declare, permanently, and the
+/// emitter cannot read the spec to warn anybody first. So a shape is only emittable once a real
+/// service has taken a real record carrying every key the shape uses — which is what makes the
+/// declaration for `review` a change with a check behind it rather than one nobody could break.
+///
+/// Both through one deployment, and counted at the end: two records that landed as one, or as one
+/// and a duplicate, would satisfy each command's own exit code.
+#[test]
+fn each_of_the_two_emitted_shapes_is_a_record_the_service_takes() {
+    let deployment = Deployment::new();
+    let root = deployment.root_str();
+    let mut service = Service::start(&deployment);
+    let (socket, mut agent) = sidecar(
+        &deployment,
+        "agent",
+        &format!("http://{}", service.address),
+        &service.sealing_public_key,
+    );
+    let env = hook_env(&socket);
+
+    // A failed rollout, carrying every attribute the `deploy` group declares — including the integer
+    // one, which is the type a value passed as `--attr` would have arrived as text under.
+    let deployed = yaam_emit(
+        &[
+            "--action",
+            "deploy",
+            "--outcome",
+            "failure",
+            "--summary",
+            "the api rollout to production stalled on the second shard and was rolled back",
+            "--attr",
+            "service=api",
+            "--attr",
+            "environment=production",
+            "--attr",
+            "build=b1042",
+            "--attr-int",
+            "duration_ms=94000",
+            "--entity",
+            "deploy:api/production#1042",
+            "--entity",
+            "ticket:PROJ-42",
+            "--tag",
+            "release",
+        ],
+        &as_pairs(&env),
+    );
+    assert_accepted("deploy", &deployed);
+
+    // A review that read the whole diff and asked for changes: a success carrying a blocking
+    // verdict, which is the pair `review` declares `verdict` apart from `outcome` for. What it
+    // reviewed is entity references, so a later read joins it to the deploy that follows.
+    let reviewed = yaam_emit(
+        &[
+            "--action",
+            "review",
+            "--outcome",
+            "success",
+            "--summary",
+            "read the whole diff and asked for two changes before it can go in",
+            "--attr",
+            "verdict=changes_requested",
+            "--attr-int",
+            "findings=2",
+            "--entity",
+            "pull_request:owner/repo#84",
+            "--entity",
+            "commit:owner/repo@3f1c9ab",
+            "--tag",
+            "review",
+        ],
+        &as_pairs(&env),
+    );
+    assert_accepted("review", &reviewed);
+
+    // Both in the tree and both in the index, with nothing the index cannot account for.
+    let files = support::record_files(deployment.root());
+    assert_eq!(files.len(), 2, "{files:?}");
+    let health = String::from_utf8_lossy(&yaam(&["--root", root, "check"]).stdout).into_owned();
+    assert!(health.contains("records indexed    2"), "{health}");
+    assert!(health.contains("index drift        0"), "{health}");
+
+    terminate(&mut agent, "yaam-agent");
+    service.stop();
+}
+
+/// Asserts one emitted record was taken, and says which shape it was when it was not.
+///
+/// The service's own reason is on stderr, and it is the whole of what a failure here means: an
+/// undeclared key names itself, so the message says which attribute the spec is missing.
+fn assert_accepted(shape: &str, emitted: &std::process::Output) {
+    assert_eq!(
+        emitted.status.code(),
+        Some(0),
+        "the service refused the `{shape}` shape: {}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let printed = String::from_utf8_lossy(&emitted.stdout).into_owned();
+    assert!(printed.starts_with("accepted "), "{shape}: {printed}");
+}
+
 /// With the service unreachable the record is spooled, and that exits with its own code — a success,
 /// because the sidecar has it and will keep trying.
 #[test]
