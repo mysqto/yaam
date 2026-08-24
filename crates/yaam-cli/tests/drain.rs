@@ -106,6 +106,55 @@ fn a_rebuild_leaves_the_timelines_re_materialised() {
     );
 }
 
+/// A restore ends in a rebuild too, and its debt is the one the backup manifest promises: timelines
+/// are left out of a backup *because* a rebuild writes them again.
+#[test]
+fn a_restore_leaves_the_timelines_the_backup_left_behind() {
+    let deployment = Deployment::new();
+    let record = record();
+    let id = record.record_id.clone();
+    {
+        let mut pipeline = Pipeline::new(deployment.root()).expect("pipeline");
+        pipeline.accept(record, BODY).expect("accepted");
+        assert_eq!(pipeline.drain_fanout(10).expect("drained"), 1);
+    }
+
+    // Outside both stores: a backup inside the tree it copies is refused.
+    let outside = tempfile::tempdir().expect("tempdir");
+    let into = outside.path().join("backup");
+    let into_str = into.to_str().expect("utf-8");
+    yaam(&["--root", deployment.root_str(), "backup", "--to", into_str]);
+    assert!(
+        !into.join("entities").exists(),
+        "the manifest excludes materialised timelines, which is what makes the drain below owed"
+    );
+
+    let destination = tempfile::tempdir().expect("tempdir");
+    let destination_str = destination.path().to_str().expect("utf-8");
+    let restored = yaam(&["--root", destination_str, "restore", "--from", into_str]);
+    let said = String::from_utf8_lossy(&restored.stdout);
+    assert_eq!(
+        restored.status.code(),
+        Some(0),
+        "{said}{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(said.contains("jobs still queued   0"), "{said}");
+
+    let head = destination
+        .path()
+        .join("entities")
+        .join(TICKET.0)
+        .join(TICKET.1)
+        .join("timeline.md");
+    assert!(
+        fs::read_to_string(&head)
+            .unwrap_or_default()
+            .contains(&format!("[[record:{}", id.as_str())),
+        "a restored store owes the timeline the backup left for it to rebuild: {said}"
+    );
+}
+
 /// An erasure ends in a rebuild, so it has the same debt to settle — over the timelines the contract
 /// says an erasure *retains*.
 #[test]
@@ -245,4 +294,38 @@ fn a_fan_out_job_that_cannot_run_does_not_fail_an_erasure() {
     // The store is the one that is degraded, and that is the command that says so.
     let checked = yaam(&["--root", deployment.root_str(), "check"]);
     assert_eq!(checked.status.code(), Some(4));
+}
+
+/// A job nobody will retry has to look the same to both commands.
+///
+/// It used not to: `drain` counted `.dead-letter/` and exited degraded, `check` did not count it at
+/// all and exited clean over the same store. Two verdicts about whether one store wants a person is
+/// the defect, whichever of them a monitor happens to read.
+#[test]
+fn a_dead_letter_is_degraded_to_check_as_it_is_to_drain() {
+    let deployment = Deployment::new();
+    let root = deployment.root_str();
+    // Set aside by some earlier drain, which is the state an operator actually finds: the queue is
+    // empty and the work is still owed.
+    drop(Pipeline::new(deployment.root()).expect("pipeline"));
+    fs::write(
+        deployment.root().join(".dead-letter/some-record.bundle"),
+        "record: some-record\njob: bundle\nattempts: 5\nreason: gone\n",
+    )
+    .expect("a job set aside");
+
+    let drained = yaam(&["--root", root, "drain"]);
+    let said = String::from_utf8_lossy(&drained.stdout);
+    assert_eq!(drained.status.code(), Some(4), "{said}");
+    assert!(said.contains("set aside           1"), "{said}");
+
+    let checked = yaam(&["--root", root, "check"]);
+    let printed = String::from_utf8_lossy(&checked.stdout);
+    assert_eq!(
+        checked.status.code(),
+        Some(4),
+        "a drain asking for an operator and a check saying nothing is the disagreement: {printed}"
+    );
+    assert!(printed.contains("dead-lettered      1"), "{printed}");
+    assert!(printed.contains("`yaam reindex --all`"), "{printed}");
 }

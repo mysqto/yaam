@@ -168,9 +168,12 @@ pub enum Command {
         #[arg(long, value_name = "ID")]
         tombstone: String,
     },
-    /// Read the store's health: schema version, index drift, sweeper backlog, quarantine depth.
+    /// Read the store's health: schema version, index drift, sweeper backlog, quarantine depth,
+    /// dead-lettered fan-out.
     ///
-    /// The first command to run when something looks wrong.
+    /// The first command to run when something looks wrong. Degraded whenever any of it wants a
+    /// person, a job set aside in `.dead-letter/` included: nothing retries one, so a store holding
+    /// one is not converging however long it is left alone.
     Check,
     /// Copy the store's authoritative half into a fresh directory.
     ///
@@ -183,12 +186,14 @@ pub enum Command {
         #[arg(long = "to", value_name = "PATH")]
         to: PathBuf,
     },
-    /// Restore a backup into this store, then rebuild the index.
+    /// Restore a backup into this store, rebuild the index, then run the fan-out that queued.
     ///
     /// The rebuild is part of the command rather than a step to remember: restored files can be
     /// older than the sweeper's own scan bound, and the rebuild is also what replays the restored
-    /// tombstone log so a backup cannot resurrect erased structure. Refuses a store that already
-    /// holds records — a restore is not a merge.
+    /// tombstone log so a backup cannot resurrect erased structure. Its fan-out is drained here for
+    /// the same reason: a backup carries no materialised timelines because a rebuild writes them
+    /// again, and this is the command that makes that true. Refuses a store that already holds
+    /// records — a restore is not a merge.
     Restore {
         /// Directory holding the backup.
         #[arg(long = "from", value_name = "PATH")]

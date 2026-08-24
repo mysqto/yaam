@@ -24,6 +24,10 @@
 //! sweeper's own bound, and a rebuild is also what replays the tombstone log so that a backup
 //! predating an erasure cannot re-index the structure that erasure removed.
 //!
+//! `audit/` is the one derived thing that travels anyway, and its entry says why: reproducing it
+//! needs a drain to run, and an account of which records named which subjects is not worth
+//! betting on one.
+//!
 //! # What does not, and why each one
 //!
 //! Every exclusion carries its reason in [`Entry::reason`], stated where the exclusion is made
@@ -112,10 +116,13 @@ pub const MANIFEST: &[Entry] = &[
     Entry {
         name: layout::AUDIT_DIR,
         disposition: Disposition::Included,
-        reason: "which records named which subjects. Written by fan-out from the record's own \
-                 frontmatter, but a rebuild only re-enqueues that work — and for a record the tree \
-                 no longer holds, because it was archived to a cold manifest, no drain can ever do \
-                 it. So the audit trail travels",
+        reason: "the subject-to-record linkage: which records named which subjects, in which role. \
+                 The most legally interesting residue an erasure leaves standing — retained by \
+                 design rather than erased, which is also what makes carrying it safe, since it \
+                 resurrects nothing an erasure destroyed — and whether it is retained is a \
+                 documented decision somebody owns, not this routine's to take. A drain does \
+                 reproduce it, archived records included, but only if `cold/` travelled too and \
+                 only if a drain actually runs: an audit trail is not worth betting on either",
     },
     Entry {
         name: layout::TOMBSTONE_LOG,

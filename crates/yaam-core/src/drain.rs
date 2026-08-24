@@ -52,8 +52,9 @@ pub struct DrainReport {
     /// Jobs sitting in `.dead-letter/`, waiting for a person.
     ///
     /// Counted from the directory rather than from this drain alone, because that is the number
-    /// somebody has to act on: a job set aside by an earlier drain is owed the same attention as one
-    /// set aside by this one, and nothing else reports it.
+    /// somebody has to act on: a job set aside by an earlier drain is owed the same attention as
+    /// one set aside by this one. [`crate::health::check`] reads the same directory through the
+    /// same counter, so the two commands agree about who is owed a look.
     pub dead_lettered: usize,
 }
 
@@ -122,7 +123,10 @@ fn queued(pipeline: &Pipeline) -> Result<usize> {
 }
 
 /// Files in `.dead-letter/`, one per job that ran out of attempts.
-fn dead_lettered(pipeline: &Pipeline) -> Result<usize> {
+///
+/// Shared with [`crate::health::check`] rather than counted there again, so a drain and a health
+/// read cannot come back with two numbers for one directory.
+pub(crate) fn dead_lettered(pipeline: &Pipeline) -> Result<usize> {
     let dir = pipeline.paths().root.join(layout::DEAD_LETTER_DIR);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -201,6 +205,34 @@ mod tests {
                 .expect("health")
                 .sweeper_backlog
                 .fanout_pending
+        );
+    }
+
+    /// And the same for the jobs nothing will retry. A drain that asks for an operator over a
+    /// directory a health read does not count is two verdicts about one store.
+    #[test]
+    fn what_a_drain_says_was_set_aside_is_what_a_health_read_says_was() {
+        let mut harness = Harness::new();
+        let record = testkit::internal("2026-08-20T09:00:00Z");
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+        fs::remove_file(harness.path_of(&record)).expect("remove");
+
+        let mut report = drain(&mut harness.pipeline, 10).expect("drained");
+        while report.remaining > 0 {
+            harness.release_fanout();
+            report = drain(&mut harness.pipeline, 10).expect("drained");
+        }
+        assert_eq!(report.dead_lettered, 1);
+
+        let health = crate::health::check(&harness.pipeline).expect("health");
+        assert_eq!(report.dead_lettered, health.dead_lettered);
+        assert_eq!(
+            report.needs_attention(),
+            health.needs_attention(),
+            "a store is degraded to both commands or to neither"
         );
     }
 
