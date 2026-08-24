@@ -70,6 +70,60 @@ impl Scheme {
             _ => None,
         }
     }
+
+    /// How this scheme protects key material, in the words a report uses.
+    ///
+    /// Here rather than on the wrapper, because a blob read off disk names its scheme by a byte and
+    /// nothing else: a report that could only get this prose from a live wrapper could only describe
+    /// the wrapper the reading process happens to hold.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PassphraseArgon2id => "argon2id over a passphrase, then AES-256 key wrap",
+        }
+    }
+}
+
+/// What the front of stored key material says about its own protection.
+///
+/// The header sits outside the ciphertext exactly so this question has an answer without the
+/// passphrase: reading a marker is not decrypting, and a report that needed the key in order to say
+/// whether the key was protected could only ever describe its own configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrapping {
+    /// Marked, under a scheme this build can name.
+    Named(Scheme),
+    /// Marked, under something this build cannot name — a newer format version, or the discriminant
+    /// reserved for a key service. Wrapped all the same: the marker is the claim, and naming the
+    /// scheme is the separate question.
+    Unnamed,
+    /// No marker. The bytes are key material as written, and the file is a usable key.
+    Absent,
+}
+
+/// What the leading bytes of `stored` say about how it was wrapped.
+///
+/// Deliberately more forgiving than the header parse on the unwrap path: that one gates a blob about
+/// to be unwrapped and owes an error naming the cause, this one only has to tell a marked blob from
+/// an unmarked one. A header this build cannot read is still a header, and calling it unwrapped would
+/// be the more dangerous mistake of the two — it is the one that says a protected store is in the
+/// clear.
+///
+/// A 32-byte random key that happens to open with the marker would be misread here, at one chance in
+/// 2^48; the same coincidence makes [`crate::keystore::KeyWrapper::unwrap`] fail loudly, so nothing
+/// acts on it silently.
+#[must_use]
+pub fn wrapping_of(stored: &[u8]) -> Wrapping {
+    if stored.len() < MAGIC.len() || &stored[..MAGIC.len()] != MAGIC {
+        return Wrapping::Absent;
+    }
+    if stored.len() <= MAGIC.len() + 1 || stored[MAGIC.len()] != FORMAT_VER {
+        return Wrapping::Unnamed;
+    }
+    match Scheme::from_byte(stored[MAGIC.len() + 1]) {
+        Some(scheme) => Wrapping::Named(scheme),
+        None => Wrapping::Unnamed,
+    }
 }
 
 /// Argon2id cost, as recorded in every blob this wrapper writes.
@@ -198,7 +252,10 @@ impl PassphraseWrapper {
 
 impl crate::keystore::KeyWrapper for PassphraseWrapper {
     fn scheme(&self) -> &'static str {
-        "argon2id over a passphrase, then AES-256 key wrap"
+        // The same words a blob's own header resolves to, from the same place: a wrapper that
+        // described itself differently from what it writes is a mismatch nobody would see until
+        // two reports of one store disagreed.
+        Scheme::PassphraseArgon2id.name()
     }
 
     fn wrap(&self, key: &[u8]) -> crate::Result<Vec<u8>> {
@@ -488,6 +545,54 @@ mod tests {
         );
         assert_eq!(Scheme::from_byte(0), None);
         assert_eq!(Scheme::from_byte(2), None, "reserved, not yet implemented");
+    }
+
+    #[test]
+    fn a_blob_names_its_scheme_to_a_reader_holding_no_passphrase() {
+        // The property a health read stands on: the header is outside the ciphertext, so what wrote
+        // a key file can be read without the key. Nothing derived here, and nothing unwrapped.
+        let blob = wrapper(PASS).wrap(KEY).expect("wrapped");
+        assert_eq!(
+            wrapping_of(&blob),
+            Wrapping::Named(Scheme::PassphraseArgon2id)
+        );
+        assert_eq!(
+            Scheme::PassphraseArgon2id.name(),
+            wrapper(PASS).scheme(),
+            "one spelling for the header's scheme and the wrapper's own"
+        );
+    }
+
+    #[test]
+    fn key_material_written_as_it_came_carries_no_marker() {
+        // A bare key, which is what Passthrough leaves on disk, and the state the marker exists to
+        // tell apart from a blob.
+        assert_eq!(
+            wrapping_of(&Passthrough.wrap(KEY).expect("passed through")),
+            Wrapping::Absent
+        );
+        assert_eq!(wrapping_of(b""), Wrapping::Absent);
+        assert_eq!(wrapping_of(b"YAAMK"), Wrapping::Absent, "a partial marker");
+    }
+
+    #[test]
+    fn a_header_this_build_cannot_read_still_reads_as_wrapped() {
+        // Wrapped-but-unnameable is the safer of the two errors: calling it unwrapped would tell an
+        // operator that a protected store is in the clear.
+        let blob = wrapper(PASS).wrap(KEY).expect("wrapped");
+        let mut future = blob.clone();
+        future[MAGIC.len()] = FORMAT_VER + 1;
+        assert_eq!(wrapping_of(&future), Wrapping::Unnamed);
+
+        let mut reserved = blob.clone();
+        reserved[MAGIC.len() + 1] = 2;
+        assert_eq!(wrapping_of(&reserved), Wrapping::Unnamed);
+
+        assert_eq!(
+            wrapping_of(&blob[..=MAGIC.len()]),
+            Wrapping::Unnamed,
+            "a marker with nothing behind it is still a marker"
+        );
     }
 
     #[test]

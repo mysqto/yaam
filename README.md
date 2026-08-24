@@ -275,8 +275,20 @@ because an argument is visible in `ps` to every user on the host.
 
 Without it the store falls back to `Passthrough` and a key file recovered from a snapshot, a stale
 volume or a decommissioned disk is a usable key. Both `yaam-server` at startup and `yaam check` on
-every read say which of the two is in force, and they ask the store rather than the configuration, so
-a wrapper that failed to take effect still warns.
+every read say which is the case, and they read it off the key files rather than off the flags: the
+answer is a property of the store, so a passphrase the reader did not pass cannot change it.
+
+Three answers, not two, because "no wrapping" and "no key material" are different states:
+
+| on disk | reported as |
+| --- | --- |
+| every key file carries the marker | the scheme its header names |
+| key files exist, none carries the marker | `none`, with the count, and development-only |
+| no key files yet | nothing to report — neither claim is true |
+
+The third is the common case for a new store, and calling it unwrapped was a false statement about
+files that did not exist. A store holding *both* is what fitting a wrapper to a store that already
+had keys leaves behind: `yaam check` reports it as degraded, because no wrapper reads all of it.
 
 Every wrapped blob carries its own scheme, salt and cost. That is redundant per blob and bought
 deliberately: a wrong wrapper errors instead of handing plausible rubbish to the unwrap step, which is

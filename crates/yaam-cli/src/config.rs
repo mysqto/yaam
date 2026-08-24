@@ -605,8 +605,10 @@ mod tests {
         }
     }
 
+    /// A flag says what this process will write, and nothing about what the store already holds —
+    /// which is the whole distinction: this one fits a wrapper over a key store with nothing in it.
     #[test]
-    fn a_passphrase_file_fits_a_wrapper_and_silences_the_warning() {
+    fn a_passphrase_file_fits_a_wrapper_without_claiming_anything_about_the_disk() {
         let dir = tree();
         let file = dir.path().join("pass");
         std::fs::write(&file, b"a passphrase\n").expect("written");
@@ -614,17 +616,26 @@ mod tests {
         let settings = StoreSettings::resolve(&passphrase_args(dir.path(), &file), &Env::default())
             .expect("resolved");
         let pipeline = settings.open().expect("opened");
-        assert!(pipeline.key_material_protected());
-        assert!(pipeline.key_wrapping().contains("argon2id"));
+        assert!(pipeline.key_wrapper_protects());
+        assert!(pipeline.key_wrapper_scheme().contains("argon2id"));
+        assert_eq!(
+            pipeline.key_material().expect("read"),
+            yaam_crypto::keystore::KeyMaterial::Absent,
+            "a fitted wrapper is not key material on disk"
+        );
     }
 
     #[test]
-    fn no_passphrase_file_leaves_key_material_in_the_clear() {
+    fn no_passphrase_file_leaves_what_this_process_writes_in_the_clear() {
         let dir = tree();
         let settings = StoreSettings::resolve(&store_args(Some(dir.path())), &Env::default())
             .expect("resolved");
         let pipeline = settings.open().expect("opened");
-        assert!(!pipeline.key_material_protected());
+        assert!(!pipeline.key_wrapper_protects());
+        // And still nothing to say about the store: an absent flag is not a store in the clear.
+        let state = pipeline.key_material().expect("read");
+        assert_eq!(state, yaam_crypto::keystore::KeyMaterial::Absent);
+        assert!(!state.exposed());
     }
 
     #[test]

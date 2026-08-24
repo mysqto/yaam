@@ -23,6 +23,7 @@ use std::time::Duration;
 use axum::Router;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use yaam_crypto::keystore::KeyMaterial;
 use yaam_server::routes::{self, AppState};
 use yaam_server::service::CoreService;
 
@@ -67,8 +68,15 @@ pub async fn bind(settings: &ServerSettings) -> Result<Bound> {
         .transpose()?;
 
     let pipeline = settings.store.open()?;
-    let key_wrapping = pipeline.key_wrapping();
-    let key_protected = pipeline.key_material_protected();
+    // Read here like every other refusal: a key store whose files cannot be read is a service that
+    // would fail sealed writes one request at a time.
+    let keys = KeyReport {
+        on_disk: pipeline
+            .key_material()
+            .map_err(|error| failed("reading how key material on disk is protected", &error))?,
+        wrapper: pipeline.key_wrapper_scheme(),
+        wrapper_protects: pipeline.key_wrapper_protects(),
+    };
     let service = Arc::new(CoreService::with_pipeline(pipeline));
     let mut state = AppState::new(Arc::clone(&keyring), Arc::clone(&service) as Arc<_>);
     if let Some((secret, _)) = &sealing {
@@ -86,8 +94,7 @@ pub async fn bind(settings: &ServerSettings) -> Result<Bound> {
         settings,
         address,
         sealing.as_ref().map(|(_, public)| *public),
-        key_wrapping,
-        key_protected,
+        &keys,
     );
 
     Ok(Bound {
@@ -170,6 +177,20 @@ async fn maintenance_loop(
     }
 }
 
+/// What a startup log has to say about key material.
+///
+/// Two answers rather than one, gathered at the same moment: what the key files on disk carry, and
+/// what this service would write. Held apart deliberately — treating the second as the first is the
+/// mistake that reported a wrapped store as development-only.
+struct KeyReport {
+    /// What the key material already on disk says about its own protection.
+    on_disk: KeyMaterial,
+    /// How the wrapper this service holds would protect a key it writes.
+    wrapper: &'static str,
+    /// Whether that wrapper protects at all.
+    wrapper_protects: bool,
+}
+
 /// Logs the effective configuration, once, at startup.
 ///
 /// Paths, the address, and whether sealed bodies can be opened. No key material: the secret half is
@@ -179,8 +200,7 @@ fn announce(
     settings: &ServerSettings,
     address: SocketAddr,
     sealing_public_key: Option<[u8; 32]>,
-    key_wrapping: &'static str,
-    key_protected: bool,
+    keys: &KeyReport,
 ) {
     for (setting, value) in settings.store.describe() {
         tracing::info!(setting, %value, "configuration");
@@ -210,19 +230,69 @@ fn announce(
              body. A sidecar posting to it would spool for ever"
         );
     }
-    // Once, clearly, and not buried -- but only when it is true. Asked of the store rather than of
-    // the configuration, so a wrapper that failed to take effect still warns.
+    // Two facts, not one, and the difference between them matters: what the key files on disk carry,
+    // and what this service will write. They are the same sentence on a store this service has
+    // always run over, and an operator who can see both can spot a store about to end up holding
+    // half of each. The first is the one `yaam check` prints, from the same place, so the two cannot
+    // disagree about one store.
     tracing::info!(
         setting = "key wrapping",
-        value = key_wrapping,
+        value = %keys.on_disk,
         "configuration"
     );
-    if !key_protected {
-        tracing::warn!(
-            "subject keys are stored unwrapped: no --key-passphrase-file, so a key file recovered \
-             from a snapshot, a stale volume or a decommissioned disk is a usable key. Fit a \
-             wrapper before this store holds anyone's data"
-        );
+    tracing::info!(
+        setting = "key wrapper",
+        value = keys.wrapper,
+        "configuration: what this service writes new keys under"
+    );
+    if let Some(warning) = key_warning(keys) {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// Key material on disk that anyone who can read the files can use.
+const KEYS_EXPOSED: &str = "subject keys on disk are stored unwrapped, so a key file recovered from a snapshot, a stale \
+     volume or a decommissioned disk is a usable key. Fit a wrapper: until then, destroying a key \
+     erases nothing that a copy of that file can still open";
+
+/// Nothing on disk yet, and this service about to write key material in the clear.
+const KEYS_WILL_BE_IN_THE_CLEAR: &str = "this store holds no key material yet, and no --key-passphrase-file: the first subject key \
+     this service mints will be stored as written. Fit a wrapper before this store holds anyone's \
+     data \u{2014} a wrapper fitted afterwards leaves the keys written before it unreadable rather \
+     than migrating them";
+
+/// Key material on disk this service holds no wrapper for.
+const KEYS_UNREADABLE: &str = "the key material on disk is wrapped and this service was given no --key-passphrase-file: it \
+     cannot unwrap a single subject key, so every sealed body it is asked for will fail to open. \
+     Point it at the passphrase the store was written under";
+
+/// What a startup log warns about key material, or nothing where nothing is wrong.
+///
+/// A function returning the sentence rather than a run of `if`s inside the log call: which of these
+/// cases deserves a warning is exactly what this change had to decide, and a decision only a log
+/// line records is a decision no test can contradict.
+fn key_warning(keys: &KeyReport) -> Option<&'static str> {
+    // Present tense, about the disk, and whatever this process holds: key material somebody can read
+    // is there to be read either way. First, because a mixed store is exposed and unreadable at once
+    // and the exposure is the half that cannot wait.
+    if keys.on_disk.exposed() {
+        return Some(KEYS_EXPOSED);
+    }
+    if keys.wrapper_protects {
+        return None;
+    }
+    match keys.on_disk {
+        // A store with no key material has nothing exposed, so the warning above would be a claim
+        // about files that do not exist -- the false alarm every fresh store used to raise. Silence
+        // would give up the one moment fitting a wrapper is free, so this says it in the future
+        // tense instead, and only where it is true. A fresh store opened with a passphrase is quiet.
+        KeyMaterial::Absent => Some(KEYS_WILL_BE_IN_THE_CLEAR),
+        // Wrapped on disk, no wrapper here. Not an exposure -- the files are protected -- but this
+        // service cannot read them, and that is a misconfiguration an operator would otherwise meet
+        // one failed read at a time.
+        KeyMaterial::Wrapped { .. } => Some(KEYS_UNREADABLE),
+        // Unreachable: both are exposed, and returned above.
+        KeyMaterial::Unwrapped { .. } | KeyMaterial::Mixed { .. } => None,
     }
 }
 
@@ -235,7 +305,7 @@ mod tests {
     use yaam_contract::RecordId;
     use yaam_server::service::CoreService;
 
-    use super::{bind, serve};
+    use super::{KeyMaterial, KeyReport, bind, key_warning, serve};
     use crate::cli::{ServerArgs, StoreArgs};
     use crate::config::{DEFAULT_MAINTENANCE_MS, Env, ServerSettings};
     use crate::exit::Exit;
@@ -334,6 +404,96 @@ mod tests {
             .expect_err("the port is taken");
         assert_eq!(error.exit(), Exit::Failed);
         assert!(error.to_string().contains(&taken), "{error}");
+    }
+
+    /// Everything the startup warning says about key material, and everything it stays quiet about.
+    ///
+    /// Both directions are claims. Warning on a store with nothing in its key store is the false
+    /// alarm this change removed; saying nothing about key material anyone can read is the bug that
+    /// would replace it.
+    #[test]
+    fn a_startup_warns_about_the_key_material_that_deserves_it() {
+        let report = |on_disk, wrapper_protects| KeyReport {
+            on_disk,
+            wrapper: "either wrapper",
+            wrapper_protects,
+        };
+        let warned = |on_disk, protects| key_warning(&report(on_disk, protects));
+
+        // Readable on disk: a warning whatever this process holds, because the files are the keys.
+        for protects in [true, false] {
+            let said = warned(KeyMaterial::Unwrapped { files: 1 }, protects)
+                .expect("keys in the clear must be said out loud");
+            assert!(said.contains("stored unwrapped"), "{said}");
+            assert!(
+                warned(
+                    KeyMaterial::Mixed {
+                        wrapped: 1,
+                        unwrapped: 1
+                    },
+                    protects
+                )
+                .is_some(),
+                "one key in the clear is one key in the clear"
+            );
+        }
+
+        // Wrapped and this service can read it: nothing to say.
+        assert!(
+            warned(
+                KeyMaterial::Wrapped {
+                    scheme: None,
+                    files: 2
+                },
+                true
+            )
+            .is_none()
+        );
+        // Wrapped and it cannot: not an exposure, but every sealed read will fail.
+        let said = warned(
+            KeyMaterial::Wrapped {
+                scheme: None,
+                files: 2,
+            },
+            false,
+        )
+        .expect("a service that can read none of its keys has to say so");
+        assert!(said.contains("cannot unwrap"), "{said}");
+
+        // Nothing on disk: no claim about files that are not there. The future tense earns a line
+        // only where this service is the one about to write in the clear.
+        let said = warned(KeyMaterial::Absent, false).expect("about to mint keys in the clear");
+        assert!(said.contains("holds no key material yet"), "{said}");
+        assert!(
+            warned(KeyMaterial::Absent, true).is_none(),
+            "a fresh store with a wrapper fitted is not worth waking anyone for"
+        );
+    }
+
+    /// The startup line an operator reads, over a store that already holds key material.
+    ///
+    /// A fresh store says there is nothing to report and warns about what it is about to write; this
+    /// one has keys on disk in the clear, which is the state the present-tense warning is for. Both
+    /// paths are rendered here under a real subscriber rather than merely constructed.
+    #[tokio::test]
+    async fn a_store_holding_key_material_is_announced_from_the_disk() {
+        crate::logging(&Env::default());
+        let deployment = Deployment::new();
+        let mut pipeline = yaam_core::Pipeline::with_paths(yaam_core::Paths::under(
+            deployment.dir.path().to_path_buf(),
+        ))
+        .expect("a pipeline over the tree");
+        pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &fixtures::subject('a')),
+                fixtures::BODY,
+            )
+            .expect("accepted");
+        drop(pipeline);
+
+        bind(&deployment.settings("127.0.0.1:0"))
+            .await
+            .expect("a store whose keys are in the clear still comes up");
     }
 
     /// A service with an unusable keyring must not come up at all.

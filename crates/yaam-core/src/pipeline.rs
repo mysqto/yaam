@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use yaam_contract::attrs::Schema;
 use yaam_contract::entity::Registry;
 use yaam_contract::{ActionRecord, DataClass, RecordId, SubjectHash, SubjectRef};
-use yaam_crypto::keystore::{FsKeyStore, KeyStore as _, KeyWrapper};
+use yaam_crypto::keystore::{FsKeyStore, KeyMaterial, KeyStore as _, KeyWrapper};
 use yaam_crypto::{Epoch, SealedBody};
 use yaam_md::{Body, Document};
 use yaam_store::{FanoutJob, PublishInput, Store, Writer};
@@ -317,19 +317,29 @@ impl Pipeline {
         &mut self.writer
     }
 
-    /// How key material in this pipeline's key store is protected.
+    /// What the key material in this pipeline's key store says about its own protection.
     ///
-    /// Reported rather than assumed: a health read that printed what the CLI intended, instead of
-    /// what the store actually has, would say "protected" for a store that is not.
-    #[must_use]
-    pub fn key_wrapping(&self) -> &'static str {
-        self.keys.wrapping()
+    /// Read off the disk, so the answer does not depend on this process holding the passphrase.
+    /// Asking the wrapper instead answers a different question — what the *next* key will be written
+    /// under — and a report that confused the two called a wrapped store development-only whenever
+    /// the operator reading it passed no passphrase.
+    pub fn key_material(&self) -> Result<KeyMaterial> {
+        Ok(self.keys.key_material()?)
     }
 
-    /// Whether this pipeline's key material is protected at all.
+    /// Whether the wrapper this pipeline holds protects the key material it writes.
+    ///
+    /// About this process, not about the store — [`Pipeline::key_material`] is that question. What
+    /// this one answers is what a store holding no key material yet is about to become.
     #[must_use]
-    pub fn key_material_protected(&self) -> bool {
-        self.keys.protects()
+    pub fn key_wrapper_protects(&self) -> bool {
+        self.keys.wrapper_protects()
+    }
+
+    /// How the wrapper this pipeline holds would protect a key it writes.
+    #[must_use]
+    pub fn key_wrapper_scheme(&self) -> &'static str {
+        self.keys.wrapper_scheme()
     }
 
     /// Custody of the subject keys.
