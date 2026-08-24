@@ -33,11 +33,12 @@ pub enum Exit {
     /// about the same record: one is stored, the other is owed. A deployment whose service has been
     /// down all afternoon is invisible to a caller that cannot tell them apart.
     Spooled,
-    /// A record will never be accepted as written. Retrying changes nothing; the caller is the only
-    /// one who can fix it.
+    /// A record will never be accepted as written, or a read will never be answered as asked.
+    /// Retrying changes nothing; the caller is the only one who can fix it.
     Rejected,
-    /// A socket did not answer: nothing is listening, or the path names no socket. Nothing was
-    /// recorded, so the record is still the caller's to send.
+    /// A socket did not answer: nothing is listening, the path names no socket, or the service
+    /// behind it could not be reached. Nothing was recorded and nothing was read, so the work is
+    /// still the caller's to do.
     Unreachable,
 }
 
@@ -96,8 +97,8 @@ Exit codes:
   5  unconfirmed — a destructive command was not confirmed; nothing was done
   6  incomplete — the erasure is real but cannot be asserted complete yet
   7  spooled — the sidecar holds the record and is still delivering it; a success
-  8  rejected — the record will never be accepted as written; only its sender can fix it
-  9  unreachable — a socket did not answer; nothing was recorded";
+  8  rejected — the request will never be accepted as asked; only its sender can fix it
+  9  unreachable — a socket did not answer; nothing was recorded and nothing was read";
 
 #[cfg(test)]
 mod tests {
