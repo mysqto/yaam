@@ -1,12 +1,15 @@
-//! The argument surface of all three binaries.
+//! The argument surface of all four binaries.
 //!
-//! One file, because the three have to agree. [`StoreArgs`] is flattened into the service and the
+//! One file, because they have to agree. [`StoreArgs`] is flattened into the service and the
 //! operator command line, so `--root` is one declaration with one default and one help string — not
 //! two that drift until a rebuild addresses a different store than the service reads.
 //!
-//! The sidecar has no [`StoreArgs`], and that is a decision rather than an omission: it never opens
-//! the tree, the index or the key store. Handing it those flags would invite a deployment to point
-//! it somewhere, and the answer to where it points is "nowhere".
+//! Neither the sidecar nor the emitter has [`StoreArgs`], and that is a decision rather than an
+//! omission: neither ever opens the tree, the index or the key store. Handing them those flags would
+//! invite a deployment to point them somewhere, and the answer to where they point is "nowhere".
+//! This is also why [`EmitCli`] is its own binary rather than a `yaam emit` subcommand — the operator
+//! command line flattens [`StoreArgs`] above its subcommands, so a subcommand would inherit `--root`
+//! whatever it did with it.
 
 use std::path::PathBuf;
 
@@ -99,6 +102,169 @@ pub struct AgentArgs {
     /// Delay between drain attempts while the spool is backed up. Overrides the configuration file.
     #[arg(long, value_name = "MS")]
     pub retry_interval_ms: Option<u64>,
+}
+
+/// Record one thing an agent did, on a caller socket.
+///
+/// Everything mechanical is filled in here: the identifier, both timestamps, the schema version,
+/// `backfilled: false` and the empty collections. What is left to say is what only the caller knows.
+///
+/// This binary opens no store, and has no flag that could point it at one. It writes one JSON line
+/// to a sidecar socket and reads one back; the sidecar is what seals, signs and spools. A caller
+/// posting to the service directly would need the service's own key and would lose the spool with
+/// it, which is the difference between a record that waits out an outage and one that is gone.
+///
+/// Subjects stay empty and the data class stays `internal`. What a subject *is* — how a person
+/// becomes a pseudonym, and under whose canonicalisation — is still an open decision, and a flag
+/// inviting one would let a caller declare a record erasable that this deployment cannot erase.
+/// A subject resolver is what will fill them in when that is settled, not an argument here.
+#[derive(Debug, Parser)]
+#[command(name = "yaam-emit", version, after_help = exit::HELP)]
+pub struct EmitCli {
+    /// Everything the record and the socket need.
+    #[command(flatten)]
+    pub args: EmitArgs,
+}
+
+/// One record, as a caller describes it.
+#[derive(Debug, Args)]
+pub struct EmitArgs {
+    /// The caller socket to write to. Also read from `YAAM_SOCKET`.
+    ///
+    /// A sidecar's record socket, at `<state-dir>/sockets/<agent>.sock` by default. Not the
+    /// `.read.sock` beside it, which speaks HTTP.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+    /// Which agent this record is attributed to. Also read from `YAAM_AGENT`.
+    ///
+    /// Must be the agent the socket belongs to. The sidecar refuses a record claiming another,
+    /// because the socket is the evidence of who is writing.
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
+    /// Version of the agent, for attributing a change in behaviour to a release.
+    #[arg(long, value_name = "VERSION")]
+    pub agent_ver: Option<String>,
+    /// What was done, as `spec/attrs-schema.yaml` names it.
+    #[arg(long, value_name = "ACTION")]
+    pub action: String,
+    /// How it went.
+    ///
+    /// Required, and deliberately not defaulted to `success`: a default would file every failure
+    /// nobody remembered to describe as a success, and no later read could tell.
+    #[arg(long, value_name = "OUTCOME")]
+    pub outcome: OutcomeArg,
+    /// Prose describing what happened. Becomes the record's body.
+    #[arg(long, value_name = "TEXT")]
+    pub summary: String,
+    /// A declared text attribute, as `key=value`. Repeat for several.
+    ///
+    /// Text, always. The type each key is declared with lives in the deployment's
+    /// `spec/attrs-schema.yaml`, which this binary cannot read, and guessing from the shape of a
+    /// value would send an integer wherever a build number happened to be all digits. Use
+    /// `--attr-int` and `--attr-bool` to mean those.
+    #[arg(long = "attr", value_name = "KEY=VALUE")]
+    pub attrs: Vec<String>,
+    /// A declared integer attribute, as `key=value`. Repeat for several.
+    #[arg(long = "attr-int", value_name = "KEY=VALUE")]
+    pub attr_ints: Vec<String>,
+    /// A declared boolean attribute, as `key=true` or `key=false`. Repeat for several.
+    #[arg(long = "attr-bool", value_name = "KEY=VALUE")]
+    pub attr_bools: Vec<String>,
+    /// An entity this record joins on, as `kind:id`. Repeat for several.
+    ///
+    /// Recorded as a primary reference at full confidence, because a caller naming an entity is
+    /// stating a fact rather than inferring one. The other roles and every confidence below `1.0`
+    /// describe references *inferred* from prose, which are the extractor's to produce.
+    #[arg(long = "entity", value_name = "KIND:ID")]
+    pub entities: Vec<String>,
+    /// A free tag. Repeat for several.
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
+    /// Who may read this record.
+    #[arg(long, value_name = "SCOPE", default_value = "org")]
+    pub visibility: VisibilityArg,
+    /// The team, required when `--visibility team`.
+    #[arg(long, value_name = "TEAM")]
+    pub team: Option<String>,
+    /// Ties every stage of one interaction together.
+    #[arg(long, value_name = "ID")]
+    pub correlation_id: Option<String>,
+    /// The redaction policy this record was written under.
+    ///
+    /// It must name the policy the deployment *applies*, not one the caller would like: the service
+    /// refuses a record that declares any other, because a record claiming a policy nobody ran is a
+    /// record whose account of its own redaction is false. The name is the `policy:` field of the
+    /// deployment's `spec/redaction/*.yaml`.
+    #[arg(long, value_name = "NAME", default_value = crate::emit::DEFAULT_REDACTION_POLICY)]
+    pub redaction_policy: String,
+    /// Print the record that would be sent and stop. Needs no socket and no sidecar.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// How long to wait for the sidecar's answer, in milliseconds.
+    ///
+    /// The sidecar sends its backlog ahead of a new record, so the wait can legitimately be longer
+    /// than one round trip. A bound all the same: a hook that blocks for ever on a wedged socket
+    /// stops whatever called it.
+    #[arg(long, value_name = "MS", default_value_t = crate::emit::DEFAULT_TIMEOUT_MS)]
+    pub timeout_ms: u64,
+}
+
+/// How the outcome of an action is reported, as a flag.
+///
+/// A separate enum from [`yaam_contract::Outcome`] only because clap has to be told the spellings;
+/// [`OutcomeArg::into_contract`] is the one place they are mapped, so a variant added to the
+/// contract fails to compile here rather than being silently unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum OutcomeArg {
+    /// The action did what it set out to do.
+    Success,
+    /// It failed.
+    Failure,
+    /// It partly succeeded, and the summary says how.
+    Partial,
+    /// It was refused.
+    Declined,
+}
+
+impl OutcomeArg {
+    /// The contract's own spelling.
+    #[must_use]
+    pub fn into_contract(self) -> yaam_contract::Outcome {
+        match self {
+            Self::Success => yaam_contract::Outcome::Success,
+            Self::Failure => yaam_contract::Outcome::Failure,
+            Self::Partial => yaam_contract::Outcome::Partial,
+            Self::Declined => yaam_contract::Outcome::Declined,
+        }
+    }
+}
+
+/// Who may read a record, as a flag. Paired with [`yaam_contract::Visibility`] as [`OutcomeArg`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum VisibilityArg {
+    /// The actor only.
+    Owner,
+    /// A named team, which `--team` has to name.
+    Team,
+    /// Everyone in the deployment.
+    Org,
+    /// Audit records, readable only by the operator role.
+    Operator,
+}
+
+impl VisibilityArg {
+    /// The contract's own spelling.
+    #[must_use]
+    pub fn into_contract(self) -> yaam_contract::Visibility {
+        match self {
+            Self::Owner => yaam_contract::Visibility::Owner,
+            Self::Team => yaam_contract::Visibility::Team,
+            Self::Org => yaam_contract::Visibility::Org,
+            Self::Operator => yaam_contract::Visibility::Operator,
+        }
+    }
 }
 
 /// Operate a memory store: rebuild the index, run its queued work, erase a subject, copy it, read
@@ -205,7 +371,7 @@ pub enum Command {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{AgentCli, Command, OperatorCli, ServerCli};
+    use super::{AgentCli, Command, EmitCli, OperatorCli, ServerCli};
     use crate::exit::Exit;
 
     /// The codes are only an interface if they are published where a reader looks.
@@ -215,6 +381,7 @@ mod tests {
             OperatorCli::command().render_long_help().to_string(),
             ServerCli::command().render_long_help().to_string(),
             AgentCli::command().render_long_help().to_string(),
+            EmitCli::command().render_long_help().to_string(),
         ];
         for help in &rendered {
             for outcome in Exit::ALL {
@@ -228,12 +395,13 @@ mod tests {
     }
 
     /// The shared flags are one declaration, so they have to appear on both binaries that open a
-    /// store — and on neither the sidecar, which opens none.
+    /// store — and on neither of the two that run on a caller's host, which open none.
     #[test]
     fn the_store_flags_are_on_the_two_binaries_that_open_a_store() {
         let operator = OperatorCli::command().render_long_help().to_string();
         let server = ServerCli::command().render_long_help().to_string();
         let agent = AgentCli::command().render_long_help().to_string();
+        let emit = EmitCli::command().render_long_help().to_string();
         for flag in ["--root", "--index", "--key-store"] {
             assert!(operator.contains(flag), "yaam is missing {flag}");
             assert!(server.contains(flag), "yaam-server is missing {flag}");
@@ -241,7 +409,87 @@ mod tests {
                 !agent.contains(flag),
                 "the sidecar opens no store, so {flag} must not be offered"
             );
+            assert!(
+                !emit.contains(flag),
+                "the emitter opens no store, so {flag} must not be offered"
+            );
         }
+    }
+
+    /// The decision that stays open has to stay open in the argument surface too. A `--subject`
+    /// would let a caller declare a record erasable under a canonicalisation nobody has chosen, and
+    /// the help is where a reader finds out why there is none.
+    #[test]
+    fn the_emitter_offers_no_way_to_name_a_subject() {
+        let help = EmitCli::command().render_long_help().to_string();
+        assert!(!help.contains("--subject"), "{help}");
+        assert!(!help.contains("--data-class"), "{help}");
+        assert!(help.contains("Subjects stay empty"), "{help}");
+    }
+
+    /// The three that only the caller can answer are required, so a record cannot be written without
+    /// saying what happened or how it went.
+    #[test]
+    fn what_only_the_caller_knows_is_required() {
+        EmitCli::try_parse_from(["yaam-emit"]).expect_err("no action, outcome or summary");
+        EmitCli::try_parse_from(["yaam-emit", "--action", "deploy"])
+            .expect_err("an action with no outcome");
+        EmitCli::try_parse_from([
+            "yaam-emit",
+            "--action",
+            "deploy",
+            "--outcome",
+            "success",
+            "--summary",
+            "shipped it",
+        ])
+        .expect("everything mechanical is filled in, so this is enough");
+    }
+
+    /// An outcome nobody can report is a usage error, not a record that stores the typo.
+    #[test]
+    fn an_outcome_outside_the_contract_is_refused() {
+        EmitCli::try_parse_from([
+            "yaam-emit",
+            "--action",
+            "deploy",
+            "--outcome",
+            "probably",
+            "--summary",
+            "shipped it",
+        ])
+        .expect_err("`probably` is not an outcome the contract has");
+    }
+
+    /// Each repeatable flag collects rather than replacing, or a caller naming three entities would
+    /// silently record one.
+    #[test]
+    fn the_repeatable_flags_collect() {
+        let cli = EmitCli::try_parse_from([
+            "yaam-emit",
+            "--action",
+            "deploy",
+            "--outcome",
+            "success",
+            "--summary",
+            "shipped it",
+            "--attr",
+            "service=api",
+            "--attr",
+            "environment=staging",
+            "--entity",
+            "deploy:api/staging#1",
+            "--entity",
+            "ticket:PROJ-42",
+            "--tag",
+            "release",
+            "--tag",
+            "rollout",
+        ])
+        .expect("parsed");
+        assert_eq!(cli.args.attrs.len(), 2);
+        assert_eq!(cli.args.entities.len(), 2);
+        assert_eq!(cli.args.tags.len(), 2);
     }
 
     #[test]

@@ -114,6 +114,23 @@ pub fn yaam(args: &[&str]) -> Output {
         .expect("run yaam")
 }
 
+/// Runs `yaam-emit` and returns what a script would see.
+///
+/// Nothing about the environment is inherited beyond what the caller passes: the emitter reads
+/// `YAAM_SOCKET` and `YAAM_AGENT`, and a variable left over from the surrounding shell would make a
+/// test pass on a setting it never named.
+pub fn yaam_emit(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yaam-emit"));
+    command
+        .args(args)
+        .env_remove("YAAM_SOCKET")
+        .env_remove("YAAM_AGENT");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().expect("run yaam-emit")
+}
+
 /// Services started so far, which is what keeps their logs apart.
 static STARTS: AtomicUsize = AtomicUsize::new(0);
 

@@ -38,7 +38,7 @@ crates/
   yaam-core       write pipeline, sweeper, reindex, erasure, bundle composition
   yaam-server     HTTP service
   yaam-agent      local sidecar: two sockets per caller, seals and signs on their behalf
-  yaam-cli        the three entry points: `yaam-server`, `yaam-agent`, `yaam`
+  yaam-cli        the four entry points: `yaam-server`, `yaam-agent`, `yaam`, `yaam-emit`
 xtask/            repository chores: generates spec/schemas, checks the shapes behind it
 spec/             the contract bundle other implementations vendor
   memory.v1.yaml    the wire contract as OpenAPI 3.1, checked against the router and the types
@@ -51,11 +51,15 @@ spec/             the contract bundle other implementations vendor
 
 ## Running it
 
-Three binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
+Four binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
 `--key-store` default to sitting under it, and every setting is also read from the environment
 (`YAAM_ROOT`, `YAAM_INDEX`, `YAAM_KEY_STORE`, `YAAM_LISTEN`, `YAAM_KEYRING`,
-`YAAM_UNSEAL_KEY_FILE`, `YAAM_MAINTENANCE_MS`, `YAAM_AGENT_STATE`, `YAAM_LOG`). A flag beats the
-environment.
+`YAAM_UNSEAL_KEY_FILE`, `YAAM_MAINTENANCE_MS`, `YAAM_AGENT_STATE`, `YAAM_SOCKET`, `YAAM_AGENT`,
+`YAAM_LOG`). A flag beats the environment.
+
+Two of the four open a store and two never do. `yaam-agent` and `yaam-emit` run on the caller's host
+and have no `--root` to give them: that is what lets a caller record what it did while holding no key
+material and no path into anyone's memory tree.
 
 The service drains fan-out and sweeps every `--maintenance-ms` (30 s by default) *and* once at
 startup, so a process that comes up over an interrupted write converges without waiting an interval
@@ -78,6 +82,14 @@ yaam-agent --state-dir /var/lib/yaam/agent
 # A read through the sidecar. The request is ordinary HTTP; the signature is the sidecar's to add.
 curl --unix-socket /var/lib/yaam/agent/sockets/agent_a.read.sock \
      "http://localhost/records?limit=10"
+
+# Recording one action. Everything mechanical — the identifier, both timestamps, the schema version,
+# `backfilled`, the empty collections — is filled in; what is asked for is what only the caller knows.
+export YAAM_SOCKET=/var/lib/yaam/agent/sockets/agent_a.sock YAAM_AGENT=agent_a
+yaam-emit --action deploy --outcome success --summary "rolled the api service out to staging" \
+          --attr service=api --attr environment=staging --entity deploy:api/staging#1146 --tag release
+
+yaam-emit --action deploy --outcome success --summary "…" --dry-run   # the exact line, no sidecar needed
 
 # The operator command line.
 yaam --root /srv/memory check                       # schema, drift, backlog, quarantine, dead letters
@@ -129,6 +141,37 @@ Exit codes are the scriptable interface and are listed in every `--help`:
 | `4` | degraded — the store answered, and something in it wants attention |
 | `5` | unconfirmed — a destructive command was not confirmed; nothing was done |
 | `6` | incomplete — the erasure is real but cannot be asserted complete yet |
+| `7` | spooled — the sidecar holds the record and is still delivering it; a success |
+| `8` | rejected — the record will never be accepted as written; only its sender can fix it |
+| `9` | unreachable — a socket did not answer; nothing was recorded |
+
+`7` is a success and has its own code because the two things it might mean to a monitor are different:
+the record is durable, and the service has not seen it yet. A hook that treated it as a failure would
+report an outage as a lost record, which is the one thing the spool exists to prevent — so a hook that
+branches at all should treat `0` and `7` alike.
+
+### Recording an action
+
+`yaam-emit` builds one `ActionRecord` and writes it to a caller socket. It exists because the socket
+takes a complete record — seventeen fields — and hand-building that in every caller is why nothing
+emitted records for so long.
+
+| It fills in | It asks for | It will not offer |
+|---|---|---|
+| `record_id`, `at`, `received_at`, `schema_ver`, `backfilled`, the empty collections | `--agent`, `--action`, `--outcome`, `--summary`, and repeatable `--attr`, `--attr-int`, `--attr-bool`, `--entity`, `--tag` | a subject, a data class, or a store |
+
+Three attribute flags rather than one that guesses: the type each key is declared with lives in the
+deployment's `spec/attrs-schema.yaml`, which a caller cannot read, and a build number that happens to
+be all digits is not evidence that it is an integer.
+
+`--redaction-policy` defaults to `default-v1` and must name the policy the deployment *applies* — the
+`policy:` field of its `spec/redaction/*.yaml`. The service refuses any other, because a record
+declaring a policy that was never run gives a false account of its own redaction; the emitter turns
+that refusal into the flag to change rather than a status code.
+
+Subjects stay empty and the data class stays `internal`. What a subject *is* — how a person becomes a
+pseudonym, and under whose canonicalisation — is still an open decision, so there is deliberately no
+flag: one would let a caller declare a record erasable that the deployment cannot erase.
 
 ### The keyring file
 

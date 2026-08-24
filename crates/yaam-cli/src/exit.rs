@@ -26,11 +26,24 @@ pub enum Exit {
     /// An erasure is real but not yet assertable: a key copy remains, or the backup window has not
     /// passed. Not a failure — a "not yet".
     Incomplete,
+    /// A record reached the sidecar but not the service, and the sidecar is still trying. Not a
+    /// failure — the record is durable, and nothing is owed by whoever sent it.
+    ///
+    /// Distinct from [`Self::Ok`] rather than folded into it, because the two say different things
+    /// about the same record: one is stored, the other is owed. A deployment whose service has been
+    /// down all afternoon is invisible to a caller that cannot tell them apart.
+    Spooled,
+    /// A record will never be accepted as written. Retrying changes nothing; the caller is the only
+    /// one who can fix it.
+    Rejected,
+    /// A socket did not answer: nothing is listening, or the path names no socket. Nothing was
+    /// recorded, so the record is still the caller's to send.
+    Unreachable,
 }
 
 impl Exit {
     /// Every outcome, so the drift test can iterate them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::Ok,
         Self::Failed,
         Self::Usage,
@@ -38,6 +51,9 @@ impl Exit {
         Self::Degraded,
         Self::Unconfirmed,
         Self::Incomplete,
+        Self::Spooled,
+        Self::Rejected,
+        Self::Unreachable,
     ];
 
     /// The number the process exits with.
@@ -51,7 +67,21 @@ impl Exit {
             Self::Degraded => 4,
             Self::Unconfirmed => 5,
             Self::Incomplete => 6,
+            Self::Spooled => 7,
+            Self::Rejected => 8,
+            Self::Unreachable => 9,
         }
+    }
+
+    /// Whether this outcome means the record or the operation is safe: nothing was lost, and the
+    /// caller has nothing left to do.
+    ///
+    /// Two codes answer yes, which is the whole reason this predicate exists rather than a `== 0`
+    /// at every call site. A shell hook that treated [`Self::Spooled`] as a failure would report an
+    /// unreachable service as a lost record, which is the one thing the spool exists to prevent.
+    #[must_use]
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Ok | Self::Spooled)
     }
 }
 
@@ -64,7 +94,10 @@ Exit codes:
   3  config error — a setting is missing, unreadable, or incomplete
   4  degraded — the store answered, and something in it wants attention
   5  unconfirmed — a destructive command was not confirmed; nothing was done
-  6  incomplete — the erasure is real but cannot be asserted complete yet";
+  6  incomplete — the erasure is real but cannot be asserted complete yet
+  7  spooled — the sidecar holds the record and is still delivering it; a success
+  8  rejected — the record will never be accepted as written; only its sender can fix it
+  9  unreachable — a socket did not answer; nothing was recorded";
 
 #[cfg(test)]
 mod tests {
@@ -92,5 +125,17 @@ mod tests {
     #[test]
     fn success_is_zero() {
         assert_eq!(Exit::Ok.code(), 0);
+    }
+
+    /// A spooled record is safe and a lost one is not, and the predicate is what says which.
+    #[test]
+    fn only_a_stored_or_spooled_record_counts_as_success() {
+        for outcome in Exit::ALL {
+            assert_eq!(
+                outcome.is_success(),
+                matches!(outcome, Exit::Ok | Exit::Spooled),
+                "{outcome:?} is on the wrong side of success"
+            );
+        }
     }
 }
