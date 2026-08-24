@@ -39,6 +39,7 @@ crates/
   yaam-server     HTTP service
   yaam-agent      local sidecar: two sockets per caller, seals and signs on their behalf
   yaam-cli        the five entry points: `yaam-server`, `yaam-agent`, `yaam`, `yaam-emit`, `yaam-read`
+hooks/            the pre-commit guard for a repository holding a backup, and its installer
 xtask/            repository chores: generates spec/schemas, checks the shapes behind it
 spec/             the contract bundle other implementations vendor
   memory.v1.yaml    the wire contract as OpenAPI 3.1, checked against the router and the types
@@ -129,6 +130,42 @@ rebuild queued, all as part of the same command.
 The key store has its own recovery path and is not part of this one. Restoring a tree without it
 gives a store that answers structure and no bodies, which is the honest outcome: bodies are
 readable only where their keys still are.
+
+### Keeping a backup under version control
+
+Records are Markdown, so a backup in a private repository is reviewable and diffable — and it is safe
+for exactly the reason above: no keys travel, so destroying a key still makes a sealed body
+permanently unreadable however long the ciphertext stays in the history. That rests on the key store
+never being committed once, and an ignore rule is not a mechanism against a one-way door. `git add -f`
+overrides one, a rule written today does not remove what was committed yesterday, and a store whose
+`--key-store` points inside the work tree is ignored by nothing.
+
+`yaam guard-commit` is the mechanism. It decides whether a set of paths is safe to commit, reading
+the same `yaam_core::backup::MANIFEST` a backup is taken against — so a newly excluded entry protects
+a repository the moment it is declared, with no second list to keep in step. It opens no store.
+
+```sh
+hooks/install.sh --store store          # writes .git/hooks/pre-commit, records yaam.root
+yaam --root store guard-commit --repo .              # what the hook runs
+yaam --root store guard-commit --path store/keystore/x   # one path, by hand
+yaam guard-commit --print-hook           # the hook the installer writes
+```
+
+Keep the store in a subdirectory. Everything beside it is then outside the memory root and none of
+the guard's business; a store at the top level of a repository leaves no such place, and the guard
+refuses every file there that no manifest entry classifies.
+
+Every unknown refuses, and each kind has its own code: `8` a path no copy may contain, `4` one beside
+the store in no manifest, `3` not knowing where the store is, `1` not being able to resolve a path at
+all. A path is read twice — its spelling, which catches `records/../keystore/x`, and its identity from
+`canonicalize`, which catches a symlink into a key store and a key store relocated under `records/`.
+A hardlink is caught by inode, and an excluded entry that merely *exists* in the work tree is refused
+on every commit whether anything from it is staged or not.
+
+Two limits, stated rather than assumed. `git commit --no-verify` skips every pre-commit hook, and a
+*copy* of a key file is a different file with the same bytes; neither is visible from a hook. What
+catches those is the same command run again on the far side — a `pre-receive` hook on the remote, or a
+required job over the pushed tree.
 
 Both long-running binaries shut down on `SIGINT` or `SIGTERM`: they stop accepting, finish what is
 in flight, and the sidecar removes its sockets and drains what the service will still take.

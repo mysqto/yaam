@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `yaam-server` | The HTTP service, plus the maintenance its store needs. |
 //! | `yaam-agent` | The local sidecar: two sockets per caller, sealing and signing on their behalf. |
-//! | `yaam` | The operator command line: rebuild, drain, erase, verify, back up, restore, read health. |
+//! | `yaam` | The operator command line: rebuild, drain, erase, verify, back up, restore, read health, guard a commit. |
 //! | `yaam-emit` | One record, built from arguments and written to a caller socket. |
 //! | `yaam-read` | One read, sent to a caller read socket; the service's answer, unchanged. |
 //!
@@ -36,7 +36,7 @@
 //!
 //! Not here. Every judgement these binaries appear to make is a library call:
 //! [`yaam_core::reindex::reindex_all`], [`yaam_core::drain`], [`yaam_core::erase`],
-//! [`yaam_core::backup`],
+//! [`yaam_core::backup`], [`yaam_core::backup::excluded_paths`] behind [`guard`],
 //! [`yaam_core::health::check`], [`yaam_agent::listener::serve_until`],
 //! [`yaam_server::routes::router`]. What is here is argument parsing, refusals that belong before
 //! anything starts, signal handling, rendering and exit codes.
@@ -49,6 +49,7 @@ pub mod config;
 pub mod emit;
 pub mod error;
 pub mod exit;
+pub mod guard;
 pub mod keyring;
 pub mod ops;
 pub mod read;
@@ -202,6 +203,23 @@ fn run_operator(cli: &OperatorCli, env: &Env, out: &mut dyn Write) -> Result<Exi
         let settings = StoreSettings::resolve_destination(&cli.store, env)?;
         return ops::restore(&settings.paths, from, out);
     }
+    // The guard returns before one is opened for a different reason: it runs on every commit, from a
+    // hook, and has no business touching an index. It reads the same lenient settings a restore
+    // does, because a repository holding a backup and no `spec/` yet is exactly when the first
+    // commit is made — and the first commit is the dangerous one.
+    if let Command::GuardCommit {
+        repo,
+        paths,
+        print_hook,
+    } = &cli.command
+    {
+        let subject = guard::Subject::from_flags(repo.as_deref(), paths, *print_hook)?;
+        if subject == guard::Subject::Hook {
+            return guard::print_hook(out);
+        }
+        let settings = StoreSettings::resolve_destination(&cli.store, env)?;
+        return guard::guard_commit(&settings.paths, &subject, out);
+    }
 
     let settings = StoreSettings::resolve(&cli.store, env)?;
     let mut pipeline = settings.open()?;
@@ -217,7 +235,9 @@ fn run_operator(cli: &OperatorCli, env: &Env, out: &mut dyn Write) -> Result<Exi
         Command::VerifyErasure { tombstone } => ops::verify_erasure(&mut pipeline, tombstone, out),
         Command::Check => ops::check(&pipeline, out),
         Command::Backup { to } => ops::backup(&pipeline, to, out),
-        Command::Restore { .. } => unreachable!("a restore returns before the store is opened"),
+        Command::Restore { .. } | Command::GuardCommit { .. } => {
+            unreachable!("both return before the store is opened")
+        }
     }
 }
 

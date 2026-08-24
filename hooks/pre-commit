@@ -1,0 +1,65 @@
+#!/usr/bin/env sh
+# Refuses a commit that would put a memory store's key material under version control.
+#
+# Generated: `yaam guard-commit --print-hook` writes this text, and `hooks/install.sh` installs it.
+# The copy in the binary is the original, so the script and the command it calls cannot drift, and so
+# the installer can tell an unmodified hook from an edited one by comparing bytes. Edit the source,
+# not this file.
+#
+# Nothing is decided here. This resolves where the store is, runs the guard, and turns its exit code
+# into a sentence. Which paths are safe comes from the backup manifest — the same list a backup is
+# taken against — because a second list in a shell script is how one of them stops being protected.
+#
+# No `set -e`: this reads `$?` after the guard, and `set -e` would abort before it could say why.
+set -u
+
+yaam="${YAAM:-yaam}"
+
+# A missing guard blocks the commit. Nothing checked it, and "nothing checked it" is not a pass.
+if ! command -v "$yaam" >/dev/null 2>&1 && ! [ -x "$yaam" ]; then
+  echo "pre-commit: $yaam is not runnable, so nothing checked this commit. Refusing it." >&2
+  echo "pre-commit: set YAAM=/path/to/yaam, or remove this hook to commit unchecked." >&2
+  exit 1
+fi
+
+top=$(git rev-parse --show-toplevel) || exit 1
+
+# Where the store is, in the order an operator can override it. `git config` first, because a hook
+# run from an editor or a desktop client inherits almost no environment.
+#
+# Deliberately not defaulted. A guessed root would classify against the wrong tree, and the guard
+# refuses an unset one with a code that says so — which is the honest answer to "where is the store".
+root=$(git config --get yaam.root 2>/dev/null || :)
+: "${root:=${YAAM_ROOT:-}}"
+
+set --
+if [ -n "$root" ]; then
+  case "$root" in /*) ;; *) root="$top/$root" ;; esac
+  set -- --root "$root"
+fi
+
+# Passed only when this deployment has relocated it. The guard reasons about the paths it is told
+# about, so a key store somewhere it does not name is outside what it can see.
+keystore=$(git config --get yaam.keystore 2>/dev/null || :)
+if [ -n "$keystore" ]; then
+  case "$keystore" in /*) ;; *) keystore="$top/$keystore" ;; esac
+  set -- "$@" --key-store "$keystore"
+fi
+
+"$yaam" "$@" guard-commit --repo "$top"
+status=$?
+
+# The codes are the interface: `yaam --help` publishes them, and each one has a different remedy.
+case "$status" in
+  0) ;;
+  8) echo "pre-commit: refused — this commit would carry something no copy of a store may hold." >&2
+     echo "pre-commit: destroying a key cannot make a body unreadable once a copy of the key is in" >&2
+     echo "            the history. That is the guarantee this is protecting." >&2 ;;
+  4) echo "pre-commit: refused — something in this commit sits beside the store in no manifest." >&2
+     echo "pre-commit: decide where it belongs; a check that guessed is how a keyring gets committed." >&2 ;;
+  3) echo "pre-commit: refused — the guard could not tell where the store is. Set it with:" >&2
+     echo "              git config yaam.root <path, relative to the repository>" >&2 ;;
+  2) echo "pre-commit: refused — the guard was called wrongly, so nothing was checked." >&2 ;;
+  *) echo "pre-commit: refused — the guard could not decide, so it did not allow." >&2 ;;
+esac
+exit "$status"

@@ -535,6 +535,34 @@ pub enum Command {
         #[arg(long = "to", value_name = "PATH")]
         to: PathBuf,
     },
+    /// Decide whether a set of paths is safe to commit, for a `pre-commit` hook to stop on.
+    ///
+    /// The layout this is for keeps a store's *backup* in a private repository, which is safe for
+    /// one reason: a backup carries ciphertext and no keys, so destroying a key still makes a
+    /// sealed body permanently unreadable however long the ciphertext stays in the history. That
+    /// rests on the key store never being committed once, and an ignore rule is not a mechanism
+    /// against a one-way door — `git add -f` overrides one, and a rule written today does not
+    /// remove what was committed yesterday.
+    ///
+    /// What is safe is decided by `yaam_core::backup::MANIFEST`, the same list a backup is taken
+    /// against, so a newly excluded entry protects a repository the moment it is declared. Opens no
+    /// store: a hook runs on every commit and has no business touching an index.
+    ///
+    /// Every unknown refuses. Read the exit codes: 8 is a path no copy may contain, 4 is one beside
+    /// the store that no manifest entry classifies, 3 is not knowing where the store is, and 1 is
+    /// not being able to resolve a path at all.
+    GuardCommit {
+        /// Check everything in this repository's index: what the commit would contain, not only
+        /// what changed. Catches a key file added before the hook existed, on every commit after.
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+        /// Check exactly this path. Repeat for several. For a check by hand.
+        #[arg(long = "path", value_name = "PATH")]
+        paths: Vec<PathBuf>,
+        /// Print the `pre-commit` hook and stop. What `hooks/install.sh` installs.
+        #[arg(long)]
+        print_hook: bool,
+    },
     /// Restore a backup into this store, rebuild the index, then run the fan-out that queued.
     ///
     /// The rebuild is part of the command rather than a step to remember: restored files can be
