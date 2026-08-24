@@ -26,6 +26,23 @@ actions:
       build: { type: string, class: structural }
       duration_ms: { type: integer, class: structural }
 
+  # `outcome` says whether the review ran; `verdict` says what it concluded. A review that read the
+  # whole diff and asked for changes is a `success` carrying a blocking verdict, so folding the two
+  # together would make "which reviews are holding a change up" unanswerable. `partial` is the third
+  # case — some of the diff was read and the rest was not, which is neither a pass nor a failure.
+  #
+  # `findings` is how many things the review raised, and it is here for `findings: 0`: a change that
+  # went in unchallenged is the one an operator comes looking for, and counting is the only way to
+  # ask without opening every body.
+  #
+  # What the review was *of* stays an entity reference. `pull_request` and `commit` are join keys
+  # other records share, and a copy of either here would be a second one nothing joins on.
+  review:
+    outcome: [success, failure, partial]
+    attrs:
+      verdict: { type: string, class: structural }
+      findings: { type: integer, class: structural }
+
   transact:
     outcome: [success, failure, partial, declined]
     attrs:
