@@ -211,6 +211,20 @@ Three attribute flags rather than one that guesses: the type each key is declare
 deployment's `spec/attrs-schema.yaml`, which a caller cannot read, and a build number that happens to
 be all digits is not evidence that it is an integer.
 
+Both timestamps default to now, which is what a hook firing beside the action means. `--at` names the
+instant the action happened at instead; `--backfilled` says the record was read out of a source
+rather than watched happening, and makes `--at` the received time too. The pair is how history is
+imported, and each flag needs the other for a reason: the store orders, windows and joins on the
+received time, so `--at` alone would file a note from three years ago as having arrived today, and
+`--backfilled` alone would claim a source supplied a received time nothing supplied. The emitter
+refuses both of those, and refuses an `--at` in the future outright — a record is something that
+happened.
+
+```bash
+yaam-emit --action deploy --outcome success --summary "…" \
+          --at 2023-05-01T12:00:00Z --backfilled   # stored in 2023, not today
+```
+
 `--redaction-policy` defaults to `default-v1` and must name the policy the deployment *applies* — the
 `policy:` field of its `spec/redaction/*.yaml`. The service refuses any other, because a record
 declaring a policy that was never run gives a false account of its own redaction; the emitter turns

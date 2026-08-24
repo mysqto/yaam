@@ -7,10 +7,20 @@
 //!
 //! # What is filled in, and what is asked for
 //!
-//! Minted here: the identifier, both timestamps, the schema version, `backfilled: false`, and every
-//! empty collection. Asked for: the agent, what was done, how it went, the prose, and whatever
-//! attributes, entity references and tags the caller has. Fixed: `subjects` is empty and
-//! `data_class` is [`DataClass::Internal`] — see [`crate::cli::EmitCli`] for why there is no flag.
+//! Minted here: the identifier, both timestamps, the schema version, and every empty collection.
+//! Asked for: the agent, what was done, how it went, the prose, and whatever attributes, entity
+//! references and tags the caller has. Fixed: `subjects` is empty and `data_class` is
+//! [`DataClass::Internal`] — see [`crate::cli::EmitCli`] for why there is no flag.
+//!
+//! # The timestamps, and why one flag is not enough
+//!
+//! Both default to now, which is what a hook firing beside the action means. `--at` moves the
+//! instant the action happened to; `--backfilled` says the record was read out of a source rather
+//! than observed, and makes `--at` the received time as well. The store orders, windows and joins on
+//! the received time and treats the source-reported one as display, so the second flag is what
+//! decides where a record lands: without it a note from three years ago sorts among today's, and the
+//! windowed queries the history was imported for would answer as if none of it existed. Neither
+//! shape is inferrable from the other — see [`stamps`] for the three refusals that follow.
 //!
 //! # Why the sidecar and not the service
 //!
@@ -53,6 +63,15 @@ pub const DEFAULT_REDACTION_POLICY: &str = "default-v1";
 /// Generous, because the sidecar sends its whole backlog ahead of a new record and the answer waits
 /// on that. Bounded all the same: a hook that blocks for ever holds up whatever invoked it.
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
+/// How far behind this clock a live record's own timestamp may sit, in milliseconds.
+///
+/// Not a tolerance for wrong timestamps — a bound on which reading of an old `--at` is plausible. A
+/// hook reporting an action it watched a moment ago is separated from this clock by scheduling and
+/// by whatever skew there is between two hosts, which is small and which the deployment already
+/// accounts for by recording the gap and alerting past this same figure. An `--at` further back than
+/// that is not skew; it is history, and history is `--backfilled`'s to declare.
+const LIVE_SKEW_MS: i64 = 5_000;
 
 /// Schema version records are written under.
 ///
@@ -255,16 +274,16 @@ fn silence(socket: &Path, error: &std::io::Error) -> Error {
 /// `now` is passed in rather than read here, so what this produces is a function of its arguments
 /// and can be asserted on.
 fn record(settings: &EmitSettings, args: &EmitArgs, now: i64) -> Result<ActionRecord> {
-    let stamp = timestamp::format_ms(now);
+    let (at_ms, received_ms) = stamps(args, now)?;
     Ok(ActionRecord {
         record_id: RecordId::generate(),
         schema_ver: SCHEMA_VER,
-        // The same instant twice, and that is honest: this process is both the source of the action
-        // and the clock that read it. `backfilled` says exactly that — a record whose `received_at`
-        // came from somewhere else is the one that would set it.
-        at: stamp.clone(),
-        received_at: stamp,
-        backfilled: false,
+        // Re-rendered from the milliseconds rather than passed through as the caller spelled it: an
+        // offset is legal input and would put a second spelling of one instant in the store, where
+        // the day a record is filed under is read back off this string.
+        at: timestamp::format_ms(at_ms),
+        received_at: timestamp::format_ms(received_ms),
+        backfilled: args.backfilled,
         agent: settings.agent.clone(),
         agent_ver: args.agent_ver.clone(),
         correlation_id: args.correlation_id.clone(),
@@ -288,6 +307,74 @@ fn record(settings: &EmitSettings, args: &EmitArgs, now: i64) -> Result<ActionRe
         tags: args.tags.clone(),
         summary: args.summary.clone(),
     })
+}
+
+/// The two timestamps, in milliseconds: when the action happened, and when this learnt of it.
+///
+/// One function because the pair is one decision. `at` is display-only downstream and the received
+/// time is what every ordering, window and join uses, so which of the two the flags move is the
+/// whole of what a record's position in history depends on — and getting it wrong is not visible
+/// afterwards, in a store nothing rewrites.
+///
+/// Three refusals, none of them a matter of taste:
+///
+/// - **`--backfilled` with no `--at`.** The flag's entire claim is that the received time came from
+///   upstream, and with nothing to take it from there is only this clock — so the record would
+///   assert, in a field, the one thing it did not do.
+/// - **`--at` after now.** This process is the one recording the action, so an instant it has not
+///   reached yet cannot be one the action happened at. There is no grace: a stamp from a clock
+///   running ahead is still a record that claims to have happened after it was received.
+/// - **`--at` further back than [`LIVE_SKEW_MS`], without `--backfilled`.** This one is the reason
+///   the flag exists rather than being inferred from the timestamp. Such a record is coherent — it
+///   happened then, this saw it now — so nothing downstream refuses it; it simply sorts and windows
+///   at now, which is precisely the corruption a backfill exists to avoid. Refusing it here makes
+///   the import say which of the two it meant, at the one moment anybody can still be asked.
+fn stamps(args: &EmitArgs, now: i64) -> Result<(i64, i64)> {
+    let Some(text) = args.at.as_deref() else {
+        if args.backfilled {
+            return Err(Error::Usage(
+                "--backfilled needs --at: it says the received time came from the source, and \
+                 without one there is nothing to take it from but this clock — which is what the \
+                 flag denies. Name the source's own instant with --at, or drop --backfilled"
+                    .to_owned(),
+            ));
+        }
+        // The same instant twice, and that is honest: this process is both what saw the action and
+        // the clock that read it.
+        return Ok((now, now));
+    };
+
+    let at = timestamp::parse_ms(text).ok_or_else(|| {
+        Error::Usage(format!(
+            "--at {text} is not a timestamp this can read. It has to be RFC3339 — \
+             `2026-08-20T09:14:02Z`, optionally with a `.sss` fraction and with an `+hh:mm` offset \
+             in place of the `Z`. Coercing it would file the record at an instant nobody chose"
+        ))
+    })?;
+    if at > now {
+        return Err(Error::Usage(format!(
+            "--at {text} is after this clock reads ({}). A record is something that happened, and \
+             this process is the one recording it, so an instant it has not reached yet is not one \
+             the action can have happened at",
+            timestamp::format_ms(now)
+        )));
+    }
+    if args.backfilled {
+        // §6's exception, and the whole point of the flag: the source's instant is both timestamps,
+        // so the record takes its place in history rather than at the moment of import.
+        return Ok((at, at));
+    }
+    if now - at > LIVE_SKEW_MS {
+        return Err(Error::Usage(format!(
+            "--at {text} is further behind this clock ({}) than skew between two hosts accounts \
+             for, so this record cannot have been watched happening. Pass --backfilled with it if \
+             it comes from a source: that is what makes the received time the source's instant too, \
+             and the received time is what every ordering, window and join reads. Without it this \
+             would be stored as history that arrived today",
+            timestamp::format_ms(now)
+        )));
+    }
+    Ok((at, now))
 }
 
 /// Collects every attribute flag into one map.
@@ -458,6 +545,95 @@ mod tests {
         // The decision that stays open, and the one the record cannot be talked into.
         assert!(built.subjects.is_empty());
         assert_eq!(built.data_class, yaam_contract::DataClass::Internal);
+    }
+
+    /// The instant `--at` names becomes both timestamps, which is what puts an imported record in
+    /// its own place in history rather than at the moment of import.
+    #[test]
+    fn a_backfilled_record_takes_the_sources_instant_for_both_timestamps() {
+        let cli = parsed(&["--at", "2023-05-01T12:00:00Z", "--backfilled"]);
+        let built = record(
+            &settings(PathBuf::from("/nowhere")),
+            &cli.args,
+            1_787_217_242_117,
+        )
+        .expect("built");
+
+        built.validate().expect("a record the contract accepts");
+        assert!(built.backfilled);
+        assert_eq!(built.at, "2023-05-01T12:00:00.000Z");
+        // The rule this exists for: `received_ms := at_ms`. Ordering, windowing and joins all read
+        // the received time, so had this stayed at now the record would answer today's windows and
+        // none of 2023's.
+        assert_eq!(built.received_at, built.at);
+    }
+
+    /// An offset is legal input and is stored as the one spelling of the instant it names.
+    #[test]
+    fn an_offset_is_normalised_rather_than_stored_as_written() {
+        let cli = parsed(&["--at", "2023-05-01T21:00:00+09:00", "--backfilled"]);
+        let built =
+            record(&settings(PathBuf::from("/nowhere")), &cli.args, i64::MAX).expect("built");
+        assert_eq!(built.at, "2023-05-01T12:00:00.000Z");
+    }
+
+    /// `--at` alone is for the gap between watching an action and reporting it, and no further.
+    #[test]
+    fn a_live_record_may_name_its_own_instant_within_the_skew_a_hook_has() {
+        let now = 1_787_217_242_117;
+        let cli = parsed(&["--at", "2026-08-20T09:14:00Z"]);
+        let built = record(&settings(PathBuf::from("/nowhere")), &cli.args, now).expect("built");
+
+        assert!(!built.backfilled);
+        assert_eq!(built.at, "2026-08-20T09:14:00.000Z");
+        // Not equal, and that is the honest pair: the action is the source's instant, the receipt is
+        // this clock's. It is also the gap §6's skew metric is measuring.
+        assert_eq!(built.received_at, "2026-08-20T09:14:02.117Z");
+    }
+
+    /// Each refusal the two flags carry, and the reason has to name what to do about it.
+    #[test]
+    fn the_timestamp_a_record_cannot_honestly_claim_is_refused_before_anything_is_sent() {
+        let now = 1_787_217_242_117;
+        let cases: [(&[&str], &str); 5] = [
+            // Malformed, and the message names the format rather than repairing the value.
+            (&["--at", "last tuesday"], "RFC3339"),
+            (&["--at", "2026-02-30T00:00:00Z"], "RFC3339"),
+            // The future: records are history, whether or not the record calls itself a backfill.
+            (&["--at", "2027-01-01T00:00:00Z"], "has not reached"),
+            (
+                &["--at", "2027-01-01T00:00:00Z", "--backfilled"],
+                "has not reached",
+            ),
+            // The combination refused on purpose: a claim that the received time came from upstream,
+            // with no upstream instant to have taken it from.
+            (&["--backfilled"], "--backfilled needs --at"),
+        ];
+        for (extra, expected) in cases {
+            let cli = parsed(extra);
+            let error = record(&settings(PathBuf::from("/nowhere")), &cli.args, now)
+                .expect_err("refused before a socket is opened");
+            assert!(
+                matches!(&error, Error::Usage(why) if why.contains(expected)),
+                "{extra:?} produced {error}"
+            );
+        }
+    }
+
+    /// The refusal the flag exists for: an old `--at` on its own is a record that would be filed as
+    /// having arrived today, and nothing downstream could tell.
+    #[test]
+    fn history_without_the_flag_that_declares_it_is_refused_naming_the_flag() {
+        let cli = parsed(&["--at", "2023-05-01T12:00:00Z"]);
+        let error = record(
+            &settings(PathBuf::from("/nowhere")),
+            &cli.args,
+            1_787_217_242_117,
+        )
+        .expect_err("three years is not skew");
+        let told = error.to_string();
+        assert!(told.contains("--backfilled"), "{told}");
+        assert!(told.contains("arrived today"), "{told}");
     }
 
     /// Two records from one set of arguments are two records, because the identifier is the
