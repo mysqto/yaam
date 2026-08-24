@@ -15,7 +15,7 @@ use std::path::Path;
 
 mod support;
 
-use support::{Deployment, Service, sidecar, terminate, yaam, yaam_emit};
+use support::{Deployment, Service, read_socket, sidecar, terminate, yaam, yaam_emit, yaam_read};
 
 /// The arguments a shell hook passes, over a socket named by the environment.
 fn hook_env(socket: &Path) -> Vec<(String, String)> {
@@ -192,6 +192,194 @@ fn each_of_the_two_emitted_shapes_is_a_record_the_service_takes() {
 
     terminate(&mut agent, "yaam-agent");
     service.stop();
+}
+
+/// A note from three years ago, imported, and it is stored as having happened three years ago.
+///
+/// Built on the shapes case above because what is under test is the same round trip with two extra
+/// flags, and the interesting assertion is only reachable through the whole of it: the tree files a
+/// record under the day its *received* time names, so the directory the file lands in is the store's
+/// own answer to where in history this record sits. A backfill that took this clock for its received
+/// time would land under today — accepted, indexed, and wrong in the one place nothing rewrites.
+///
+/// A record with neither flag goes through the same deployment, because the emitter is in a
+/// deployment's write path and a regression in the ordinary case is silent.
+#[test]
+fn a_backfilled_record_is_stored_and_read_back_at_the_instant_it_happened() {
+    const HAPPENED: &str = "2023-05-01T12:00:00Z";
+    /// The same instant as the store spells it: one spelling, always UTC, always to a millisecond.
+    const STORED: &str = "2023-05-01T12:00:00.000Z";
+
+    let deployment = Deployment::new();
+    let root = deployment.root_str();
+    let mut service = Service::start(&deployment);
+    let (socket, mut agent) = sidecar(
+        &deployment,
+        "agent",
+        &format!("http://{}", service.address),
+        &service.sealing_public_key,
+    );
+    let env = hook_env(&socket);
+
+    let shape = [
+        "--action",
+        "deploy",
+        "--outcome",
+        "success",
+        "--attr",
+        "service=api",
+        "--attr",
+        "environment=production",
+        "--attr",
+        "build=b0001",
+    ];
+
+    let mut imported = shape.to_vec();
+    imported.extend([
+        "--summary",
+        "the api rollout an existing note recorded, lifted into this store",
+        "--at",
+        HAPPENED,
+        "--backfilled",
+    ]);
+    let imported = yaam_emit(&imported, &as_pairs(&env));
+    assert_accepted("a backfill", &imported);
+    let historical = accepted_id(&imported);
+
+    // Neither flag, and nothing about it has changed: still now, still not a backfill.
+    let mut live = shape.to_vec();
+    live.extend(["--summary", "the api rollout that happened just now"]);
+    let live = yaam_emit(&live, &as_pairs(&env));
+    assert_accepted("the default path", &live);
+    let today = accepted_id(&live);
+
+    // Filed under the day it happened on, which is the whole point: this is the store's own record of
+    // where in history it sits, and it is derived from the received time rather than from `at`.
+    let files = support::record_files(deployment.root());
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert!(
+        files
+            .iter()
+            .any(|path| path.ends_with(Path::new(&format!("records/2023/05/01/{historical}.md")))),
+        "{files:?}"
+    );
+
+    // Read back over the caller's read socket, which is the shape any consumer sees.
+    let reads = read_socket(&socket);
+    let page = answered(&reads, &["records", "--limit", "10"]);
+    let of = |id: &str| -> serde_json::Value {
+        page["records"]
+            .as_array()
+            .expect("records")
+            .iter()
+            .find(|record| record["record_id"] == id)
+            .unwrap_or_else(|| panic!("{id} is missing from {page}"))
+            .clone()
+    };
+
+    let backfilled = of(&historical);
+    assert_eq!(backfilled["backfilled"], true, "{backfilled}");
+    assert_eq!(backfilled["at"], STORED, "{backfilled}");
+    // The rule the flag carries: the received time is the source's instant too, so every ordering,
+    // window and join places this in 2023 rather than among today's records.
+    assert_eq!(backfilled["received_at"], STORED, "{backfilled}");
+
+    let ordinary = of(&today);
+    assert_eq!(ordinary["backfilled"], false, "{ordinary}");
+    assert_eq!(ordinary["at"], ordinary["received_at"], "{ordinary}");
+    assert_ne!(ordinary["at"], STORED, "{ordinary}");
+
+    // And it answers 2023's window, which is the query the import exists to make answerable — and
+    // the one that would have come back empty had the received time been this clock's. The window is
+    // exclusive at the top, so the record's own millisecond is inside it.
+    let window = answered(
+        &reads,
+        &[
+            "records",
+            "--from-ms",
+            "1682899200000", // 2023-05-01T00:00:00Z
+            "--to-ms",
+            "1682985600000", // 2023-05-02T00:00:00Z
+        ],
+    );
+    let matched = window["records"].as_array().expect("records");
+    assert_eq!(matched.len(), 1, "{window}");
+    assert_eq!(matched[0]["record_id"], historical, "{window}");
+
+    let health = String::from_utf8_lossy(&yaam(&["--root", root, "check"]).stdout).into_owned();
+    assert!(health.contains("records indexed    2"), "{health}");
+    assert!(health.contains("index drift        0"), "{health}");
+
+    terminate(&mut agent, "yaam-agent");
+    service.stop();
+}
+
+/// A timestamp the record cannot honestly carry is refused by the command line itself.
+///
+/// No deployment, and `--dry-run` so no socket either: each of these is a refusal the emitter owes
+/// the caller *before* anything is sent, because a record that reached an append-only store carrying
+/// a timestamp nobody chose is not something a later fix can reach.
+#[test]
+fn a_timestamp_the_record_cannot_honestly_carry_never_leaves_the_command_line() {
+    let base = [
+        "--agent",
+        "agent_a",
+        "--action",
+        "deploy",
+        "--outcome",
+        "success",
+        "--summary",
+        "rolled the api service out to staging",
+        "--dry-run",
+    ];
+    // Malformed, in the future, history not declaring itself, and a declaration with nothing to
+    // declare — the four the two flags have to refuse, and what each message has to name.
+    let cases: [(&[&str], &str); 4] = [
+        (&["--at", "1 May 2023"], "RFC3339"),
+        (&["--at", "2999-01-01T00:00:00Z"], "has not reached"),
+        (&["--at", "2023-05-01T12:00:00Z"], "--backfilled"),
+        (&["--backfilled"], "--backfilled needs --at"),
+    ];
+    for (extra, expected) in cases {
+        let mut args = base.to_vec();
+        args.extend_from_slice(extra);
+        let refused = yaam_emit(&args, &[]);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{extra:?} was not a usage error"
+        );
+        let told = String::from_utf8_lossy(&refused.stderr);
+        assert!(told.contains(expected), "{extra:?} said: {told}");
+        assert!(
+            refused.stdout.is_empty(),
+            "{extra:?} printed a record anyway"
+        );
+    }
+}
+
+/// One page from a caller's read socket, as the JSON a consumer would parse.
+fn answered(reads: &Path, args: &[&str]) -> serde_json::Value {
+    let env = [("YAAM_READ_SOCKET", reads.to_str().expect("utf-8"))];
+    let read = yaam_read(args, &env);
+    assert_eq!(
+        read.status.code(),
+        Some(0),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    serde_json::from_slice(&read.stdout).expect("the service's own JSON")
+}
+
+/// The identifier the emitter reported, from the first line of its own output.
+fn accepted_id(emitted: &std::process::Output) -> String {
+    let printed = String::from_utf8_lossy(&emitted.stdout).into_owned();
+    printed
+        .lines()
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .expect("the record identifier")
+        .to_owned()
 }
 
 /// Asserts one emitted record was taken, and says which shape it was when it was not.

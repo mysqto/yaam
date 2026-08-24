@@ -106,8 +106,12 @@ pub struct AgentArgs {
 
 /// Record one thing an agent did, on a caller socket.
 ///
-/// Everything mechanical is filled in here: the identifier, both timestamps, the schema version,
-/// `backfilled: false` and the empty collections. What is left to say is what only the caller knows.
+/// Everything mechanical is filled in here: the identifier, both timestamps, the schema version and
+/// the empty collections. What is left to say is what only the caller knows.
+///
+/// The timestamps default to now and are `--at`'s to move, which is what makes history importable:
+/// `--at` with `--backfilled` records something that already happened, at the instant it happened,
+/// rather than at the instant a converter got round to reading it.
 ///
 /// This binary opens no store, and has no flag that could point it at one. It writes one JSON line
 /// to a sidecar socket and reads one back; the sidecar is what seals, signs and spools. A caller
@@ -189,6 +193,22 @@ pub struct EmitArgs {
     /// Ties every stage of one interaction together.
     #[arg(long, value_name = "ID")]
     pub correlation_id: Option<String>,
+    /// When the action happened, as an `RFC3339` timestamp. Defaults to now.
+    ///
+    /// A hook firing beside the action means now, which is why this is optional. Naming an instant
+    /// this clock passed long ago needs `--backfilled` with it, and an instant it has not reached is
+    /// refused outright: a record is something that happened.
+    #[arg(long, value_name = "TIMESTAMP")]
+    pub at: Option<String>,
+    /// This record comes from a source rather than from watching the action happen.
+    ///
+    /// Requires `--at`, and makes it both timestamps: the source's own instant becomes the received
+    /// time too, because there is no moment at which this deployment observed the action, and
+    /// stamping one would be inventing it. That is also what puts the record where it belongs — the
+    /// store orders, windows and joins on the received time, so a backfill without this lands
+    /// today, however old the action it describes.
+    #[arg(long)]
+    pub backfilled: bool,
     /// The redaction policy this record was written under.
     ///
     /// It must name the policy the deployment *applies*, not one the caller would like: the service
