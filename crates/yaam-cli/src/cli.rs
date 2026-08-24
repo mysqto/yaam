@@ -4,12 +4,12 @@
 //! operator command line, so `--root` is one declaration with one default and one help string — not
 //! two that drift until a rebuild addresses a different store than the service reads.
 //!
-//! Neither the sidecar nor the emitter has [`StoreArgs`], and that is a decision rather than an
-//! omission: neither ever opens the tree, the index or the key store. Handing them those flags would
-//! invite a deployment to point them somewhere, and the answer to where they point is "nowhere".
-//! This is also why [`EmitCli`] is its own binary rather than a `yaam emit` subcommand — the operator
-//! command line flattens [`StoreArgs`] above its subcommands, so a subcommand would inherit `--root`
-//! whatever it did with it.
+//! Neither the sidecar nor the emitter nor the reader has [`StoreArgs`], and that is a decision
+//! rather than an omission: none of them ever opens the tree, the index or the key store. Handing
+//! them those flags would invite a deployment to point them somewhere, and the answer to where they
+//! point is "nowhere". This is also why [`EmitCli`] and [`ReadCli`] are their own binaries rather
+//! than `yaam emit` and `yaam read` subcommands — the operator command line flattens [`StoreArgs`]
+//! above its subcommands, so a subcommand would inherit `--root` whatever it did with it.
 
 use std::path::PathBuf;
 
@@ -238,6 +238,21 @@ impl OutcomeArg {
             Self::Declined => yaam_contract::Outcome::Declined,
         }
     }
+
+    /// How a stored record spells this outcome, which is what a query is matched against.
+    ///
+    /// Its own function because the consequence of getting it wrong is invisible: the service
+    /// compares this against an indexed column, so a misspelling matches nothing and answers `200`
+    /// with an empty page. A test pins every variant to what `serde` actually writes.
+    #[must_use]
+    pub fn as_stored(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Partial => "partial",
+            Self::Declined => "declined",
+        }
+    }
 }
 
 /// Who may read a record, as a flag. Paired with [`yaam_contract::Visibility`] as [`OutcomeArg`] is.
@@ -265,6 +280,174 @@ impl VisibilityArg {
             Self::Operator => yaam_contract::Visibility::Operator,
         }
     }
+}
+
+/// Ask a deployment what it remembers, over a caller's read socket.
+///
+/// The read half of [`EmitCli`], and it holds no key either. The sidecar's read socket signs on the
+/// caller's behalf: this binary sends an ordinary HTTP request over a unix socket and prints what
+/// comes back, so a reader needs no signing key, no keyring and no path into anyone's tree. Teaching
+/// it to sign would hand a caller exactly what the sidecar exists to keep away from it.
+///
+/// Like the emitter, it opens no store and has no flag that could point it at one. There is also no
+/// `--agent`: the socket signs as the caller it belongs to, so who is asking is a property of the
+/// socket rather than something the request gets to claim.
+///
+/// The service's own JSON goes to stdout unchanged. Nothing is reformatted, summarised or unwrapped
+/// — the caller is a program, and an answer this rewrote would have to be parsed twice.
+#[derive(Debug, Parser)]
+#[command(
+    name = "yaam-read",
+    version,
+    after_help = exit::HELP,
+    subcommand_required = true,
+    arg_required_else_help = true
+)]
+pub struct ReadCli {
+    /// How the request travels.
+    #[command(flatten)]
+    pub args: ReadArgs,
+    /// Which read.
+    #[command(subcommand)]
+    pub query: ReadQuery,
+}
+
+/// How a read reaches the sidecar. Shared by every read, whichever one it is.
+///
+/// Global, so `yaam-read --socket … records` and `yaam-read records --socket …` are the same command.
+/// Where a flag that belongs to no particular subcommand has to sit is not a thing a caller should
+/// have to remember.
+#[derive(Debug, Args)]
+pub struct ReadArgs {
+    /// The caller's read socket. Also read from `YAAM_READ_SOCKET`.
+    ///
+    /// A sidecar's read socket, at `<state-dir>/sockets/<agent>.read.sock` by default — the same
+    /// path as that agent's record socket with `.read.sock` for its extension. Not the record socket
+    /// itself, which speaks newline-delimited JSON and would refuse an HTTP request as a malformed
+    /// record.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub socket: Option<PathBuf>,
+    /// Print the request that would be sent and stop. Needs no socket and no sidecar.
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+    /// How long to wait for the answer, in milliseconds.
+    ///
+    /// A bound on a wedged socket rather than a judgement about how long a query should take: the
+    /// sidecar is waiting on the service, which is waiting on an index. A read is side-effect free,
+    /// so a wait that runs out costs nothing but the wait — asking again is always safe.
+    #[arg(long, value_name = "MS", global = true, default_value_t = crate::read::DEFAULT_TIMEOUT_MS)]
+    pub timeout_ms: u64,
+}
+
+/// The reads this service answers.
+///
+/// Subcommands rather than one flat set of flags, because the four are four questions and not four
+/// filters on one. `--query` is required for a search and meaningless to a bundle; `--entity` names
+/// exactly one entity for a history and any number for a bundle; a window narrows a records query
+/// and is not a parameter of the others. Flattened together, every one of those would be accepted
+/// here and refused a round trip later — the service answers an unknown parameter with `400` rather
+/// than ignoring it — and `--help` would describe a request surface that does not exist.
+///
+/// Every filter is optional wherever the service says it is optional, and absent means absent: this
+/// sends no parameter the caller did not name, because each of them has a documented default at the
+/// service and a copy of that figure here would be a second place for it to be out of date.
+#[derive(Debug, Subcommand)]
+pub enum ReadQuery {
+    /// Query records by action, outcome, agent, attribute or time window. Newest first.
+    ///
+    /// Bounded whether or not `--limit` says so, so a short answer is not proof that nothing else
+    /// matched. There is no cursor: page by narrowing the request.
+    Records {
+        /// Exact match on one action.
+        #[arg(long, value_name = "ACTION")]
+        action: Option<String>,
+        /// Restrict to one outcome.
+        #[arg(long, value_name = "OUTCOME")]
+        outcome: Option<OutcomeArg>,
+        /// Restrict to the records one agent wrote.
+        ///
+        /// The record's author, which is not the caller. What this caller may see is decided by the
+        /// socket that signs the read, and no flag here widens it.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+        /// Require a structural attribute, as `key=value`.
+        ///
+        /// Compared as text, so an integer matches its decimal form. Sensitive attributes live in
+        /// the sealed body and are not queryable at all.
+        #[arg(long, value_name = "KEY=VALUE")]
+        attr: Option<String>,
+        /// Inclusive start of the window, in milliseconds of the server-stamped time.
+        #[arg(long, value_name = "MS")]
+        from_ms: Option<i64>,
+        /// Exclusive end of the window, on the same clock.
+        #[arg(long, value_name = "MS")]
+        to_ms: Option<i64>,
+        /// Page size. Absent leaves the service's own cap in force.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+    /// One page of what touches one entity, newest first.
+    ///
+    /// The identifier is canonicalised by the deployment before it is matched, so the spelling that
+    /// was good enough to store is good enough to find. A kind this deployment does not configure is
+    /// refused rather than answered with an empty page — no rows would be indistinguishable from an
+    /// entity with no history.
+    History {
+        /// The entity, as `kind:id`. Percent-encoding is this command's business, not the caller's.
+        #[arg(long, value_name = "KIND:ID")]
+        entity: String,
+        /// Tolerance for inferred references. `1.0` keeps only references read from a structured
+        /// field. Absent means the service's floor, which is everything.
+        #[arg(long, value_name = "FLOOR")]
+        min_confidence: Option<f32>,
+        /// Page size. Absent leaves the service's own cap in force.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+    /// Which records mention something. Full text over record bodies, best match first.
+    ///
+    /// The needle reaches the prose and the answer does not carry it: a hit comes back as the
+    /// record's structure. Sealed bodies hold no text to search, so they never match.
+    ///
+    /// A short page is not proof that nothing else matched — the matches examined are capped before
+    /// the caller's scope is applied. Narrow the needle rather than raising `--limit`.
+    Search {
+        /// The needle, as the service's `q`: a word, several words, a prefix as `roll*`, or a phrase
+        /// in double quotes. Required — a search for nothing is not a search for everything.
+        #[arg(long, value_name = "TEXT")]
+        query: String,
+        /// Page size. Absent leaves the service's own cap in force.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+    /// Compose context for a request: history for some entities and an actor, in one capped set.
+    ///
+    /// Check `degraded` in the answer before acting on it. A bundle whose sources ran out of time is
+    /// safe to answer a question from and unsafe to act on, and only the caller can make that call.
+    Bundle {
+        /// An entity to gather history for, as `kind:id`. Repeat for several.
+        ///
+        /// Only references read out of a structured field reach a bundle, whatever confidence floor
+        /// an entity's own history would accept: a guess in a bundle is one the caller cannot tell
+        /// apart from a fact.
+        #[arg(long = "entity", value_name = "KIND:ID")]
+        entities: Vec<String>,
+        /// An agent whose recent activity is relevant, in addition to the named entities.
+        #[arg(long, value_name = "NAME")]
+        actor: Option<String>,
+        /// Budget for the whole composition, in milliseconds. Absent means the service's own.
+        ///
+        /// A source not consulted in time names itself in `omitted` and sets `degraded`; it is never
+        /// silently skipped, because "no history" and "never asked" call for opposite decisions.
+        #[arg(long, value_name = "MS")]
+        deadline_ms: Option<u64>,
+        /// Most records the bundle may return. Absent means the service's own cap.
+        ///
+        /// Worth setting: this reaches the source reads, so a caller that wants five records is
+        /// charged for five rather than for the cap.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
 }
 
 /// Operate a memory store: rebuild the index, run its queued work, erase a subject, copy it, read
@@ -371,7 +554,7 @@ pub enum Command {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{AgentCli, Command, EmitCli, OperatorCli, ServerCli};
+    use super::{AgentCli, Command, EmitCli, OperatorCli, ReadCli, ServerCli};
     use crate::exit::Exit;
 
     /// The codes are only an interface if they are published where a reader looks.
@@ -382,6 +565,7 @@ mod tests {
             ServerCli::command().render_long_help().to_string(),
             AgentCli::command().render_long_help().to_string(),
             EmitCli::command().render_long_help().to_string(),
+            ReadCli::command().render_long_help().to_string(),
         ];
         for help in &rendered {
             for outcome in Exit::ALL {
@@ -395,25 +579,74 @@ mod tests {
     }
 
     /// The shared flags are one declaration, so they have to appear on both binaries that open a
-    /// store — and on neither of the two that run on a caller's host, which open none.
+    /// store — and on none of the three that run on a caller's host, which open none.
     #[test]
     fn the_store_flags_are_on_the_two_binaries_that_open_a_store() {
         let operator = OperatorCli::command().render_long_help().to_string();
         let server = ServerCli::command().render_long_help().to_string();
-        let agent = AgentCli::command().render_long_help().to_string();
-        let emit = EmitCli::command().render_long_help().to_string();
+        let caller_side = [
+            (
+                "the sidecar",
+                AgentCli::command().render_long_help().to_string(),
+            ),
+            (
+                "the emitter",
+                EmitCli::command().render_long_help().to_string(),
+            ),
+            (
+                "the reader",
+                ReadCli::command().render_long_help().to_string(),
+            ),
+        ];
         for flag in ["--root", "--index", "--key-store"] {
             assert!(operator.contains(flag), "yaam is missing {flag}");
             assert!(server.contains(flag), "yaam-server is missing {flag}");
-            assert!(
-                !agent.contains(flag),
-                "the sidecar opens no store, so {flag} must not be offered"
-            );
-            assert!(
-                !emit.contains(flag),
-                "the emitter opens no store, so {flag} must not be offered"
-            );
+            for (whose, help) in &caller_side {
+                assert!(
+                    !help.contains(flag),
+                    "{whose} opens no store, so {flag} must not be offered"
+                );
+            }
         }
+    }
+
+    /// A reader holds no key and names no caller of its own: the socket is the evidence of who is
+    /// asking, so a flag claiming otherwise would be a flag inviting a caller to lie.
+    #[test]
+    fn the_reader_names_no_caller_and_no_key_of_its_own() {
+        let top = ReadCli::command().render_long_help().to_string();
+        assert!(!top.contains("--agent <"), "{top}");
+        assert!(!top.contains("--key"), "{top}");
+        assert!(top.contains("no signing key"), "{top}");
+
+        // One read does take an `--agent`, and it filters on who *wrote* the record. The help has to
+        // say which of the two it means, or a caller reads it as a way to ask as somebody else.
+        let mut command = ReadCli::command();
+        let records = command
+            .find_subcommand_mut("records")
+            .expect("the filtered query")
+            .render_long_help()
+            .to_string();
+        assert!(records.contains("not the caller"), "{records}");
+    }
+
+    /// Each read is its own subcommand, and each demands what only it needs.
+    #[test]
+    fn every_read_is_its_own_subcommand_with_its_own_requirements() {
+        ReadCli::try_parse_from(["yaam-read"]).expect_err("no default read: there are four");
+        ReadCli::try_parse_from(["yaam-read", "records"]).expect("every filter is optional");
+        ReadCli::try_parse_from(["yaam-read", "search"])
+            .expect_err("a search for nothing is not a search for everything");
+        ReadCli::try_parse_from(["yaam-read", "search", "--query", "rolled back"]).expect("parsed");
+        ReadCli::try_parse_from(["yaam-read", "history"])
+            .expect_err("an entity history has to name the entity");
+        ReadCli::try_parse_from(["yaam-read", "history", "--entity", "ticket:PROJ-42"])
+            .expect("parsed");
+        // A filter that belongs to another read is refused here rather than answered `400` later.
+        ReadCli::try_parse_from(["yaam-read", "search", "--query", "x", "--action", "deploy"])
+            .expect_err("a full-text read takes no filters");
+        ReadCli::try_parse_from(["yaam-read", "bundle", "--query", "x"])
+            .expect_err("a bundle has no needle");
     }
 
     /// The decision that stays open has to stay open in the argument surface too. A `--subject`

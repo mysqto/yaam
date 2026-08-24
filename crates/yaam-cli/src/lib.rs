@@ -1,35 +1,36 @@
-//! The four entry points, and the configuration all of them agree on.
+//! The five entry points, and the configuration all of them agree on.
 //!
 //! Everything lives here rather than in the `main.rs` files for one reason: a binary-only crate
 //! cannot be unit tested, and the interesting parts of a command-line tool — what it accepts, what
 //! it refuses, what it prints and what it exits with — are exactly the parts worth testing. Each
 //! `main` is one statement.
 //!
-//! # The four
+//! # The five
 //!
 //! | Binary | What it is |
 //! |---|---|
 //! | `yaam-server` | The HTTP service, plus the maintenance its store needs. |
-//! | `yaam-agent` | The local sidecar: one socket per caller, sealing and signing on their behalf. |
+//! | `yaam-agent` | The local sidecar: two sockets per caller, sealing and signing on their behalf. |
 //! | `yaam` | The operator command line: rebuild, drain, erase, verify, back up, restore, read health. |
 //! | `yaam-emit` | One record, built from arguments and written to a caller socket. |
+//! | `yaam-read` | One read, sent to a caller read socket; the service's answer, unchanged. |
 //!
 //! One crate, because the first two open the same store and have to agree about where it is. Two
 //! crates would be two argument parsers, and the first setting one of them spelled differently would
 //! be a service reading an index that nothing writes — which is a failure with no symptom except
 //! empty answers.
 //!
-//! `yaam-emit` is here for the neighbouring reason. It opens no store at all, but it does report the
-//! same [`exit`] codes, and a crate of its own would be a second copy of that table. It is a binary
-//! rather than a `yaam emit` subcommand because the operator command line flattens
-//! [`cli::StoreArgs`] above its subcommands, so `emit` would offer `--root` however little it did
-//! with one — and a flag inviting a caller to open the memory tree is precisely what the sidecar
-//! exists to make unnecessary.
+//! `yaam-emit` and `yaam-read` are here for the neighbouring reason. Neither opens a store at all,
+//! but both report the same [`exit`] codes, and a crate of their own would be a second copy of that
+//! table. They are binaries rather than `yaam emit` and `yaam read` subcommands because the operator
+//! command line flattens [`cli::StoreArgs`] above its subcommands, so either would offer `--root`
+//! however little it did with one — and a flag inviting a caller to open the memory tree is
+//! precisely what the sidecar exists to make unnecessary.
 //!
-//! The cost is that the sidecar and the emitter link what the service links. It is worth naming:
-//! both run on the caller's host, and smaller ones would be better. If that footprint ever matters
-//! more than the agreement does, the split to make is [`config`] into a leaf crate of its own — not
-//! four copies of it.
+//! The cost is that the sidecar, the emitter and the reader link what the service links. It is worth
+//! naming: all three run on the caller's host, and smaller ones would be better. If that footprint
+//! ever matters more than the agreement does, the split to make is [`config`] into a leaf crate of
+//! its own — not five copies of it.
 //!
 //! # Where the logic is
 //!
@@ -50,6 +51,7 @@ pub mod error;
 pub mod exit;
 pub mod keyring;
 pub mod ops;
+pub mod read;
 pub mod server;
 
 #[cfg(test)]
@@ -60,8 +62,10 @@ use std::io::Write;
 
 use clap::Parser;
 
-use crate::cli::{AgentCli, Command, EmitCli, OperatorCli, ServerCli};
-use crate::config::{AgentSettings, EmitSettings, Env, ServerSettings, StoreSettings};
+use crate::cli::{AgentCli, Command, EmitCli, OperatorCli, ReadCli, ServerCli};
+use crate::config::{
+    AgentSettings, EmitSettings, Env, ReadSettings, ServerSettings, StoreSettings,
+};
 use crate::error::Result;
 use crate::exit::Exit;
 
@@ -109,6 +113,23 @@ where
 {
     match parsed::<EmitCli, _, _>(args) {
         Ok(cli) => report("yaam-emit", run_emitter(&cli, env, out)),
+        Err(code) => code,
+    }
+}
+
+/// Sends one read to a caller read socket, and returns the process exit code.
+///
+/// No logging subscriber, for the reason the emitter has none, and one more: this command's output
+/// *is* the answer. A subscriber writing prose to stderr beside a JSON document on stdout would give
+/// a caller two streams to tell apart where it asked for one.
+#[must_use]
+pub fn reader<I, T>(args: I, env: &Env, out: &mut dyn Write) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    match parsed::<ReadCli, _, _>(args) {
+        Ok(cli) => report("yaam-read", run_reader(&cli, env, out)),
         Err(code) => code,
     }
 }
@@ -218,6 +239,16 @@ fn run_service(cli: &ServerCli, env: &Env) -> Result<Exit> {
 fn run_emitter(cli: &EmitCli, env: &Env, out: &mut dyn Write) -> Result<Exit> {
     let settings = EmitSettings::resolve(&cli.args, env)?;
     emit::emit(&settings, &cli.args, out)
+}
+
+/// One read, once its arguments are known.
+///
+/// Nothing is refused at the resolve, unlike the emitter, whose `--agent` is a field of the record
+/// it prints and has to be known before one exists. Every setting here is about how the request
+/// travels rather than what it asks, which is exactly why a dry run needs none of them.
+fn run_reader(cli: &ReadCli, env: &Env, out: &mut dyn Write) -> Result<Exit> {
+    let settings = ReadSettings::resolve(&cli.args, env);
+    read::read(&settings, &cli.args, &cli.query, out)
 }
 
 /// The sidecar, once its arguments are known.

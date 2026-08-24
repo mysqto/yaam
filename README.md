@@ -38,7 +38,7 @@ crates/
   yaam-core       write pipeline, sweeper, reindex, erasure, bundle composition
   yaam-server     HTTP service
   yaam-agent      local sidecar: two sockets per caller, seals and signs on their behalf
-  yaam-cli        the four entry points: `yaam-server`, `yaam-agent`, `yaam`, `yaam-emit`
+  yaam-cli        the five entry points: `yaam-server`, `yaam-agent`, `yaam`, `yaam-emit`, `yaam-read`
 xtask/            repository chores: generates spec/schemas, checks the shapes behind it
 spec/             the contract bundle other implementations vendor
   memory.v1.yaml    the wire contract as OpenAPI 3.1, checked against the router and the types
@@ -51,15 +51,15 @@ spec/             the contract bundle other implementations vendor
 
 ## Running it
 
-Four binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
+Five binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
 `--key-store` default to sitting under it, and every setting is also read from the environment
 (`YAAM_ROOT`, `YAAM_INDEX`, `YAAM_KEY_STORE`, `YAAM_LISTEN`, `YAAM_KEYRING`,
 `YAAM_UNSEAL_KEY_FILE`, `YAAM_MAINTENANCE_MS`, `YAAM_AGENT_STATE`, `YAAM_SOCKET`, `YAAM_AGENT`,
-`YAAM_LOG`). A flag beats the environment.
+`YAAM_READ_SOCKET`, `YAAM_LOG`). A flag beats the environment.
 
-Two of the four open a store and two never do. `yaam-agent` and `yaam-emit` run on the caller's host
-and have no `--root` to give them: that is what lets a caller record what it did while holding no key
-material and no path into anyone's memory tree.
+Two of the five open a store and three never do. `yaam-agent`, `yaam-emit` and `yaam-read` run on the
+caller's host and have no `--root` to give them: that is what lets a caller record what it did, and
+read what it remembers, while holding no key material and no path into anyone's memory tree.
 
 The service drains fan-out and sweeps every `--maintenance-ms` (30 s by default) *and* once at
 startup, so a process that comes up over an interrupted write converges without waiting an interval
@@ -79,7 +79,17 @@ yaam-server --root /srv/memory --listen 127.0.0.1:8787 \
 # extension. A caller needs no key material for either.
 yaam-agent --state-dir /var/lib/yaam/agent
 
-# A read through the sidecar. The request is ordinary HTTP; the signature is the sidecar's to add.
+# Reading. The sidecar signs on the caller's behalf, so this holds no key either. The service's
+# JSON goes to stdout unchanged.
+export YAAM_READ_SOCKET=/var/lib/yaam/agent/sockets/agent_a.read.sock
+yaam-read records --action deploy --attr environment=staging --limit 10
+yaam-read search --query "rolled back" --limit 5      # full text over bodies, structure back
+yaam-read history --entity deploy:api/staging#1146    # one entity's history, newest first
+yaam-read bundle --entity ticket:PROJ-42 --actor agent_a --limit 5   # context for a request
+
+yaam-read records --dry-run   # the exact request, no sidecar needed
+
+# The socket is ordinary HTTP, so anything that speaks it can read too.
 curl --unix-socket /var/lib/yaam/agent/sockets/agent_a.read.sock \
      "http://localhost/records?limit=10"
 
@@ -142,8 +152,8 @@ Exit codes are the scriptable interface and are listed in every `--help`:
 | `5` | unconfirmed — a destructive command was not confirmed; nothing was done |
 | `6` | incomplete — the erasure is real but cannot be asserted complete yet |
 | `7` | spooled — the sidecar holds the record and is still delivering it; a success |
-| `8` | rejected — the record will never be accepted as written; only its sender can fix it |
-| `9` | unreachable — a socket did not answer; nothing was recorded |
+| `8` | rejected — the request will never be accepted as asked; only its sender can fix it |
+| `9` | unreachable — a socket did not answer; nothing was recorded and nothing was read |
 
 `7` is a success and has its own code because the two things it might mean to a monitor are different:
 the record is durable, and the service has not seen it yet. A hook that treated it as a failure would
@@ -172,6 +182,40 @@ that refusal into the flag to change rather than a status code.
 Subjects stay empty and the data class stays `internal`. What a subject *is* — how a person becomes a
 pseudonym, and under whose canonicalisation — is still an open decision, so there is deliberately no
 flag: one would let a caller declare a record erasable that the deployment cannot erase.
+
+### Reading it back
+
+`yaam-read` sends one request to a caller's *read* socket and prints the service's JSON on stdout,
+byte for byte. It exists for the same reason the emitter does — the alternative was a signed request
+assembled by hand — and it holds no key for a stronger one: the read socket signs on the caller's
+behalf, so a reader that signed for itself would be holding exactly what the sidecar exists to keep
+away from it. There is no `--root`, no key flag and no `--agent`: the socket is the evidence of who is
+asking.
+
+| Read | Command | Answers |
+|---|---|---|
+| filtered query | `yaam-read records [--action --outcome --agent --attr --from-ms --to-ms --limit]` | `RecordsResponse` |
+| entity history | `yaam-read history --entity kind:id [--min-confidence --limit]` | `RecordsResponse` |
+| full text | `yaam-read search --query TEXT [--limit]` | `RecordsResponse` |
+| context | `yaam-read bundle [--entity kind:id …] [--actor --deadline-ms --limit]` | `BundleResponse` |
+
+Four subcommands rather than one flat set of flags, because they are four questions and not four
+filters on one: `--query` is required for a search and meaningless to a bundle, a window narrows the
+filtered query alone, and the service answers a parameter it does not know with `400` rather than
+ignoring it. Flattened together, `--help` would describe a request surface that does not exist.
+
+Nothing the caller did not name is sent. Every optional parameter has a documented default at the
+service, and a copy of one here would be a second place for it to be out of date.
+
+The three exit codes a script branches on are `0`, `8` and `9`, and the first is the one that matters:
+**a read that matched nothing exits `0`**. It is an answer — `200` with an empty page — and folding it
+into a failure would make every quiet day look like an outage. `8` says the request will never be
+answered as asked; `9` says nothing was read, which includes the service being unreachable from the
+sidecar, since a read is never queued.
+
+Percent-encoding is the command's business rather than the caller's, which matters more than it looks:
+several configured entity kinds carry `/`, `#` or `@` inside an identifier, and the signature the
+sidecar adds covers the request target exactly as sent.
 
 ### The keyring file
 

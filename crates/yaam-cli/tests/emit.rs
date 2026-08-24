@@ -11,46 +11,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::path::Path;
 
 mod support;
 
-use support::{Deployment, SIGNING_KEY, Service, await_socket, spawn, terminate, yaam, yaam_emit};
-
-/// Where a sidecar with this state directory puts the caller socket.
-fn socket_of(state: &Path) -> PathBuf {
-    state.join("sockets/agent_a.sock")
-}
-
-/// Starts a sidecar in its own state directory, pointed at `base_url`.
-///
-/// The sealing key is generated here rather than taken from a service, so a sidecar can be pointed at
-/// a service that does not exist — which is the whole spool case.
-fn sidecar(
-    deployment: &Deployment,
-    name: &str,
-    base_url: &str,
-    public_key: &str,
-) -> (PathBuf, Child) {
-    let state = deployment.root().join(name);
-    std::fs::create_dir_all(&state).expect("state dir");
-    std::fs::write(
-        state.join("upstream.json"),
-        format!(
-            r#"{{"base_url":"{base_url}","service_public_key":"{public_key}",
-                 "signing_keys":{{"agent_a":"{SIGNING_KEY}"}},"retry_interval_ms":200}}"#
-        ),
-    )
-    .expect("upstream");
-    let child = spawn(
-        env!("CARGO_BIN_EXE_yaam-agent"),
-        &["--state-dir", state.to_str().expect("utf-8")],
-    );
-    let socket = socket_of(&state);
-    drop(await_socket(&socket));
-    (socket, child)
-}
+use support::{Deployment, Service, sidecar, terminate, yaam, yaam_emit};
 
 /// The arguments a shell hook passes, over a socket named by the environment.
 fn hook_env(socket: &Path) -> Vec<(String, String)> {

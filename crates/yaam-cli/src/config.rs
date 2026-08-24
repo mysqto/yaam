@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use yaam_core::Paths;
 
-use crate::cli::{AgentArgs, EmitArgs, ServerArgs, StoreArgs};
+use crate::cli::{AgentArgs, EmitArgs, ReadArgs, ServerArgs, StoreArgs};
 use crate::error::{Error, Result, config, failed};
 
 /// Environment variable naming the memory tree root.
@@ -51,6 +51,14 @@ pub const ENV_SOCKET: &str = "YAAM_SOCKET";
 /// The pair above and here is what makes a one-line hook possible: a host that exports both leaves
 /// the caller with only what it alone knows to say.
 pub const ENV_AGENT: &str = "YAAM_AGENT";
+/// Environment variable naming the caller socket reads are sent to.
+///
+/// Its own variable rather than a derivation from [`ENV_SOCKET`]: that one is documented as naming
+/// the record socket, and a reader that guessed the read socket from it would send HTTP into the
+/// newline-JSON protocol whenever the guess was wrong. The sidecar does derive one path from the
+/// other, and the help says how, so a host exporting both is exporting two spellings of one fact
+/// rather than two settings.
+pub const ENV_READ_SOCKET: &str = "YAAM_READ_SOCKET";
 /// Environment variable setting the log level.
 pub const ENV_LOG: &str = "YAAM_LOG";
 
@@ -98,6 +106,8 @@ pub struct Env {
     pub socket: Option<OsString>,
     /// [`ENV_AGENT`].
     pub agent: Option<OsString>,
+    /// [`ENV_READ_SOCKET`].
+    pub read_socket: Option<OsString>,
     /// [`ENV_LOG`].
     pub log: Option<OsString>,
 }
@@ -121,6 +131,7 @@ impl Env {
             agent_state: std::env::var_os(ENV_AGENT_STATE),
             socket: std::env::var_os(ENV_SOCKET),
             agent: std::env::var_os(ENV_AGENT),
+            read_socket: std::env::var_os(ENV_READ_SOCKET),
             log: std::env::var_os(ENV_LOG),
         }
     }
@@ -473,6 +484,37 @@ impl EmitSettings {
             ));
         }
         Ok(Self { socket, agent })
+    }
+}
+
+/// Where a read is sent.
+///
+/// One setting, and deliberately not two: there is no agent here. The read socket signs as the
+/// caller it belongs to, so who is asking is a property of the socket rather than something a reader
+/// gets to say, and a `--agent` would be an invitation to claim otherwise. No store settings either,
+/// for the reason the emitter has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadSettings {
+    /// The read socket to send the request to, absent only for a dry run.
+    ///
+    /// Optional for the reason [`EmitSettings::socket`] is: a dry run prints the request without
+    /// sending it, and demanding the socket it would have gone to defeats the point of printing it.
+    pub socket: Option<PathBuf>,
+}
+
+impl ReadSettings {
+    /// Resolves a reader's settings from flags and the environment.
+    ///
+    /// The one resolve that cannot fail, and that is the whole shape of this binary. There is a
+    /// single setting; it is refused at the send rather than here, because a dry run has none to
+    /// name; and neither layer can supply a blank one — [`pick`] drops an empty variable, and `clap`
+    /// refuses an empty path. The emitter's returns a [`Result`] because it also resolves an agent,
+    /// which is a field of the record and has to be known before one can be built.
+    #[must_use]
+    pub fn resolve(flags: &ReadArgs, env: &Env) -> Self {
+        Self {
+            socket: pick(flags.socket.as_deref(), env.read_socket.as_deref()),
+        }
     }
 }
 

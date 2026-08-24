@@ -131,6 +131,57 @@ pub fn yaam_emit(args: &[&str], env: &[(&str, &str)]) -> Output {
     command.output().expect("run yaam-emit")
 }
 
+/// Runs `yaam-read` and returns what a script would see.
+///
+/// Nothing about the environment is inherited beyond what the caller passes, for the reason
+/// [`yaam_emit`] inherits nothing: a variable left over from the surrounding shell would make a test
+/// pass on a setting it never named.
+pub fn yaam_read(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yaam-read"));
+    command.args(args).env_remove("YAAM_READ_SOCKET");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().expect("run yaam-read")
+}
+
+/// Starts a sidecar in its own state directory under `deployment`, pointed at `base_url`.
+///
+/// The sealing key is passed in rather than taken from a running service, so a sidecar can be
+/// pointed at a service that does not exist — which is what the spool cases need.
+///
+/// Returns the caller's record socket and the process. The read socket is the same path with
+/// `.read.sock` for its extension, which is [`read_socket`].
+pub fn sidecar(
+    deployment: &Deployment,
+    name: &str,
+    base_url: &str,
+    public_key: &str,
+) -> (PathBuf, Child) {
+    let state = deployment.root().join(name);
+    fs::create_dir_all(&state).expect("state dir");
+    fs::write(
+        state.join("upstream.json"),
+        format!(
+            r#"{{"base_url":"{base_url}","service_public_key":"{public_key}",
+                 "signing_keys":{{"{AGENT}":"{SIGNING_KEY}"}},"retry_interval_ms":200}}"#
+        ),
+    )
+    .expect("upstream");
+    let child = spawn(
+        env!("CARGO_BIN_EXE_yaam-agent"),
+        &["--state-dir", state.to_str().expect("utf-8")],
+    );
+    let socket = state.join(format!("sockets/{AGENT}.sock"));
+    drop(await_socket(&socket));
+    (socket, child)
+}
+
+/// A caller's read socket, derived from its record socket exactly as the sidecar derives it.
+pub fn read_socket(record: &Path) -> PathBuf {
+    record.with_extension("read.sock")
+}
+
 /// Services started so far, which is what keeps their logs apart.
 static STARTS: AtomicUsize = AtomicUsize::new(0);
 
