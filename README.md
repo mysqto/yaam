@@ -36,6 +36,7 @@ crates/
   yaam-md         frontmatter and sealed-body serialisation
   yaam-store      SQLite schema, queries, full-text search
   yaam-core       write pipeline, sweeper, reindex, erasure, bundle composition
+  yaam-knowledge  facts derived from record structure, rebuilt wholesale from the record tree
   yaam-server     HTTP service
   yaam-agent      local sidecar: two sockets per caller, seals and signs on their behalf
   yaam-cli        the five entry points: `yaam-server`, `yaam-agent`, `yaam`, `yaam-emit`, `yaam-read`

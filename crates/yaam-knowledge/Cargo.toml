@@ -1,0 +1,28 @@
+[package]
+name = "yaam-knowledge"
+description = "Knowledge derived from yaam's action records. Derived, disposable, rebuildable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+yaam-contract = { path = "../yaam-contract" }
+# Record files are read through the same parser that writes them. A second reading of the record
+# format here would be a second thing to keep in step with the frontmatter projection.
+yaam-md = { path = "../yaam-md" }
+
+[dev-dependencies]
+tempfile.workspace = true
+# Tests drive the real write pipeline rather than hand-writing record files. "Knowledge is a
+# function of the record tree" is a claim about the tree a deployment actually produces, and
+# erasure propagation can only be shown by running the erasure its owner performs.
+yaam-core = { path = "../yaam-core" }
+yaam-crypto = { path = "../yaam-crypto" }
