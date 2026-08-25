@@ -22,6 +22,32 @@
 //! windowed queries the history was imported for would answer as if none of it existed. Neither
 //! shape is inferrable from the other — see [`stamps`] for the three refusals that follow.
 //!
+//! # Inferring the references the caller did not state
+//!
+//! `--entity` is a caller stating a fact and is recorded as such: [`entity::Role::Primary`], at
+//! [`extract::FIELD_CONFIDENCE`]. Prose holds references too, and without a way to lift them a
+//! record imported from a source carries none at all — searchable, and unreachable from any read
+//! that composes context out of entities. `--infer-entities` is that way, and [`entities`] is where
+//! the two meet: what the caller said first, then what the prose supports, and the stated one wins
+//! wherever both name one entity.
+//!
+//! It reads the spec directory it is given and no store. That is the line, and it is not a
+//! technicality: a `--root` is records, key material and an index, and the only thing to do with one
+//! is open it; two YAML files saying what an identifier looks like are configuration a deployment
+//! distributes, and this reads them the way it would read any other.
+//!
+//! Opt-in, per invocation, for the reason the whole extractor is built the way it is. An inferred
+//! reference is a join key with a guess behind it, and a guess added by default would change what
+//! every existing caller writes without anybody asking for it.
+//!
+//! Doing it here rather than in the sidecar is the choice worth naming. The sidecar masks on the way
+//! past, which is the same shape of problem — but masking is an obligation the deployment owes and
+//! declares in a field, so somebody other than the caller has to be able to guarantee it. Inference
+//! claims nothing and is nobody's obligation; it is a reading of the caller's own prose. Two
+//! consequences settle it: the wire format is a validated record with no field meaning "and please
+//! infer", so a sidecar could only be switched on for every record a caller writes; and `--dry-run`
+//! prints the bytes the socket receives, which would stop being the record that gets stored.
+//!
 //! # Why the sidecar and not the service
 //!
 //! The sidecar seals, signs and spools. A caller posting to the service would need the service's own
@@ -43,12 +69,13 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use yaam_agent::listener::{Answer, Status};
-use yaam_contract::entity::{self, EntityRef};
+use yaam_contract::entity::{self, EntityRef, Registry};
+use yaam_contract::extract::Extractor;
 use yaam_contract::{ActionRecord, DataClass, RecordId, SchemaVer, attrs, extract, timestamp};
 
 use crate::cli::EmitArgs;
 use crate::config::EmitSettings;
-use crate::error::{Error, Result, failed};
+use crate::error::{Error, Result, config, failed};
 use crate::exit::Exit;
 
 /// The redaction policy a record declares when nothing names one.
@@ -79,12 +106,22 @@ const LIVE_SKEW_MS: i64 = 5_000;
 /// running, and a flag would let one claim a version whose fields it is not sending.
 const SCHEMA_VER: SchemaVer = SchemaVer(1);
 
+/// What an identifier is, inside the directory `--infer-entities` names.
+const ENTITIES_FILE: &str = "entities.yaml";
+
+/// When prose is evidence that one was meant, in the same directory.
+const EXTRACTORS_FILE: &str = "extractors.yaml";
+
 /// Builds one record from the arguments and sends it, reporting what became of it.
 ///
 /// Validated locally before it is sent, so a record that cannot possibly be accepted fails here —
 /// naming the field — rather than after a round trip that names it second-hand.
 pub fn emit(settings: &EmitSettings, args: &EmitArgs, out: &mut dyn Write) -> Result<Exit> {
-    let record = record(settings, args, now_ms())?;
+    // Ahead of the record, so a dry run fails on an unreadable spec directory too. The flag asks for
+    // references the record will carry, which makes it part of building one rather than of sending
+    // it — and a dry run that skipped the check would rehearse a record the real send could not make.
+    let inferring = args.infer_entities.as_deref().map(extractor).transpose()?;
+    let record = record(settings, args, inferring.as_ref(), now_ms())?;
     record
         .validate()
         .map_err(|error| Error::Rejected(error.to_string()))?;
@@ -271,9 +308,16 @@ fn silence(socket: &Path, error: &std::io::Error) -> Error {
 
 /// Builds the record the arguments describe.
 ///
-/// `now` is passed in rather than read here, so what this produces is a function of its arguments
-/// and can be asserted on.
-fn record(settings: &EmitSettings, args: &EmitArgs, now: i64) -> Result<ActionRecord> {
+/// `now` is passed in rather than read here, and so is the extractor, so what this produces is a
+/// function of its arguments and can be asserted on. `extractor` is `Some` exactly when
+/// `--infer-entities` named a spec directory, and it is the only thing that reaches
+/// [`ActionRecord::entities`] beyond what `--entity` states.
+fn record(
+    settings: &EmitSettings,
+    args: &EmitArgs,
+    extractor: Option<&Extractor>,
+    now: i64,
+) -> Result<ActionRecord> {
     let (at_ms, received_ms) = stamps(args, now)?;
     Ok(ActionRecord {
         record_id: RecordId::generate(),
@@ -290,11 +334,7 @@ fn record(settings: &EmitSettings, args: &EmitArgs, now: i64) -> Result<ActionRe
         action: args.action.clone(),
         outcome: args.outcome.into_contract(),
         attrs: declared_attrs(args)?,
-        entities: args
-            .entities
-            .iter()
-            .map(|spec| entity_ref(spec))
-            .collect::<Result<Vec<_>>>()?,
+        entities: entities(args, extractor)?,
         // Empty, and no flag can change it: see `crate::cli::EmitCli`.
         subjects: Vec::new(),
         visibility: args.visibility.into_contract(),
@@ -432,6 +472,102 @@ fn pair<'a>(flag: &str, spec: &'a str) -> Result<(&'a str, &'a str)> {
     Ok((key, value))
 }
 
+/// Every entity reference the record carries: what the caller stated, then what the prose supports.
+///
+/// The two stay apart in the record itself, which is the whole reason this is safe to do at all. A
+/// stated reference is primary at [`extract::FIELD_CONFIDENCE`]; an inferred one is related, below
+/// the floor a high-confidence read joins on. Nothing here narrows that gap — a merge that produced
+/// one indistinguishable list would turn a guess into an assertion at the moment of storing it.
+///
+/// Where both name one entity the stated one is kept and the inferred one is dropped, because
+/// keeping both would put a single join key in the record twice: once as a fact and once as a guess
+/// about that same fact, leaving every reader to decide which of the two it believed.
+///
+/// "One entity" is the kind and the *canonical* identifier, which is the pair the store joins on:
+/// the write path canonicalises every identifier it is given, so `ticket:proj-42` stated and
+/// `ticket:PROJ-42` inferred are one key by the time either is stored. Comparing the spellings as
+/// typed would collapse only the pairs that happened to match, which is not a rule.
+fn entities(args: &EmitArgs, extractor: Option<&Extractor>) -> Result<Vec<EntityRef>> {
+    let mut stated = args
+        .entities
+        .iter()
+        .map(|spec| entity_ref(spec))
+        .collect::<Result<Vec<_>>>()?;
+    let Some(extractor) = extractor else {
+        return Ok(stated);
+    };
+
+    let claimed: Vec<(&str, String)> = stated
+        .iter()
+        .map(|entity| {
+            (
+                entity.kind.as_str(),
+                canonical(extractor.registry(), entity),
+            )
+        })
+        .collect();
+    // The summary alone. It is the record's prose; an attribute is a declared, typed field whose
+    // kind whoever declared it already knows, and reading one for join keys would be a guess about
+    // a value that was never prose. Collected before the stated list is extended, because the
+    // comparison borrows it.
+    let inferred: Vec<EntityRef> = extractor
+        .from_text(&args.summary)
+        .into_iter()
+        // The extractor canonicalises before it decides anything, so both sides are canonical here.
+        .filter(|found| {
+            !claimed
+                .iter()
+                .any(|(kind, id)| *kind == found.kind && *id == found.id)
+        })
+        .collect();
+    stated.extend(inferred);
+    Ok(stated)
+}
+
+/// A stated identifier as the store will hold it, or as it was typed when the registry cannot say.
+///
+/// An identifier this registry refuses is one the write path refuses too, so there is no canonical
+/// form for it and nothing for it to collide with; the literal is as good a key as any. It is not
+/// refused here on that account: `--infer-entities` asks for references to be added, and letting it
+/// also police the ones the caller stated would make a record's acceptance depend on a flag about
+/// something else.
+fn canonical(registry: &Registry, entity: &EntityRef) -> String {
+    registry
+        .canonicalise(&entity.kind, &entity.id)
+        .unwrap_or_else(|_| entity.id.clone())
+}
+
+/// Loads the extraction rules out of the spec directory `--infer-entities` names.
+///
+/// Both files are required. A directory with no `extractors.yaml` would leave a caller that asked
+/// for inference with a record that has none and no way to tell — the flag is the request, so being
+/// unable to honour it is a configuration failure rather than a quiet nothing.
+fn extractor(dir: &Path) -> Result<Extractor> {
+    let registry = Registry::from_yaml(&spec_text(dir, ENTITIES_FILE)?)
+        .map_err(|error| unusable(dir, ENTITIES_FILE, &error))?;
+    Extractor::from_yaml(registry, &spec_text(dir, EXTRACTORS_FILE)?)
+        .map_err(|error| unusable(dir, EXTRACTORS_FILE, &error))
+}
+
+/// Reads one file of the spec directory, naming what the directory is expected to be.
+fn spec_text(dir: &Path, file: &str) -> Result<String> {
+    std::fs::read_to_string(dir.join(file)).map_err(|error| {
+        config(format!(
+            "--infer-entities {}: {error}. It names a spec directory, which is where {ENTITIES_FILE} \
+             and {EXTRACTORS_FILE} live — the same pair the deployment this record goes to reads",
+            dir.join(file).display()
+        ))
+    })
+}
+
+/// A spec file that was read and could not be used.
+fn unusable(dir: &Path, file: &str, cause: &dyn std::fmt::Display) -> Error {
+    config(format!(
+        "--infer-entities {}: {cause}",
+        dir.join(file).display()
+    ))
+}
+
 /// Reads one `kind:id` entity reference.
 ///
 /// Primary, at [`extract::FIELD_CONFIDENCE`]: an argument is a structured field, and a caller naming
@@ -477,7 +613,10 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{DEFAULT_REDACTION_POLICY, emit, guidance, record};
+    use super::{
+        ActionRecord, DEFAULT_REDACTION_POLICY, ENTITIES_FILE, Extractor, emit, extract, extractor,
+        guidance, record,
+    };
     use crate::cli::EmitCli;
     use crate::config::{EmitSettings, Env};
     use crate::error::Error;
@@ -496,6 +635,38 @@ mod tests {
         ];
         args.extend_from_slice(extra);
         EmitCli::try_parse_from(args).expect("parsed")
+    }
+
+    /// The same, over prose a test chose, which is what the extraction cases are all about.
+    fn about(summary: &str, extra: &[&str]) -> EmitCli {
+        let mut args = vec![
+            "yaam-emit",
+            "--action",
+            "deploy",
+            "--outcome",
+            "success",
+            "--summary",
+            summary,
+        ];
+        args.extend_from_slice(extra);
+        EmitCli::try_parse_from(args).expect("parsed")
+    }
+
+    /// The rules the workspace ships, loaded the way the flag loads them.
+    fn shipped() -> Extractor {
+        extractor(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec"))
+            .expect("the shipped spec loads")
+    }
+
+    /// One record built with inference on, at a fixed instant.
+    fn built_with(cli: &EmitCli, extractor: &Extractor) -> ActionRecord {
+        record(
+            &settings(PathBuf::from("/nowhere")),
+            &cli.args,
+            Some(extractor),
+            0,
+        )
+        .expect("built")
     }
 
     fn settings(socket: PathBuf) -> EmitSettings {
@@ -530,6 +701,7 @@ mod tests {
         let built = record(
             &settings(PathBuf::from("/nowhere")),
             &cli.args,
+            None,
             1_787_217_242_117,
         )
         .expect("built");
@@ -555,6 +727,7 @@ mod tests {
         let built = record(
             &settings(PathBuf::from("/nowhere")),
             &cli.args,
+            None,
             1_787_217_242_117,
         )
         .expect("built");
@@ -572,8 +745,13 @@ mod tests {
     #[test]
     fn an_offset_is_normalised_rather_than_stored_as_written() {
         let cli = parsed(&["--at", "2023-05-01T21:00:00+09:00", "--backfilled"]);
-        let built =
-            record(&settings(PathBuf::from("/nowhere")), &cli.args, i64::MAX).expect("built");
+        let built = record(
+            &settings(PathBuf::from("/nowhere")),
+            &cli.args,
+            None,
+            i64::MAX,
+        )
+        .expect("built");
         assert_eq!(built.at, "2023-05-01T12:00:00.000Z");
     }
 
@@ -582,7 +760,8 @@ mod tests {
     fn a_live_record_may_name_its_own_instant_within_the_skew_a_hook_has() {
         let now = 1_787_217_242_117;
         let cli = parsed(&["--at", "2026-08-20T09:14:00Z"]);
-        let built = record(&settings(PathBuf::from("/nowhere")), &cli.args, now).expect("built");
+        let built =
+            record(&settings(PathBuf::from("/nowhere")), &cli.args, None, now).expect("built");
 
         assert!(!built.backfilled);
         assert_eq!(built.at, "2026-08-20T09:14:00.000Z");
@@ -611,7 +790,7 @@ mod tests {
         ];
         for (extra, expected) in cases {
             let cli = parsed(extra);
-            let error = record(&settings(PathBuf::from("/nowhere")), &cli.args, now)
+            let error = record(&settings(PathBuf::from("/nowhere")), &cli.args, None, now)
                 .expect_err("refused before a socket is opened");
             assert!(
                 matches!(&error, Error::Usage(why) if why.contains(expected)),
@@ -628,6 +807,7 @@ mod tests {
         let error = record(
             &settings(PathBuf::from("/nowhere")),
             &cli.args,
+            None,
             1_787_217_242_117,
         )
         .expect_err("three years is not skew");
@@ -642,8 +822,8 @@ mod tests {
     fn each_record_gets_its_own_identifier() {
         let cli = parsed(&[]);
         let settings = settings(PathBuf::from("/nowhere"));
-        let first = record(&settings, &cli.args, 0).expect("built");
-        let second = record(&settings, &cli.args, 0).expect("built");
+        let first = record(&settings, &cli.args, None, 0).expect("built");
+        let second = record(&settings, &cli.args, None, 0).expect("built");
         assert_ne!(first.record_id, second.record_id);
     }
 
@@ -657,7 +837,8 @@ mod tests {
             "--attr-bool",
             "rolled_back=false",
         ]);
-        let built = record(&settings(PathBuf::from("/nowhere")), &cli.args, 0).expect("built");
+        let built =
+            record(&settings(PathBuf::from("/nowhere")), &cli.args, None, 0).expect("built");
 
         // The case the three flags exist for: a build number is declared `string` and would be sent
         // as an integer by anything guessing from its shape.
@@ -689,7 +870,7 @@ mod tests {
         ];
         for extra in cases {
             let cli = parsed(&extra);
-            let error = record(&settings(PathBuf::from("/nowhere")), &cli.args, 0)
+            let error = record(&settings(PathBuf::from("/nowhere")), &cli.args, None, 0)
                 .expect_err("refused before a socket is opened");
             assert!(
                 matches!(error, Error::Usage(_)),
@@ -702,12 +883,175 @@ mod tests {
     fn an_entity_argument_is_a_primary_reference_at_full_confidence() {
         // The identifier keeps its own colons; only the kind is split off.
         let cli = parsed(&["--entity", "deploy:api/staging#1146"]);
-        let built = record(&settings(PathBuf::from("/nowhere")), &cli.args, 0).expect("built");
+        let built =
+            record(&settings(PathBuf::from("/nowhere")), &cli.args, None, 0).expect("built");
         let reference = &built.entities[0];
         assert_eq!(reference.kind, "deploy");
         assert_eq!(reference.id, "api/staging#1146");
         assert_eq!(reference.role, yaam_contract::entity::Role::Primary);
         assert!((reference.confidence - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// Prose the shipped rules can anchor becomes a reference the record carries.
+    ///
+    /// The gap this closes: a record imported from prose stated no entity, so it joined to nothing,
+    /// and no read composing context out of entities could reach it however well it was indexed.
+    #[test]
+    fn anchored_prose_becomes_an_inferred_reference() {
+        let cli = about(
+            "rolled the api service out to staging, closing ticket PROJ-42",
+            &[],
+        );
+        let built = built_with(&cli, &shipped());
+
+        assert_eq!(built.entities.len(), 1, "{:?}", built.entities);
+        let inferred = &built.entities[0];
+        assert_eq!(inferred.kind, "ticket");
+        assert_eq!(
+            inferred.id, "PROJ-42",
+            "canonical, not as the prose spelt it"
+        );
+        // The two halves of "this was a guess", and both have to hold. A read that joins on entities
+        // takes the primary ones at full confidence, and would take this one too if either slipped.
+        assert_eq!(inferred.role, yaam_contract::entity::Role::Related);
+        assert!(inferred.confidence < extract::HIGH_CONFIDENCE_FLOOR);
+        assert!(inferred.confidence < extract::FIELD_CONFIDENCE);
+    }
+
+    /// Prose that anchors nothing adds nothing, including the two shapes that look like references.
+    ///
+    /// These are the cases `crates/yaam-contract/tests/extraction_precision.rs` exists for, asserted
+    /// again because what matters is that they hold *through this path*: `background` is a canonical
+    /// `order_ref` and `UTF-8` is a canonical `ticket`, so an emitter that reached for the registry
+    /// instead of the extractor would mint both — and the sentence below puts an `order` and an
+    /// `issue` anchor right in front of them, which is what would make it look reasonable.
+    #[test]
+    fn prose_that_anchors_nothing_infers_nothing() {
+        let extractor = shipped();
+        for summary in [
+            "rolled the api service out to staging",
+            "the issue UTF-8 came up while reading the order background of the cart",
+        ] {
+            let built = built_with(&about(summary, &[]), &extractor);
+            assert!(built.entities.is_empty(), "{summary}: {:?}", built.entities);
+        }
+    }
+
+    /// A stated reference and the same one inferred are one reference, and it is the stated one.
+    ///
+    /// Both spellings, because "the same" is the kind and the canonical identifier rather than the
+    /// characters typed: the write path canonicalises what it is given, so a lowercase `--entity`
+    /// and an uppercase inference are one join key by the time either is stored. Keeping both would
+    /// put that key in the record twice, once as a fact and once as a guess about the same fact.
+    #[test]
+    fn a_stated_reference_wins_over_the_same_one_inferred() {
+        let extractor = shipped();
+        for stated in ["ticket:PROJ-42", "ticket:proj-42"] {
+            let cli = about(
+                "reopened ticket PROJ-42 this morning",
+                &["--entity", stated],
+            );
+            let built = built_with(&cli, &extractor);
+
+            assert_eq!(built.entities.len(), 1, "{stated}: {:?}", built.entities);
+            let kept = &built.entities[0];
+            assert_eq!(kept.id, stated["ticket:".len()..], "the stated spelling");
+            assert_eq!(kept.role, yaam_contract::entity::Role::Primary, "{stated}");
+            assert!((kept.confidence - extract::FIELD_CONFIDENCE).abs() < f32::EPSILON);
+        }
+    }
+
+    /// An entity the prose supports and the caller did not state is kept beside the stated ones.
+    #[test]
+    fn an_inferred_reference_joins_the_stated_ones_rather_than_replacing_them() {
+        let cli = about(
+            "filed issue PROJ-42 after the api rollout",
+            &["--entity", "deploy:api/staging#1146"],
+        );
+        let built = built_with(&cli, &shipped());
+
+        // Stated first, in the order the caller gave them, then what the prose supports. One order,
+        // fixed by where a reference came from rather than by what it is, so two runs agree.
+        let listed: Vec<&str> = built.entities.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(listed, ["api/staging#1146", "PROJ-42"]);
+    }
+
+    /// Without the flag the record is the one this always wrote, byte for byte.
+    ///
+    /// The flag adds references and touches nothing else, which is what an existing caller is
+    /// entitled to. Compared as the serialised line rather than field by field, because that line is
+    /// what the socket receives; the identifier is the one field a second call cannot repeat, so it
+    /// is carried across rather than compared.
+    #[test]
+    fn the_default_path_is_the_record_this_always_wrote() {
+        let cli = about(
+            "filed issue PROJ-42 after the api rollout",
+            &["--entity", "deploy:api/staging#1146"],
+        );
+        let place = settings(PathBuf::from("/nowhere"));
+
+        let plain = record(&place, &cli.args, None, 1_787_217_242_117).expect("built");
+        assert_eq!(
+            plain.entities.len(),
+            1,
+            "prose the shipped rules would anchor, and no flag asking them to: {:?}",
+            plain.entities
+        );
+
+        let mut inferring =
+            record(&place, &cli.args, Some(&shipped()), 1_787_217_242_117).expect("built");
+        assert_eq!(inferring.entities.len(), 2, "{:?}", inferring.entities);
+        inferring.record_id = plain.record_id.clone();
+        inferring.entities.truncate(plain.entities.len());
+        assert_eq!(
+            serde_json::to_vec(&plain).expect("serialised"),
+            serde_json::to_vec(&inferring).expect("serialised"),
+            "the flag changed something other than the references it added"
+        );
+    }
+
+    /// A spec directory that cannot be used stops the command, and says which flag named it.
+    ///
+    /// A configuration failure rather than a quiet nothing, and it stops a dry run too: the flag is
+    /// a request, and a caller that asked for inference and got a record without it would have no
+    /// way to find out. The half-configured directory is the case that settles the wording — kinds
+    /// with no rules beside them is a spec that loads and infers nothing at all.
+    #[test]
+    fn a_spec_directory_that_cannot_be_used_stops_the_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(ENTITIES_FILE), "version: 1\nkinds: {}\n").expect("written");
+
+        let mut out = Vec::new();
+        for spec in [dir.path().join("nonesuch"), dir.path().to_path_buf()] {
+            let cli = about(
+                "closing ticket PROJ-42",
+                &[
+                    "--dry-run",
+                    "--infer-entities",
+                    spec.to_str().expect("utf-8"),
+                ],
+            );
+            let error = emit(&settings(PathBuf::from("/nowhere")), &cli.args, &mut out)
+                .expect_err("a spec directory this cannot infer from");
+            assert_eq!(error.exit(), Exit::Config, "{error}");
+            assert!(error.to_string().contains("--infer-entities"), "{error}");
+        }
+        assert!(out.is_empty(), "nothing was built, so nothing is printed");
+    }
+
+    /// The shipped rules, reached through the flag exactly as a caller would reach them.
+    ///
+    /// Precision is measured over the labelled corpus in `yaam-contract`, and this is the same
+    /// claim carried one layer up: what an emitted record ends up holding is what those rules
+    /// support and nothing the emitter added of its own.
+    #[test]
+    fn the_flag_loads_the_rules_the_workspace_ships() {
+        let spec = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec");
+        let loaded = extractor(&spec).expect("the shipped spec loads");
+        assert_eq!(
+            loaded.from_text("reopened ticket PROJ-42 this morning")[0].id,
+            "PROJ-42"
+        );
     }
 
     /// A record the contract itself refuses never reaches a socket, and the reason names the field.

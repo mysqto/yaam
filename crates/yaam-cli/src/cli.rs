@@ -118,6 +118,12 @@ pub struct AgentArgs {
 /// posting to the service directly would need the service's own key and would lose the spool with
 /// it, which is the difference between a record that waits out an outage and one that is gone.
 ///
+/// `--infer-entities` is the one flag that names a directory, and it is not a store root by another
+/// name. A root is where records, key material and the index are, and the only thing a process does
+/// with one is open it; this reads two configuration files, `entities.yaml` and `extractors.yaml`,
+/// and nothing here could turn the directory holding them into a store. They are configuration a
+/// deployment hands its caller hosts, the way it hands the sidecar an upstream.
+///
 /// Subjects stay empty and the data class stays `internal`. What a subject *is* — how a person
 /// becomes a pseudonym, and under whose canonicalisation — is still an open decision, and a flag
 /// inviting one would let a caller declare a record erasable that this deployment cannot erase.
@@ -178,9 +184,24 @@ pub struct EmitArgs {
     ///
     /// Recorded as a primary reference at full confidence, because a caller naming an entity is
     /// stating a fact rather than inferring one. The other roles and every confidence below `1.0`
-    /// describe references *inferred* from prose, which are the extractor's to produce.
+    /// describe references *inferred* from prose, which `--infer-entities` produces.
     #[arg(long = "entity", value_name = "KIND:ID")]
     pub entities: Vec<String>,
+    /// Also read `--summary` for entity references, using the rules in this spec directory.
+    ///
+    /// The directory holds `entities.yaml` and `extractors.yaml`: the first says what an identifier
+    /// *is*, the second when prose is evidence that one was meant. Both are read, neither is
+    /// written, and nothing else in the directory is touched — see [`EmitCli`] for why that is still
+    /// not a store.
+    ///
+    /// Opt-in, and a flag rather than a variable: what it adds are guesses about the caller's own
+    /// prose, so the decision belongs at the call site that knows what that prose is. An exported
+    /// variable would switch it on for every record every process on the host writes.
+    ///
+    /// What it infers is `related` at a confidence below `1.0`, which is what keeps it apart from a
+    /// stated `--entity`. Where the two name one entity, the stated one is what is recorded.
+    #[arg(long, value_name = "SPEC_DIR")]
+    pub infer_entities: Option<PathBuf>,
     /// A free tag. Repeat for several.
     #[arg(long = "tag", value_name = "TAG")]
     pub tags: Vec<String>,
