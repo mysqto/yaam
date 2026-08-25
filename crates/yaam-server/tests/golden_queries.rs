@@ -209,6 +209,26 @@ const FIXTURES: &[Fixture] = &[
         subject: None,
     },
     Fixture {
+        // A decline that names the ticket the deploys also name. Without a shared reference the
+        // flagship cross-bot question -- a decline and a related deploy in one window -- has nothing
+        // to join on, and the golden set could not state it at all.
+        label: "transact_declined_on_ticket",
+        agent: "ledger_bot",
+        received_at: "2026-08-20T09:15:00Z",
+        action: "transact",
+        outcome: Outcome::Declined,
+        attrs: &[
+            ("provider", Attr::Text("gateway_two")),
+            ("decline_code", Attr::Text("do_not_honour")),
+            ("currency", Attr::Text("XTS")),
+        ],
+        entities: &[("order_ref", "ord10014733"), ("ticket", "PROJ-42")],
+        visibility: Visibility::Org,
+        team: None,
+        body: "The counterparty declined between the staging deploy and the production one.",
+        subject: None,
+    },
+    Fixture {
         label: "transact_failed",
         agent: "ledger_bot",
         received_at: "2026-08-20T11:30:00Z",
@@ -383,6 +403,45 @@ const RECENTLY: (&str, &str) = ("2026-08-20T00:00:00Z", "2026-08-21T00:00:00Z");
 
 /// The golden set. Add a question by adding a row.
 const GOLDEN: &[Case] = &[
+    // ---- the flagship cross-bot question, in the two reads it actually takes ----
+    //
+    // "Refund failures in the last week where the gateway declined AND a related PR was deployed in
+    // the same window." No single read answers it: `/records` takes a window and no entity, and
+    // `/entities` takes an entity and no window. So it is asked as two reads and intersected by
+    // whoever asked -- and both halves are golden, because a question answered by hand is still a
+    // question the store has to be able to answer.
+    Case {
+        question: "which gateway declines happened in the window (half one)",
+        ask: Ask::Ordered("/records?action=transact&outcome=declined&from_ms={from}&to_ms={to}"),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        finds: &["transact_declined", "transact_declined_on_ticket"],
+        needs: &[Needs::Field("outcome", "declined")],
+    },
+    Case {
+        question: "which deploys happened in the same window (half two)",
+        ask: Ask::Ordered("/records?action=deploy&from_ms={from}&to_ms={to}"),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        finds: &["promote_ok", "deploy_partial", "deploy_failed", "deploy_ok"],
+        needs: &[Needs::Field("action", "deploy")],
+    },
+    // What the intersection is *for*: the reference both sides carry. This is the read that makes the
+    // correlation a fact about the store rather than an arithmetic the operator did -- and it is the
+    // read a windowed entity history would turn the whole question into.
+    Case {
+        question: "what deployed around the decline raised under this ticket",
+        ask: Ask::Ordered("/entities/ticket/PROJ-42"),
+        window: None,
+        agent: "ops_bot",
+        finds: &[
+            "deploy_failed",
+            "transact_declined_on_ticket",
+            "deploy_ok",
+            "deploy_stale",
+        ],
+        needs: &[Needs::Entity("ticket:PROJ-42")],
+    },
     // ---- find by action and outcome: "what failed recently" ----
     Case {
         question: "which deploys failed recently",
@@ -413,6 +472,18 @@ const GOLDEN: &[Case] = &[
         ask: Ask::Ordered("/records?action=transact&outcome=declined"),
         window: None,
         agent: "ops_bot",
+        finds: &["transact_declined", "transact_declined_on_ticket"],
+        // `needs` holds every returned record to the same claim, so a question spanning two
+        // providers can only assert what both carry. The decline codes are asserted by the narrower
+        // question below, which is where an attribute assertion belongs anyway: on a read that
+        // selected for it.
+        needs: &[Needs::Field("outcome", "declined")],
+    },
+    Case {
+        question: "which transactions one gateway declined, and with which code",
+        ask: Ask::Ordered("/records?action=transact&outcome=declined&attr=provider%3Dgateway_one"),
+        window: None,
+        agent: "ops_bot",
         finds: &["transact_declined"],
         needs: &[
             Needs::Field("outcome", "declined"),
@@ -440,7 +511,12 @@ const GOLDEN: &[Case] = &[
         ask: Ask::Ordered("/entities/ticket/PROJ-42"),
         window: None,
         agent: "ops_bot",
-        finds: &["deploy_failed", "deploy_ok", "deploy_stale"],
+        finds: &[
+            "deploy_failed",
+            "transact_declined_on_ticket",
+            "deploy_ok",
+            "deploy_stale",
+        ],
         needs: &[Needs::Entity("ticket:PROJ-42")],
     },
     Case {
@@ -483,7 +559,15 @@ const GOLDEN: &[Case] = &[
         ask: Ask::Unordered("/bundle?entity=ticket:PROJ-42"),
         window: None,
         agent: "ops_bot",
-        finds: &["deploy_failed", "deploy_ok", "deploy_stale"],
+        // The decline belongs here as much as the deploys do, and that it arrives without being
+        // asked for is the point of a bundle: an agent handed this ticket is handed the decline
+        // raised under it, having named only the ticket.
+        finds: &[
+            "deploy_failed",
+            "deploy_ok",
+            "deploy_stale",
+            "transact_declined_on_ticket",
+        ],
         needs: &[Needs::Entity("ticket:PROJ-42")],
     },
     // ---- find by actor over a time window ----
@@ -500,7 +584,12 @@ const GOLDEN: &[Case] = &[
         ask: Ask::Ordered("/records?agent=ledger_bot&from_ms={from}&to_ms={to}"),
         window: Some(RECENTLY),
         agent: "ops_bot",
-        finds: &["lookup_sealed", "transact_failed", "transact_declined"],
+        finds: &[
+            "lookup_sealed",
+            "transact_failed",
+            "transact_declined",
+            "transact_declined_on_ticket",
+        ],
         needs: &[Needs::Field("agent", "ledger_bot")],
     },
     // Another agent reviewed inside the same window, so the answer is the agent's reviews rather
