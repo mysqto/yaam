@@ -60,7 +60,10 @@ Five binaries, one crate, one configuration type. `--root` names the memory tree
 
 Two of the five open a store and three never do. `yaam-agent`, `yaam-emit` and `yaam-read` run on the
 caller's host and have no `--root` to give them: that is what lets a caller record what it did, and
-read what it remembers, while holding no key material and no path into anyone's memory tree.
+read what it remembers, while holding no key material and no path into anyone's memory tree. The one
+directory a caller-side binary will read is the one `yaam-emit --infer-entities` names, and it reads
+two configuration files out of it — a spec directory is not a store, and nothing in that binary could
+open one.
 
 The service drains fan-out and sweeps every `--maintenance-ms` (30 s by default) *and* once at
 startup, so a process that comes up over an interrupted write converges without waiting an interval
@@ -99,6 +102,11 @@ curl --unix-socket /var/lib/yaam/agent/sockets/agent_a.read.sock \
 export YAAM_SOCKET=/var/lib/yaam/agent/sockets/agent_a.sock YAAM_AGENT=agent_a
 yaam-emit --action deploy --outcome success --summary "rolled the api service out to staging" \
           --attr service=api --attr environment=staging --entity deploy:api/staging#1146 --tag release
+
+# …and the references the prose carries and the caller did not state. Opt-in, and what it adds is
+# `related` below full confidence: a guess stays a guess in the record it lands in.
+yaam-emit --action note --outcome success --summary "closing ticket PROJ-42 after the rollout" \
+          --infer-entities /srv/memory/spec
 
 yaam-emit --action deploy --outcome success --summary "…" --dry-run   # the exact line, no sidecar needed
 
@@ -206,6 +214,7 @@ emitted records for so long.
 | It fills in | It asks for | It will not offer |
 |---|---|---|
 | `record_id`, `at`, `received_at`, `schema_ver`, `backfilled`, the empty collections | `--agent`, `--action`, `--outcome`, `--summary`, and repeatable `--attr`, `--attr-int`, `--attr-bool`, `--entity`, `--tag` | a subject, a data class, or a store |
+| the references the prose carries, on `--infer-entities` | | |
 
 Three attribute flags rather than one that guesses: the type each key is declared with lives in the
 deployment's `spec/attrs-schema.yaml`, which a caller cannot read, and a build number that happens to
@@ -224,6 +233,31 @@ happened.
 yaam-emit --action deploy --outcome success --summary "…" \
           --at 2023-05-01T12:00:00Z --backfilled   # stored in 2023, not today
 ```
+
+`--entity` is the caller stating a fact, and is recorded as a *primary* reference at confidence
+`1.0`. Prose holds references too, and a record imported from a source states none at all — it is
+searchable and joined to nothing. `--infer-entities SPEC_DIR` runs the deployment's own
+`spec/extractors.yaml` over `--summary` and adds what it supports, as *related* references below
+`1.0`. The two never become one thing: a read asking for stated references only (`--min-confidence
+1.0`, and a bundle always) does not see the inferred ones, and where the caller stated an entity the
+prose also names, the stated reference is the one that is recorded.
+
+Opt-in, and a flag rather than an environment variable, because an inferred reference is a join key
+with a guess behind it: the decision belongs to the call that knows what its prose is, and an
+exported variable would make it for every record on the host. The bar the rules are held to is
+precision rather than recall — a reference inferred wrongly is a wrong answer to every question that
+touches it, silently — and the number is measured against a labelled corpus in CI.
+
+```bash
+yaam-emit --action note --outcome success \
+          --summary "closing ticket PROJ-42 after the api rollout" \
+          --infer-entities /srv/memory/spec   # ticket:PROJ-42, related, 0.7
+```
+
+The directory it names is a spec directory, holding `entities.yaml` and `extractors.yaml`. It is not
+a store root by another name: those two files are configuration a deployment distributes to its
+caller hosts, the emitter reads them and nothing else, and there is no code in it that could open a
+memory tree.
 
 `--redaction-policy` defaults to `default-v1` and must name the policy the deployment *applies* — the
 `policy:` field of its `spec/redaction/*.yaml`. The service refuses any other, because a record

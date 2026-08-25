@@ -314,6 +314,85 @@ fn a_backfilled_record_is_stored_and_read_back_at_the_instant_it_happened() {
     service.stop();
 }
 
+/// A record whose only reference is in its prose, and the entity it names finds it afterwards.
+///
+/// The whole of what `--infer-entities` is for, and it is only true end to end: the emitter reads the
+/// prose, the service canonicalises what it is sent, and the index is what a later read joins on. A
+/// record imported from a source states no entity, so without this it is searchable and joined to
+/// nothing — findable only by somebody who already knew the words in it.
+///
+/// The second half is the part that matters as much: the reference is still legibly a guess. Asked
+/// for only what a structured field stated, the same entity does not return it, and a bundle — which
+/// takes nothing below full confidence, because a guess a caller cannot tell from a fact is worse
+/// than a gap — does not either. That boundary is deliberate, and pinning it here is what stops a
+/// later change from quietly moving it.
+#[test]
+fn a_reference_only_the_prose_carries_is_stored_and_joined_on() {
+    let deployment = Deployment::new();
+    let mut service = Service::start(&deployment);
+    let (socket, mut agent) = sidecar(
+        &deployment,
+        "agent",
+        &format!("http://{}", service.address),
+        &service.sealing_public_key,
+    );
+    let env = hook_env(&socket);
+    let spec = deployment.root().join("spec");
+
+    let emitted = yaam_emit(
+        &[
+            "--action",
+            "deploy",
+            "--outcome",
+            "success",
+            "--summary",
+            "rolled the api service out to staging, closing ticket PROJ-42",
+            "--attr",
+            "service=api",
+            "--attr",
+            "environment=staging",
+            "--attr",
+            "build=1146",
+            "--infer-entities",
+            spec.to_str().expect("utf-8"),
+        ],
+        &as_pairs(&env),
+    );
+    assert_accepted("a record whose reference is in its prose", &emitted);
+    let id = accepted_id(&emitted);
+
+    let reads = read_socket(&socket);
+    let history = answered(&reads, &["history", "--entity", "ticket:PROJ-42"]);
+    let found = history["records"].as_array().expect("records");
+    assert_eq!(found.len(), 1, "{history}");
+    assert_eq!(found[0]["record_id"], id, "{history}");
+
+    // The same entity, asked for stated references only.
+    let stated = answered(
+        &reads,
+        &[
+            "history",
+            "--entity",
+            "ticket:PROJ-42",
+            "--min-confidence",
+            "1.0",
+        ],
+    );
+    assert!(
+        stated["records"].as_array().expect("records").is_empty(),
+        "an inferred reference answered a question about stated ones: {stated}"
+    );
+
+    let bundle = answered(&reads, &["bundle", "--entity", "ticket:PROJ-42"]);
+    assert!(
+        bundle["records"].as_array().expect("records").is_empty(),
+        "a guess reached a bundle, where a caller cannot tell it from a fact: {bundle}"
+    );
+
+    terminate(&mut agent, "yaam-agent");
+    service.stop();
+}
+
 /// A timestamp the record cannot honestly carry is refused by the command line itself.
 ///
 /// No deployment, and `--dry-run` so no socket either: each of these is a refusal the emitter owes
