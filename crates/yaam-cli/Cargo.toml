@@ -61,6 +61,10 @@ yaam-agent = { path = "../yaam-agent" }
 yaam-contract = { path = "../yaam-contract" }
 yaam-core = { path = "../yaam-core" }
 yaam-crypto = { path = "../yaam-crypto" }
+# The knowledge tree is offered by the operator command line rather than by the service, because it
+# is derived from the Markdown records and nothing else: a rebuild reads no index row and holds no
+# key, so it is still available on a store whose index is the thing that is broken.
+yaam-knowledge = { path = "../yaam-knowledge" }
 yaam-server = { path = "../yaam-server" }
 yaam-store = { path = "../yaam-store" }
 # Argument parsing only: no colour or suggestion machinery, which is most of clap's dependency tree.

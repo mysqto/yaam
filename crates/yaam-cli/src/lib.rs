@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `yaam-server` | The HTTP service, plus the maintenance its store needs. |
 //! | `yaam-agent` | The local sidecar: two sockets per caller, sealing and signing on their behalf. |
-//! | `yaam` | The operator command line: rebuild, drain, erase, verify, back up, restore, read health, guard a commit. |
+//! | `yaam` | The operator command line: rebuild, drain, erase, verify, back up, restore, read health, guard a commit, derive knowledge. |
 //! | `yaam-emit` | One record, built from arguments and written to a caller socket. |
 //! | `yaam-read` | One read, sent to a caller read socket; the service's answer, unchanged. |
 //!
@@ -37,7 +37,7 @@
 //! Not here. Every judgement these binaries appear to make is a library call:
 //! [`yaam_core::reindex::reindex_all`], [`yaam_core::drain`], [`yaam_core::erase`],
 //! [`yaam_core::backup`], [`yaam_core::backup::excluded_paths`] behind [`guard`],
-//! [`yaam_core::health::check`], [`yaam_agent::listener::serve_until`],
+//! [`yaam_core::health::check`], [`yaam_knowledge::rebuild`], [`yaam_agent::listener::serve_until`],
 //! [`yaam_server::routes::router`]. What is here is argument parsing, refusals that belong before
 //! anything starts, signal handling, rendering and exit codes.
 
@@ -52,6 +52,7 @@ pub mod exit;
 pub mod guard;
 pub mod infer;
 pub mod keyring;
+pub mod knowledge;
 pub mod ops;
 pub mod read;
 pub mod server;
@@ -221,6 +222,15 @@ fn run_operator(cli: &OperatorCli, env: &Env, out: &mut dyn Write) -> Result<Exi
         let settings = StoreSettings::resolve_destination(&cli.store, env)?;
         return guard::guard_commit(&settings.paths, &subject, out);
     }
+    // Knowledge returns before one is opened because it needs none. It is derived from the Markdown
+    // records and the cold manifests alone — no index row, no key, no queue — so opening a pipeline
+    // here would put a build behind a failure it does not depend on, on exactly the store where a
+    // build is most worth having. The strict resolve still applies: a root carrying no `spec/` is a
+    // directory whose records would be an empty tree rather than a store with nothing in it.
+    if let Command::Knowledge { what } = &cli.command {
+        let settings = StoreSettings::resolve(&cli.store, env)?;
+        return knowledge::run(&settings.paths.root, what, out);
+    }
 
     let settings = StoreSettings::resolve(&cli.store, env)?;
     let mut pipeline = settings.open()?;
@@ -236,8 +246,8 @@ fn run_operator(cli: &OperatorCli, env: &Env, out: &mut dyn Write) -> Result<Exi
         Command::VerifyErasure { tombstone } => ops::verify_erasure(&mut pipeline, tombstone, out),
         Command::Check => ops::check(&pipeline, out),
         Command::Backup { to } => ops::backup(&pipeline, to, out),
-        Command::Restore { .. } | Command::GuardCommit { .. } => {
-            unreachable!("both return before the store is opened")
+        Command::Restore { .. } | Command::GuardCommit { .. } | Command::Knowledge { .. } => {
+            unreachable!("all three return before the store is opened")
         }
     }
 }
@@ -371,6 +381,44 @@ mod tests {
             Exit::Ok.code()
         );
         assert!(String::from_utf8_lossy(&out).contains("index drift        0"));
+    }
+
+    /// A knowledge build runs over a store whose index has never existed.
+    ///
+    /// The reason these commands return before the pipeline is opened, asserted where it can
+    /// actually fail: the tree here carries a `spec/` and nothing else, so a build that had gone
+    /// through the open would have had to create an index it never reads.
+    #[test]
+    fn a_knowledge_build_runs_without_an_index_and_a_read_follows_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec");
+        crate::fixtures::copy_dir(&spec, &dir.path().join("spec"));
+        let root = dir.path().to_str().expect("utf-8 path");
+
+        let mut out = Vec::new();
+        assert_eq!(
+            operator(
+                ["yaam", "--root", root, "knowledge", "build"],
+                &Env::default(),
+                &mut out
+            ),
+            Exit::Ok.code()
+        );
+        let printed = String::from_utf8_lossy(&out).into_owned();
+        assert!(printed.contains("records read        0"), "{printed}");
+        assert!(!dir.path().join("index.sqlite").exists(), "{printed}");
+
+        // And the build is what makes the read answer at all: before one, there is no state to read.
+        let mut out = Vec::new();
+        assert_eq!(
+            operator(
+                ["yaam", "--root", root, "knowledge", "status"],
+                &Env::default(),
+                &mut out
+            ),
+            Exit::Ok.code()
+        );
+        assert!(String::from_utf8_lossy(&out).contains("records read        0"));
     }
 
     /// The root can come from the environment instead of a flag.

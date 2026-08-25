@@ -1574,6 +1574,7 @@ dependencies = [
  "yaam-contract",
  "yaam-core",
  "yaam-crypto",
+ "yaam-knowledge",
  "yaam-md",
  "yaam-server",
  "yaam-store",
@@ -1632,6 +1633,20 @@ dependencies = [
  "x25519-dalek",
  "yaam-contract",
  "zeroize",
+]
+
+[[package]]
+name = "yaam-knowledge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "yaam-contract",
+ "yaam-core",
+ "yaam-crypto",
+ "yaam-md",
 ]
 
 [[package]]

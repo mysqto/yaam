@@ -165,6 +165,15 @@ pub const MANIFEST: &[Entry] = &[
                  deleted by the rebuild a restore ends in. Fan-out writes them again from the tree",
     },
     Entry {
+        name: layout::KNOWLEDGE_DIR,
+        disposition: Disposition::Excluded,
+        reason: "notes derived from record structure, reproduced wholesale from the record tree by \
+                 `yaam knowledge build`. Unlike a timeline its absence announces itself — `yaam \
+                 knowledge status` reports that no build has completed — so a restore is not left \
+                 owing a rebuild nobody can see is missing. Carrying a copy would also carry facts \
+                 aggregated out of records the restored tree no longer holds",
+    },
+    Entry {
         name: layout::INDEX_FILE,
         disposition: Disposition::Excluded,
         reason: "derived, and disposable by design. A restore rebuilds it, which is cheaper than \
@@ -774,14 +783,19 @@ mod tests {
         let mut harness = Harness::new();
         let subject = testkit::subject('b');
         seal_one(&mut harness, &subject);
-        // Something in every excluded place: a quarantined copy, a staged copy, a set-aside one.
+        // Something in every excluded place: a quarantined copy, a staged copy, a set-aside one, a
+        // note. The knowledge tree is written by `yaam-knowledge` and by nothing in this crate, so
+        // the directory is made here rather than found — what is asserted below is that a copy does
+        // not take it, and that holds whatever the file inside it says.
         for dir in [
             layout::QUARANTINE_DIR,
             layout::STAGING_DIR,
             layout::DEAD_LETTER_DIR,
+            layout::KNOWLEDGE_DIR,
         ] {
-            std::fs::write(harness.root().join(dir).join("held.md"), "---\n---\nx\n")
-                .expect("a file to leave behind");
+            let held = harness.root().join(dir);
+            std::fs::create_dir_all(&held).expect("a directory to leave behind");
+            std::fs::write(held.join("held.md"), "---\n---\nx\n").expect("a file to leave behind");
         }
 
         let drill = Drill::new();

@@ -1110,17 +1110,17 @@ mod tests {
 
     /// The shipped rules, on a bare identifier with nothing vouching for it.
     ///
-    /// `PAY-2087` unanchored is the whole point: `from_text` reads it as prose and returns nothing,
+    /// `PROJ-2087` unanchored is the whole point: `from_text` reads it as prose and returns nothing,
     /// because a tracker key is exactly the shape a standards name has.
     #[test]
     fn the_shipped_rules_read_a_bare_identifier() {
-        assert!(shipped().from_text("PAY-2087").is_empty());
+        assert!(shipped().from_text("PROJ-2087").is_empty());
         let asked: Vec<String> = shipped()
-            .from_query("PAY-2087")
+            .from_query("PROJ-2087")
             .into_iter()
             .map(|entity| format!("{}:{}", entity.kind, entity.id))
             .collect();
-        assert!(asked.contains(&"ticket:PAY-2087".to_owned()), "{asked:?}");
+        assert!(asked.contains(&"ticket:PROJ-2087".to_owned()), "{asked:?}");
     }
 
     #[test]

@@ -649,13 +649,106 @@ pub enum Command {
         #[arg(long = "from", value_name = "PATH")]
         from: PathBuf,
     },
+    /// Derive knowledge from the record tree, and read what was derived.
+    ///
+    /// A second tree beside the records, holding what is *true* rather than what happened: one note
+    /// per entity, every line a restatement of a structured field some record declared, carrying the
+    /// identifiers of the records it was read out of. Derived and disposable — delete `knowledge/`
+    /// and build it again.
+    ///
+    /// Nothing here reads a body, and that is a property of the input rather than a rule each
+    /// command has to remember: derivation is handed a record's frontmatter, which has no field for
+    /// prose. It is also why a record whose body is erasable contributes nothing at all — a note is
+    /// an aggregate, and destroying a key cannot reach an aggregate already written into last
+    /// night's backup.
+    ///
+    /// Opens no index and no key store, unlike every other command that names a store. A rebuild
+    /// reads the Markdown tree and the cold manifests, so it is available on a store whose index is
+    /// the thing that is broken.
+    Knowledge {
+        /// Build it, or read what a build left.
+        #[command(subcommand)]
+        what: KnowledgeCommand,
+    },
+}
+
+/// Most notes one listing may print before the cap decides.
+///
+/// A default rather than a required flag, because an operator looking for a spelling should not have
+/// to choose a page size first. It is named here so `--help` prints the figure — a cap nobody can
+/// see is a short answer that reads as an empty tree.
+const SEARCH_LIMIT: usize = 20;
+
+/// Building the knowledge tree, and the three reads over it.
+///
+/// Subcommands rather than flags on one, for the reason the reads are subcommands: `--entity` names
+/// exactly one entity and `--query` names none, `--record` is meaningful only where a fact's
+/// provenance is being checked, and a build takes nothing at all. Flattened together, `--help` would
+/// describe a surface where every one of those was optional and the wrong combinations were quietly
+/// ignored.
+#[derive(Debug, Subcommand)]
+pub enum KnowledgeCommand {
+    /// Rebuild every note from the record tree.
+    ///
+    /// Wholesale, and there is no incremental one to ask for: a note's counts and bounds are
+    /// aggregates, and one record's contribution cannot be taken back out of a count already
+    /// written. So each build is a statement about the tree as it now stands, and a record that has
+    /// left it — or a body that has been erased — is gone from knowledge without anything chasing
+    /// it.
+    ///
+    /// Exits `4` for a source that would not parse or a stamp that would not, because those are
+    /// drift between the tree and what can be derived from it. Excluded erasable and scoped records
+    /// are counted and are not a fault: they are what the gate is for.
+    Build,
+    /// Report what the last build read, and when.
+    ///
+    /// Exits `4` when there is no answer, which is a definite state rather than a missing one: the
+    /// state file is removed before a build swaps its tree in and written after, so its absence says
+    /// this tree is mid-build or has never been built. Either way the remedy is to build it.
+    Status,
+    /// Print one entity's note.
+    Note {
+        /// The entity, as `kind:id`.
+        ///
+        /// As the tree spells it. Identifiers are canonicalised on the way in and nothing here
+        /// canonicalises again — a second canonicaliser would eventually disagree with the one the
+        /// tree was written by — so a spelling this store never stored finds nothing. `knowledge
+        /// search` is how to find the spelling.
+        #[arg(long, value_name = "KIND:ID")]
+        entity: String,
+    },
+    /// List the notes whose scalars carry a term.
+    Search {
+        /// The term, matched as a substring and case-insensitively.
+        #[arg(long, value_name = "TERM")]
+        query: String,
+        /// Most notes to list.
+        #[arg(long, value_name = "N", default_value_t = SEARCH_LIMIT)]
+        limit: usize,
+    },
+    /// Print the structure of the records behind a fact.
+    ///
+    /// The identifiers a note lists per fact, resolved back to the frontmatter they were read out
+    /// of, so a fact can be checked against its evidence. Never a body: the structure has no field
+    /// for prose, which is what makes checking one free of reading anybody's data.
+    ///
+    /// Every candidate goes back through the gate that admitted the fact, so an identifier naming a
+    /// record the derivation would not have used is not answered. Otherwise this would be a way to
+    /// read a scoped record's structure by guessing its identifier.
+    Evidence {
+        /// A record identifier. Repeat for several.
+        #[arg(long = "record", value_name = "ID", required = true)]
+        records: Vec<String>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::{CommandFactory, Parser};
 
-    use super::{AgentCli, Command, EmitCli, OperatorCli, ReadCli, ServerCli};
+    use super::{AgentCli, Command, EmitCli, KnowledgeCommand, OperatorCli, ReadCli, ServerCli};
     use crate::exit::Exit;
 
     /// The codes are only an interface if they are published where a reader looks.
@@ -748,6 +841,53 @@ mod tests {
             .expect_err("a full-text read takes no filters");
         ReadCli::try_parse_from(["yaam-read", "bundle", "--query", "x"])
             .expect_err("a bundle has no needle");
+    }
+
+    /// Each knowledge command demands what only it needs, and the group defaults to nothing.
+    ///
+    /// A default would be the wrong one either way round: `knowledge` defaulting to a build would
+    /// rewrite a tree somebody meant to read, and defaulting to a read would answer out of a tree
+    /// nobody had built.
+    #[test]
+    fn every_knowledge_command_is_its_own_subcommand_with_its_own_requirements() {
+        OperatorCli::try_parse_from(["yaam", "knowledge"])
+            .expect_err("no default: one of these writes the tree the others read");
+        OperatorCli::try_parse_from(["yaam", "knowledge", "build"]).expect("a build takes nothing");
+        OperatorCli::try_parse_from(["yaam", "knowledge", "status"]).expect("nor does a status");
+        OperatorCli::try_parse_from(["yaam", "knowledge", "note"])
+            .expect_err("a note has to name the entity it is about");
+        OperatorCli::try_parse_from(["yaam", "knowledge", "note", "--entity", "ticket:PROJ-42"])
+            .expect("parsed");
+        OperatorCli::try_parse_from(["yaam", "knowledge", "search"])
+            .expect_err("a search for nothing is not a search for everything");
+        OperatorCli::try_parse_from(["yaam", "knowledge", "search", "--query", "staging"])
+            .expect("the cap has a default, so a listing needs only its term");
+        OperatorCli::try_parse_from(["yaam", "knowledge", "evidence"])
+            .expect_err("evidence for no record is not evidence for every record");
+        OperatorCli::try_parse_from([
+            "yaam",
+            "knowledge",
+            "evidence",
+            "--record",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ])
+        .expect("parsed");
+    }
+
+    /// The store flags sit above the subcommands, so `knowledge` inherits `--root` and has to: it
+    /// derives from the record tree, and a tree it could not be pointed at would derive nothing.
+    #[test]
+    fn a_knowledge_command_takes_the_root_the_other_operator_commands_take() {
+        let cli =
+            OperatorCli::try_parse_from(["yaam", "--root", "/srv/memory", "knowledge", "build"])
+                .expect("parsed");
+        assert_eq!(cli.store.root.as_deref(), Some(Path::new("/srv/memory")));
+        assert!(matches!(
+            cli.command,
+            Command::Knowledge {
+                what: KnowledgeCommand::Build
+            }
+        ));
     }
 
     /// The decision that stays open has to stay open in the argument surface too. A `--subject`

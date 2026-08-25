@@ -20,6 +20,13 @@ pub(crate) const OWNER_DIR: &str = "owner";
 pub(crate) const ENTITIES_DIR: &str = "entities";
 /// Audit records fan-out writes.
 pub(crate) const AUDIT_DIR: &str = "audit";
+/// Notes derived from record structure. Written by `yaam-knowledge`, not by anything here.
+///
+/// Named anyway, because [`crate::backup`] classifies every entry under the root and an entry it
+/// cannot classify is reported to an operator as a decision nobody made. Nothing in this crate reads
+/// or writes it, so the spelling is held to `yaam_knowledge`'s own by a test in `yaam-cli` — the one
+/// crate that sees both.
+pub(crate) const KNOWLEDGE_DIR: &str = "knowledge";
 /// Manifests of archived records, still indexable.
 pub(crate) const COLD_DIR: &str = "cold";
 /// Root of the key store.

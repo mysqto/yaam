@@ -460,15 +460,18 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
 }
 
 /// One `label  count` line of a report, aligned so a column of numbers reads as one.
-fn line(text: &mut String, label: &str, count: usize) {
+///
+/// Shared with [`crate::knowledge`], whose reports are read beside these: two alignments would put
+/// two column widths in one operator's scrollback.
+pub(crate) fn line(text: &mut String, label: &str, count: usize) {
     let _ = writeln!(text, "  {label:<20}{count}");
 }
 
 /// Writes the finished report.
 ///
 /// The one failure path, and it is a broken pipe: the reader has gone away, and there is nobody left
-/// to tell about it.
-fn emit(out: &mut dyn Write, text: &str) -> Result<()> {
+/// to tell about it. Shared with [`crate::knowledge`] so there is one of it rather than two.
+pub(crate) fn emit(out: &mut dyn Write, text: &str) -> Result<()> {
     out.write_all(text.as_bytes())
         .map_err(|error| failed("writing the report", &error))
 }
