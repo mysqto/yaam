@@ -74,7 +74,7 @@ fn a_record_written_through_the_service_is_queryable_bundled_and_then_erasable()
     assert_eq!(
         read_ids(
             &service
-                .entity(&writer, "ticket", "PROJ-42", 1.0, None)
+                .entity(&writer, "ticket", "PROJ-42", 1.0, None, None)
                 .expect("entity")
         ),
         vec![id.clone()]
@@ -179,7 +179,7 @@ fn a_read_canonicalises_its_identifier_rather_than_answering_nothing() {
     assert_eq!(
         read_ids(
             &service
-                .entity(&writer, "ticket", "  proj-42 ", 1.0, None)
+                .entity(&writer, "ticket", "  proj-42 ", 1.0, None, None)
                 .expect("entity")
         ),
         vec![id.clone()]
@@ -206,7 +206,7 @@ fn a_read_the_deployment_cannot_canonicalise_is_refused_rather_than_answered_emp
     for (kind, id) in [("ticket", "not a ticket"), ("no_such_kind", "PROJ-42")] {
         let error = tree
             .service
-            .entity(&reader, kind, id, 0.0, None)
+            .entity(&reader, kind, id, 0.0, None, None)
             .expect_err("an unaskable entity read");
         assert_eq!(
             error.status(),

@@ -426,9 +426,20 @@ const GOLDEN: &[Case] = &[
         finds: &["promote_ok", "deploy_partial", "deploy_failed", "deploy_ok"],
         needs: &[Needs::Field("action", "deploy")],
     },
+    // And now it is one read. `/entities` takes the window `/records` always had, so the flagship
+    // question -- this entity, this window -- is a single signed request. `deploy_stale` is the
+    // assertion that matters: it names the same ticket and sits outside the window, so a window that
+    // was accepted and ignored would return it and this row would go red.
+    Case {
+        question: "what touched this ticket inside the window the decline happened in",
+        ask: Ask::Ordered("/entities/ticket/PROJ-42?from_ms={from}&to_ms={to}"),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        finds: &["deploy_failed", "transact_declined_on_ticket", "deploy_ok"],
+        needs: &[Needs::Entity("ticket:PROJ-42")],
+    },
     // What the intersection is *for*: the reference both sides carry. This is the read that makes the
-    // correlation a fact about the store rather than an arithmetic the operator did -- and it is the
-    // read a windowed entity history would turn the whole question into.
+    // correlation a fact about the store rather than an arithmetic the operator did.
     Case {
         question: "what deployed around the decline raised under this ticket",
         ask: Ask::Ordered("/entities/ticket/PROJ-42"),

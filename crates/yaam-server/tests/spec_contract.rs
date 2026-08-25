@@ -27,7 +27,7 @@ use yaam_crypto::envelope;
 use yaam_server::auth::{Caller, Credential, Keyring, Role};
 use yaam_server::routes::{AppState, router};
 use yaam_server::service::Service;
-use yaam_store::query::Filter;
+use yaam_store::query::{Filter, Window};
 
 /// The published contract.
 const SPEC: &str = include_str!("../../../spec/memory.v1.yaml");
@@ -129,6 +129,7 @@ impl Service for Fake {
         _kind: &str,
         _id: &str,
         _min_confidence: f32,
+        _window: Option<Window>,
         _limit: Option<u32>,
     ) -> yaam_server::Result<Vec<RecordStructure>> {
         self.gate()?;

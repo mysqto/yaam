@@ -283,6 +283,27 @@ pub struct EntityQuery {
     /// filtered query follows, for the same reason: a busy entity's history is unbounded, and this
     /// endpoint used to answer with all of it.
     pub limit: Option<u32>,
+    /// Inclusive start of a window over server-stamped time.
+    pub from_ms: Option<i64>,
+    /// Exclusive end of that window.
+    pub to_ms: Option<i64>,
+}
+
+impl EntityQuery {
+    /// The window this asks for, refusing half of one.
+    ///
+    /// Half a window is not a narrower query, it is a different one — the same rule `/records`
+    /// follows, and stated separately rather than shared because the two structs are deserialised
+    /// independently and a shared helper would be one indirection over four lines.
+    fn window(&self) -> Result<Option<Window>> {
+        match (self.from_ms, self.to_ms) {
+            (Some(from_ms), Some(to_ms)) => Ok(Some(Window { from_ms, to_ms })),
+            (None, None) => Ok(None),
+            _ => Err(Error::Unprocessable(
+                "a window needs both `from_ms` and `to_ms`".to_owned(),
+            )),
+        }
+    }
 }
 
 /// What a bundle should cover.
@@ -468,9 +489,13 @@ async fn entity_records(
 ) -> Result<Json<RecordsResponse>> {
     let min_confidence = params.min_confidence.unwrap_or(DEFAULT_MIN_CONFIDENCE);
     let limit = params.limit;
+    // Before the read, not inside it: a half-window is the caller's mistake, and answering it as an
+    // unwindowed history would hand back rows they did not ask for under a `200`.
+    let window = params.window()?;
     let service = state.service();
     let records =
-        blocking(move || service.entity(&caller, &kind, &id, min_confidence, limit)).await?;
+        blocking(move || service.entity(&caller, &kind, &id, min_confidence, window, limit))
+            .await?;
     Ok(Json(RecordsResponse::new(records)))
 }
 
@@ -891,7 +916,10 @@ mod tests {
         assert_eq!(body["records"].as_array().unwrap().len(), 1);
         // Every *reference*, but not every row: an absent `limit` reaches the index as `None`, which
         // is its default cap and not the unbounded read.
-        assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 0 None");
+        assert_eq!(
+            fake.calls()[0],
+            "entity agent-reader ticket T-1 0 None None"
+        );
     }
 
     #[tokio::test]
@@ -931,6 +959,47 @@ mod tests {
         assert!(body["token_estimate"].as_u64().unwrap() > 0);
     }
 
+    /// One entity inside one window, which is what makes a correlation a single read.
+    #[tokio::test]
+    async fn entity_history_takes_a_window() {
+        let fake = Arc::new(Fake::new());
+        let (status, _) = serve(
+            &fake,
+            get("/entities/ticket/T-1?from_ms=1000&to_ms=2000", Some(READER)),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            fake.calls()[0],
+            "entity agent-reader ticket T-1 0 Some(Window { from_ms: 1000, to_ms: 2000 }) None"
+        );
+    }
+
+    /// Half a window is a different question, not a narrower one — so it is refused rather than
+    /// answered as the whole history, which would hand back rows nobody asked for under a `200`.
+    #[tokio::test]
+    async fn entity_history_refuses_half_a_window() {
+        for target in [
+            "/entities/ticket/T-1?from_ms=1000",
+            "/entities/ticket/T-1?to_ms=2000",
+        ] {
+            let fake = Arc::new(Fake::new());
+            let (status, body) = serve(&fake, get(target, Some(READER))).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{target}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("window"),
+                "{target}: {body}"
+            );
+            // Refused before the read, so the service was never asked.
+            assert!(fake.calls().is_empty(), "{target} reached the service");
+        }
+    }
+
     #[tokio::test]
     async fn entity_history_takes_a_confidence_floor() {
         let fake = Arc::new(Fake::new());
@@ -941,7 +1010,10 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 1 None");
+        assert_eq!(
+            fake.calls()[0],
+            "entity agent-reader ticket T-1 1 None None"
+        );
     }
 
     #[tokio::test]
@@ -950,7 +1022,10 @@ mod tests {
         let (status, _) = serve(&fake, get("/entities/ticket/T-1?limit=5", Some(READER))).await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(fake.calls()[0], "entity agent-reader ticket T-1 0 Some(5)");
+        assert_eq!(
+            fake.calls()[0],
+            "entity agent-reader ticket T-1 0 None Some(5)"
+        );
     }
 
     #[tokio::test]

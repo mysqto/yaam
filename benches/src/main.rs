@@ -423,7 +423,7 @@ fn entity_reads(index: &Path, iterations: usize, targets: &Targets) -> Vec<Row> 
             ),
             estimate: "<1 ms",
             timings: measure(index, iterations, |store| {
-                query::by_entity(store, "order_ref", tail_id, 1.0, None, &reader())
+                query::by_entity(store, "order_ref", tail_id, 1.0, None, None, &reader())
                     .expect("by entity")
                     .len()
             }),
@@ -435,7 +435,7 @@ fn entity_reads(index: &Path, iterations: usize, targets: &Targets) -> Vec<Row> 
             ),
             estimate: "—",
             timings: measure(index, iterations / 3, |store| {
-                query::by_entity(store, "order_ref", hot_id, 1.0, None, &reader())
+                query::by_entity(store, "order_ref", hot_id, 1.0, None, None, &reader())
                     .expect("by entity")
                     .len()
             }),
@@ -445,7 +445,7 @@ fn entity_reads(index: &Path, iterations: usize, targets: &Targets) -> Vec<Row> 
             what: format!("as 1a, the busiest entity ({hot_count} records), asking for 10"),
             estimate: "—",
             timings: measure(index, iterations, |store| {
-                query::by_entity(store, "order_ref", hot_id, 1.0, Some(10), &reader())
+                query::by_entity(store, "order_ref", hot_id, 1.0, None, Some(10), &reader())
                     .expect("by entity")
                     .len()
             }),
@@ -457,7 +457,7 @@ fn entity_reads(index: &Path, iterations: usize, targets: &Targets) -> Vec<Row> 
             ),
             estimate: "—",
             timings: measure(index, iterations / 3, |store| {
-                query::by_entity_structures(store, "order_ref", hot_id, 1.0, None, &reader())
+                query::by_entity_structures(store, "order_ref", hot_id, 1.0, None, None, &reader())
                     .expect("by entity")
                     .len()
             }),
@@ -647,6 +647,7 @@ fn plans(index: &Path, targets: &Targets, queries: &Queries) -> String {
                 &targets.tail[0].1,
                 1.0,
                 None,
+                None,
                 &reader(),
             ),
         ),
@@ -657,6 +658,7 @@ fn plans(index: &Path, targets: &Targets, queries: &Queries) -> String {
                 "order_ref",
                 &targets.tail[0].1,
                 1.0,
+                None,
                 None,
                 &reader(),
             ),

@@ -444,6 +444,16 @@ pub enum ReadQuery {
         /// Page size. Absent leaves the service's own cap in force.
         #[arg(long, value_name = "N")]
         limit: Option<u32>,
+        /// Inclusive start of a window over the server-stamped time, in milliseconds.
+        ///
+        /// One entity inside one window is the shape of a correlation: what else touched this
+        /// ticket while that decline was happening. Without it the answer is the whole history and
+        /// the window is applied by whoever read it — to rows the page cap already chose.
+        #[arg(long, value_name = "MS")]
+        from_ms: Option<i64>,
+        /// Exclusive end of that window, on the same clock.
+        #[arg(long, value_name = "MS")]
+        to_ms: Option<i64>,
     },
     /// Which records mention something. Full text over record bodies, best match first.
     ///

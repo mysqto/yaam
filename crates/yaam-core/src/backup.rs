@@ -842,9 +842,16 @@ mod tests {
 
         // And the entity read a caller would actually make, which needs the derived rows a rebuild
         // reproduces rather than the file the copy carried.
-        let by_entity =
-            query::by_entity(&store, "ticket", "PROJ-42", 1.0, None, &Scope::Unrestricted)
-                .expect("queried");
+        let by_entity = query::by_entity(
+            &store,
+            "ticket",
+            "PROJ-42",
+            1.0,
+            None,
+            None,
+            &Scope::Unrestricted,
+        )
+        .expect("queried");
         assert_eq!(by_entity.len(), 1, "the entity index did not come back");
     }
 

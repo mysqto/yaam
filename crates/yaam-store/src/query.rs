@@ -135,6 +135,7 @@ pub fn by_entity(
     kind: &str,
     id: &str,
     min_confidence: f32,
+    window: Option<Window>,
     limit: Option<u32>,
     scope: &Scope,
 ) -> crate::Result<Vec<RecordId>> {
@@ -142,6 +143,7 @@ pub fn by_entity(
         kind,
         id,
         min_confidence,
+        window,
         Extent::Page(limit),
         scope,
         Select::Id,
@@ -160,6 +162,7 @@ pub fn by_entity_structures(
     kind: &str,
     id: &str,
     min_confidence: f32,
+    window: Option<Window>,
     limit: Option<u32>,
     scope: &Scope,
 ) -> crate::Result<Vec<RecordStructure>> {
@@ -167,6 +170,7 @@ pub fn by_entity_structures(
         kind,
         id,
         min_confidence,
+        window,
         Extent::Page(limit),
         scope,
         Select::Structure,
@@ -193,6 +197,10 @@ pub fn by_entity_unbounded(
         kind,
         id,
         min_confidence,
+        // No window, for the same reason there is no scope: this is the read that has to see
+        // everything, and a sweep that skipped a reference outside some window would report a
+        // rebuild complete having rebuilt part of it.
+        None,
         Extent::Everything,
         &Scope::Unrestricted,
         Select::Id,
@@ -303,6 +311,7 @@ fn by_entity_sql(
     kind: &str,
     id: &str,
     min_confidence: f32,
+    window: Option<Window>,
     extent: Extent,
     scope: &Scope,
     select: Select,
@@ -319,6 +328,15 @@ fn by_entity_sql(
          WHERE er.kind = ? AND er.entity_id = ? AND er.confidence >= ?",
         select.columns()
     );
+    // Windowed on the reference's own copy of the time, for the same reason the ordering is: it is
+    // the column the index carries, so a window narrows the seek rather than filtering rows the seek
+    // already walked. Half-open, matching every other window in this module — the end is exclusive,
+    // so consecutive windows tile without double-counting the instant they share.
+    if let Some(window) = window {
+        sql.push_str(" AND er.received_ms >= ? AND er.received_ms < ?");
+        binds.push(window.from_ms.into());
+        binds.push(window.to_ms.into());
+    }
     if let Some(predicate) = scope_predicate(scope, "rec", &mut binds) {
         sql.push_str(" AND ");
         sql.push_str(&predicate);
@@ -727,7 +745,7 @@ fn collect(rows: impl Iterator<Item = rusqlite::Result<String>>) -> crate::Resul
 #[cfg(feature = "explain")]
 pub mod explain {
     use super::{
-        Extent, Filter, Scope, Select, by_entity_sql, correlate_sql, filter_sql, search_sql,
+        Extent, Filter, Scope, Select, Window, by_entity_sql, correlate_sql, filter_sql, search_sql,
     };
 
     /// How [`super::by_entity`] would run.
@@ -736,6 +754,7 @@ pub mod explain {
         kind: &str,
         id: &str,
         min_confidence: f32,
+        window: Option<Window>,
         limit: Option<u32>,
         scope: &Scope,
     ) -> crate::Result<String> {
@@ -743,6 +762,7 @@ pub mod explain {
             kind,
             id,
             min_confidence,
+            window,
             Extent::Page(limit),
             scope,
             Select::Id,
@@ -760,6 +780,7 @@ pub mod explain {
         kind: &str,
         id: &str,
         min_confidence: f32,
+        window: Option<Window>,
         limit: Option<u32>,
         scope: &Scope,
     ) -> crate::Result<String> {
@@ -767,6 +788,7 @@ pub mod explain {
             kind,
             id,
             min_confidence,
+            window,
             Extent::Page(limit),
             scope,
             Select::Structure,
@@ -998,6 +1020,7 @@ mod tests {
             "ticket",
             "PROJ-42",
             0.0,
+            None,
             Extent::Page(Some(10)),
             &reader(),
             Select::Id,
@@ -1017,6 +1040,7 @@ mod tests {
             "ticket",
             "PROJ-42",
             0.0,
+            None,
             Extent::Page(Some(10)),
             &reader(),
             Select::Structure,
@@ -1035,6 +1059,7 @@ mod tests {
             "ticket",
             "PROJ-42",
             0.0,
+            None,
             Extent::Page(None),
             &reader(),
             Select::Id,
@@ -1044,6 +1069,7 @@ mod tests {
             "ticket",
             "PROJ-42",
             0.0,
+            None,
             Extent::Everything,
             &Scope::Unrestricted,
             Select::Id,
@@ -1237,14 +1263,22 @@ mod tests {
                 .contains("records_action_outcome_time")
         );
         assert!(
-            super::explain::by_entity_structures(&store, "ticket", "PROJ-42", 1.0, None, &reader())
-                .expect("a plan")
-                .contains("entity_refs_recent")
+            super::explain::by_entity_structures(
+                &store,
+                "ticket",
+                "PROJ-42",
+                1.0,
+                None,
+                None,
+                &reader()
+            )
+            .expect("a plan")
+            .contains("entity_refs_recent")
         );
 
         // Every helper answers, and the join names both sides.
         assert!(
-            super::explain::by_entity(&store, "ticket", "PROJ-42", 1.0, None, &reader())
+            super::explain::by_entity(&store, "ticket", "PROJ-42", 1.0, None, None, &reader())
                 .expect("a plan")
                 .contains("entity_refs_recent")
         );

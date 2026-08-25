@@ -580,7 +580,8 @@ fn every_read_path_applies_the_scope() {
     let hidden = docs[2].record_id.as_str();
 
     // Entity history: every record here names the same ticket, so only the scope can narrow it.
-    let rows = query::by_entity(&store, "ticket", "TCK-1", 1.0, None, &scope).expect("by_entity");
+    let rows =
+        query::by_entity(&store, "ticket", "TCK-1", 1.0, None, None, &scope).expect("by_entity");
     let history = ids(&rows);
     assert!(!history.contains(&hidden), "{history:?}");
     assert!(history.contains(&docs[1].record_id.as_str()));
@@ -588,7 +589,8 @@ fn every_read_path_applies_the_scope() {
     // The structure projections answer the same rows. Widening the select list must not widen the
     // predicate: a caller outside a record's scope receives neither its structure nor its id.
     let structured =
-        query::by_entity_structures(&store, "ticket", "TCK-1", 1.0, None, &scope).expect("entity");
+        query::by_entity_structures(&store, "ticket", "TCK-1", 1.0, None, None, &scope)
+            .expect("entity");
     assert_eq!(structure_ids(&structured), history);
     let filtered = query::by_filter_structures(
         &store,
@@ -649,9 +651,17 @@ fn a_read_with_no_scope_returns_nothing_rather_than_everything() {
             .is_empty()
     );
     assert!(
-        query::by_entity(&store, "ticket", "TCK-1", 1.0, None, &Scope::default())
-            .expect("by_entity")
-            .is_empty()
+        query::by_entity(
+            &store,
+            "ticket",
+            "TCK-1",
+            1.0,
+            None,
+            None,
+            &Scope::default()
+        )
+        .expect("by_entity")
+        .is_empty()
     );
     assert!(
         query::search(&store, "visible", 10, &Scope::default())
@@ -676,9 +686,17 @@ fn a_read_with_no_scope_returns_nothing_rather_than_everything() {
             .is_empty()
     );
     assert!(
-        query::by_entity_structures(&store, "ticket", "TCK-1", 1.0, None, &Scope::default())
-            .expect("by_entity")
-            .is_empty()
+        query::by_entity_structures(
+            &store,
+            "ticket",
+            "TCK-1",
+            1.0,
+            None,
+            None,
+            &Scope::default()
+        )
+        .expect("by_entity")
+        .is_empty()
     );
 }
 
@@ -863,20 +881,85 @@ fn by_entity_is_newest_first_and_honours_confidence() {
     publish(&mut writer, &inferred).expect("publish");
 
     let store = Store::open_read(&path).expect("open read");
-    let all = query::by_entity(&store, "ticket", "TCK-77", 0.0, None, &ALL).expect("by_entity");
+    let all =
+        query::by_entity(&store, "ticket", "TCK-77", 0.0, None, None, &ALL).expect("by_entity");
     assert_eq!(
         ids(&all),
         vec![inferred.record_id.as_str(), certain.record_id.as_str()]
     );
 
     let confident =
-        query::by_entity(&store, "ticket", "TCK-77", 0.9, None, &ALL).expect("by_entity");
+        query::by_entity(&store, "ticket", "TCK-77", 0.9, None, None, &ALL).expect("by_entity");
     assert_eq!(ids(&confident), vec![certain.record_id.as_str()]);
     assert!(
-        query::by_entity(&store, "ticket", "TCK-99", 0.0, None, &ALL)
+        query::by_entity(&store, "ticket", "TCK-99", 0.0, None, None, &ALL)
             .expect("by_entity")
             .is_empty()
     );
+}
+
+/// One entity inside one window, half-open at the end.
+///
+/// The half-open end is the property worth pinning: consecutive windows have to tile without
+/// double-counting the instant they share, or a correlation run window by window reports the record
+/// on the boundary twice.
+#[test]
+fn by_entity_narrows_to_a_window() {
+    // The two instants as the index stores them. Spelled out rather than parsed: a window is asked
+    // for in milliseconds, and a test that computed them from the same strings the fixture used
+    // would agree with itself about a conversion neither the caller nor the index performs.
+    const T10_MS: i64 = 1_787_220_000_000;
+    const T12_MS: i64 = 1_787_227_200_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    let mut early = record("deploy", Outcome::Success, T10);
+    early.entities = vec![entity_ref("ticket", "TCK-88", 1.0)];
+    publish(&mut writer, &early).expect("publish");
+
+    let mut late = record("transact", Outcome::Declined, T12);
+    late.entities = vec![entity_ref("ticket", "TCK-88", 1.0)];
+    publish(&mut writer, &late).expect("publish");
+
+    let store = Store::open_read(&path).expect("open read");
+    // Owned, because `ids` borrows the rows and the rows here are a temporary.
+    let window = |from_ms, to_ms| -> Vec<String> {
+        let rows = query::by_entity(
+            &store,
+            "ticket",
+            "TCK-88",
+            0.0,
+            Some(Window { from_ms, to_ms }),
+            None,
+            &ALL,
+        )
+        .expect("by_entity");
+        ids(&rows).into_iter().map(str::to_owned).collect()
+    };
+
+    // No window is every reference, newest first.
+    assert_eq!(
+        ids(
+            &query::by_entity(&store, "ticket", "TCK-88", 0.0, None, None, &ALL)
+                .expect("by_entity")
+        ),
+        vec![late.record_id.as_str(), early.record_id.as_str()]
+    );
+    // A window holding one of them holds only it.
+    assert_eq!(
+        window(T10_MS, T12_MS),
+        vec![early.record_id.as_str().to_owned()]
+    );
+    // Inclusive start, exclusive end: T12 is in the window that starts at it and out of the one that
+    // ends at it.
+    assert_eq!(
+        window(T12_MS, T12_MS + 1),
+        vec![late.record_id.as_str().to_owned()]
+    );
+    // A window either side of both is empty rather than falling back to the whole history.
+    assert!(window(T12_MS + 1, T12_MS + 2).is_empty());
 }
 
 #[test]
@@ -1674,7 +1757,8 @@ fn a_hot_entity_is_paged_through_the_query_and_whole_through_the_verification_re
     let store = Store::open_read(&path).expect("open read");
 
     // What a request gets: the page it asked for, newest first.
-    let page = query::by_entity(&store, "ticket", "TCK-HOT", 1.0, Some(10), &ALL).expect("page");
+    let page =
+        query::by_entity(&store, "ticket", "TCK-HOT", 1.0, None, Some(10), &ALL).expect("page");
     assert_eq!(page.len(), 10);
     assert_eq!(
         ids(&page)[0],

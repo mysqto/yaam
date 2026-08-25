@@ -12,7 +12,7 @@ use yaam_contract::{
 use yaam_core::bundle::{self, Bundle};
 use yaam_core::erase::EraseReport;
 use yaam_core::pipeline::Accepted;
-use yaam_store::query::Filter;
+use yaam_store::query::{Filter, Window};
 
 use crate::auth::Caller;
 use crate::service::Service;
@@ -155,10 +155,14 @@ impl Service for Fake {
         kind: &str,
         id: &str,
         min_confidence: f32,
+        window: Option<Window>,
         limit: Option<u32>,
     ) -> Result<Vec<RecordStructure>> {
+        // The window is in the recorded call because a route test's whole job is asserting that what
+        // the caller asked for reached the service. A parameter absent from here is a parameter the
+        // route could silently drop.
         self.called(format!(
-            "entity {} {kind} {id} {min_confidence} {limit:?}",
+            "entity {} {kind} {id} {min_confidence} {window:?} {limit:?}",
             caller.agent
         ))?;
         Ok(self.records.clone())

@@ -121,6 +121,11 @@ pub fn compose(store: &yaam_store::Store, request: &Request) -> crate::Result<Bu
             kind,
             id,
             MIN_CONFIDENCE,
+            // No window. A bundle is bounded by its page and its deadline, not by time: a caller
+            // composing context for a request wants the newest of an entity's history, and where
+            // that history is older than any window they would have thought to pass, it is still
+            // what there is to say about the entity.
+            None,
             Some(source_limit),
             &request.scope,
         )?;

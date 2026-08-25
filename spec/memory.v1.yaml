@@ -442,6 +442,13 @@ paths:
         is as long as that entity is busy, so there is no spelling of this request that returns all
         of it — the busiest identifier in a store would otherwise decide what every reader pays.
 
+        `from_ms` and `to_ms` narrow it to a half-open span of that same server-stamped time. One
+        entity inside one window is the shape of a correlation — what else touched this ticket while
+        that decline was happening — and it is the reason this is not simply `GET /records` with an
+        entity filter: the window is applied inside the query, so the page cap chooses among rows the
+        window already selected. A caller narrowing afterwards has it the other way round, and the
+        page silently decides which part of the window they see.
+
         Answers the same `RecordsResponse` as `GET /records`, so both reads hand back structure and
         neither hands back a body. One shape for both, because "what a read returns" is a property of
         this service and not of which read it was.
@@ -465,6 +472,8 @@ paths:
           example: PROJ-42
         - $ref: '#/components/parameters/min_confidence'
         - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/from_ms'
+        - $ref: '#/components/parameters/to_ms'
       responses:
         '200':
           $ref: '#/components/responses/Records'
@@ -475,7 +484,9 @@ paths:
         '422':
           description: |
             Permanent. `kind` is not configured by this deployment, or `id` is not in that kind's
-            canonical form and cannot be normalised into it. Fix the request; the same segments will
+            canonical form and cannot be normalised into it. Or half a window was supplied: one bound
+            asks a different question rather than a narrower one, so it is refused rather than
+            completed with a bound the caller did not choose. Fix the request; the same segments will
             never match.
           content:
             application/json:

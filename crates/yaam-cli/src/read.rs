@@ -143,10 +143,23 @@ fn target(query: &ReadQuery) -> Result<String> {
             entity,
             min_confidence,
             limit,
+            from_ms,
+            to_ms,
         } => {
+            // The same refusal the records query makes, for the same reason: the caller left out a
+            // flag, and that is worth hearing without a round trip.
+            if from_ms.is_some() != to_ms.is_some() {
+                return Err(Error::Usage(
+                    "a window needs both --from-ms and --to-ms; one bound alone asks a different \
+                     question rather than a narrower one"
+                        .to_owned(),
+                ));
+            }
             let (kind, id) = entity_term(entity)?;
             params.optional("min_confidence", *min_confidence);
             params.optional("limit", *limit);
+            params.optional("from_ms", *from_ms);
+            params.optional("to_ms", *to_ms);
             // Both segments encoded: several configured entity kinds carry `/`, `#` or `@` inside an
             // identifier, and those are the characters that decide where a path segment ends.
             format!(

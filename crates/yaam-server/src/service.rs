@@ -20,7 +20,7 @@ use yaam_core::erase::EraseReport;
 use yaam_core::pipeline::Accepted;
 use yaam_core::sweeper::SweepReport;
 use yaam_store::Store;
-use yaam_store::query::{self, Filter};
+use yaam_store::query::{self, Filter, Window};
 
 use crate::auth::Caller;
 use crate::{Error, Result};
@@ -67,12 +67,20 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
     /// `limit` is the page size, `None` meaning the index's own default cap. Not optional in the
     /// sense of unbounded: an entity's history grows with how busy the entity is, and a request
     /// answering with all of it hands the busiest identifier in the store a lever on every reader.
+    ///
+    /// `window` narrows to a half-open span of server-stamped time, `None` meaning every reference.
+    /// It is what makes a correlation one read rather than two: the records of one entity inside one
+    /// window is the shape of every "what else happened around this" question, and answering it by
+    /// reading a whole history and discarding most of it moves the window to the caller — where it is
+    /// applied to rows already paged, so the page cap silently decides which part of the window is
+    /// visible.
     fn entity(
         &self,
         caller: &Caller,
         kind: &str,
         id: &str,
         min_confidence: f32,
+        window: Option<Window>,
         limit: Option<u32>,
     ) -> Result<Vec<RecordStructure>>;
 
@@ -248,6 +256,7 @@ impl Service for CoreService {
         kind: &str,
         id: &str,
         min_confidence: f32,
+        window: Option<Window>,
         limit: Option<u32>,
     ) -> Result<Vec<RecordStructure>> {
         let id = self.canonical(kind, id)?;
@@ -256,6 +265,7 @@ impl Service for CoreService {
             kind,
             &id,
             min_confidence,
+            window,
             limit,
             &caller.scope(),
         )
