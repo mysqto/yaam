@@ -156,6 +156,17 @@ impl KindRules {
     }
 }
 
+/// Words of `text`, with punctuation-only runs dropped.
+///
+/// A word that is nothing but punctuation is no word at all, and dropping it before distances are
+/// counted stops a dash between an anchor and its identifier from consuming window.
+fn tokens(text: &str) -> Vec<Token<'_>> {
+    text.split_whitespace()
+        .map(Token::new)
+        .filter(|token| !token.text.is_empty())
+        .collect()
+}
+
 /// Values a kind inherits when it does not state its own.
 #[derive(Debug, Clone, Copy)]
 struct Defaults {
@@ -280,13 +291,7 @@ impl Extractor {
     /// them; where it separates nothing, a coin toss would put a plausible wrong key in the index.
     #[must_use]
     pub fn from_text(&self, text: &str) -> Vec<EntityRef> {
-        // A word that is nothing but punctuation is no word at all, and is dropped before distances
-        // are counted so that a dash between an anchor and its identifier does not consume window.
-        let tokens: Vec<Token<'_>> = text
-            .split_whitespace()
-            .map(Token::new)
-            .filter(|token| !token.text.is_empty())
-            .collect();
+        let tokens = tokens(text);
 
         let mut found: Vec<EntityRef> = Vec::new();
         for at in 0..tokens.len() {
@@ -298,6 +303,55 @@ impl Extractor {
                 .any(|seen| seen.kind == entity.kind && seen.id == entity.id)
             {
                 found.push(entity);
+            }
+        }
+        found
+    }
+
+    /// Entity references read out of a *question*, where nothing has to vouch for them.
+    ///
+    /// The same rules as [`Self::from_text`] minus the anchor: pattern, `require`, `refuse` and
+    /// `stopwords` all still apply, and a kind with no rule is still never inferred — that is what
+    /// keeps a kind whose pattern admits any ordinary word out of this entirely.
+    ///
+    /// # Why the anchor goes
+    ///
+    /// An anchor is evidence, and evidence is what the write path needs: a reference inferred there
+    /// *becomes* a stored join key, and a wrong key is a wrong answer to every later question that
+    /// touches it, silently. A key built for a lookup is the opposite kind of object. It is matched
+    /// against what records state and then discarded; a wrong one asks about an entity nobody wrote
+    /// anything under and costs one lookup that returns nothing.
+    ///
+    /// So requiring evidence for a lookup buys nothing and loses answers. `any knowledge about this?
+    /// WUPGHGJ7ELJM626` carries no anchor a rule would recognise and every reader would call it a
+    /// booking; anchored extraction reads it as prose about nothing.
+    ///
+    /// # Where [`Self::from_text`] drops, this keeps both
+    ///
+    /// Two kinds sharing one pattern are told apart by their anchors, so with the anchors gone they
+    /// cannot be told apart at all. Both keys are returned rather than neither: for a lookup the
+    /// wrong one matches nothing, which is a cost worth paying to stop the right one being dropped.
+    /// The returned confidences are the rules' own and mean nothing to a lookup, which matches on
+    /// the identifier alone.
+    #[must_use]
+    pub fn from_query(&self, text: &str) -> Vec<EntityRef> {
+        let mut found: Vec<EntityRef> = Vec::new();
+        for token in tokens(text) {
+            for rules in &self.kinds {
+                let Some(id) = rules.candidate(&self.registry, token.text) else {
+                    continue;
+                };
+                if !found
+                    .iter()
+                    .any(|seen| seen.kind == rules.kind && seen.id == id)
+                {
+                    found.push(EntityRef {
+                        kind: rules.kind.clone(),
+                        id,
+                        role: INFERRED_ROLE,
+                        confidence: rules.confidence,
+                    });
+                }
             }
         }
         found
@@ -967,6 +1021,106 @@ mod tests {
                 format!("version: 99\n{head}kinds: {{}}\n"),
             ),
         ]);
+    }
+
+    /// The case that sent this method into being: a real question, with no anchor in it.
+    #[test]
+    fn a_question_needs_no_anchor() {
+        let unanchored = "any knowledge abou this? PROJ-42";
+        assert!(
+            simple().from_text(unanchored).is_empty(),
+            "the write path requires evidence, and this carries none"
+        );
+        let asked = simple().from_query(unanchored);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].id, "PROJ-42");
+    }
+
+    /// Everything except the anchor still refuses.
+    #[test]
+    fn a_query_still_obeys_pattern_require_refuse_and_stopwords() {
+        let extractor = Extractor::from_yaml(
+            registry("kinds:\n  ref:\n    pattern: '^[a-z0-9]{4,12}$'\n    normalise: [trim, lowercase]\n"),
+            concat!(
+                "defaults:\n  window: 4\n  confidence: 0.7\n",
+                "kinds:\n  ref:\n    anchors: [ref]\n    require: ['[0-9]']\n",
+                "    refuse: ['^[0-9]+[a-z]+$']\n    stopwords: [utf8bom]\n",
+            ),
+        )
+        .expect("the test rules load");
+
+        let found: Vec<String> = extractor
+            .from_query("p60y9 background 12items utf8bom")
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect();
+        assert_eq!(
+            found,
+            vec!["p60y9".to_owned()],
+            "only the candidate that clears every guard"
+        );
+    }
+
+    /// A kind with no rule is not inferable, and a question does not change that. This is what keeps
+    /// a pattern admitting any ordinary word from turning every word into a key.
+    #[test]
+    fn a_kind_with_no_rule_is_never_asked_about() {
+        let asked = shipped().from_query("the user reported a fault in checkout");
+        assert!(
+            asked.iter().all(|entity| entity.kind != "chat_user"),
+            "chat_user has no rule and must stay out: {asked:?}"
+        );
+    }
+
+    /// Where `from_text` drops an ambiguous shape, a query keeps both candidates: the wrong key
+    /// matches nothing, and dropping would lose the right one too.
+    #[test]
+    fn an_ambiguous_shape_yields_every_candidate_kind() {
+        let extractor = Extractor::from_yaml(
+            registry(concat!(
+                "kinds:\n",
+                "  one:\n    pattern: '^[a-z]+/[a-z]+#[0-9]+$'\n    normalise: [trim, lowercase]\n",
+                "  two:\n    pattern: '^[a-z]+/[a-z]+#[0-9]+$'\n    normalise: [trim, lowercase]\n",
+            )),
+            concat!(
+                "defaults:\n  window: 4\n  confidence: 0.7\n",
+                "kinds:\n  one:\n    anchors: [shipped]\n  two:\n    anchors: [shipped]\n",
+            ),
+        )
+        .expect("the test rules load");
+
+        assert!(
+            extractor.from_text("shipped svc/prod#7").is_empty(),
+            "one anchor, two kinds, one distance: a tie the write path drops"
+        );
+        let mut kinds: Vec<String> = extractor
+            .from_query("svc/prod#7")
+            .into_iter()
+            .map(|entity| entity.kind)
+            .collect();
+        kinds.sort();
+        assert_eq!(kinds, vec!["one".to_owned(), "two".to_owned()]);
+    }
+
+    /// One mention, one key, however many times it is written.
+    #[test]
+    fn a_query_deduplicates_its_keys() {
+        assert_eq!(simple().from_query("PROJ-42 PROJ-42 proj-42").len(), 1);
+    }
+
+    /// The shipped rules, on a bare identifier with nothing vouching for it.
+    ///
+    /// `PAY-2087` unanchored is the whole point: `from_text` reads it as prose and returns nothing,
+    /// because a tracker key is exactly the shape a standards name has.
+    #[test]
+    fn the_shipped_rules_read_a_bare_identifier() {
+        assert!(shipped().from_text("PAY-2087").is_empty());
+        let asked: Vec<String> = shipped()
+            .from_query("PAY-2087")
+            .into_iter()
+            .map(|entity| format!("{}:{}", entity.kind, entity.id))
+            .collect();
+        assert!(asked.contains(&"ticket:PAY-2087".to_owned()), "{asked:?}");
     }
 
     #[test]

@@ -475,6 +475,13 @@ fn entity_term(spec: &str) -> Result<(&str, &str)> {
     Ok((kind, id))
 }
 
+/// How many inferred terms one bundle may carry, beyond what the caller stated.
+///
+/// Generous for a question a person wrote and firm against prose that is really a data file. There
+/// is no right number; there is only a number, and an unbounded query parameter is worse than any
+/// of them.
+const MAX_INFERRED_TERMS: usize = 32;
+
 /// Every entity a bundle asks about: what the caller stated, then what its prose supports.
 ///
 /// # Why this may guess where the writer may not
@@ -493,6 +500,11 @@ fn entity_term(spec: &str) -> Result<(&str, &str)> {
 ///
 /// The asymmetry is the whole reason this exists: inference cheap enough to be worth doing is
 /// inference on the read side, and the floor the write side holds is untouched by it.
+///
+/// Which is why this calls [`yaam_contract::extract::Extractor::from_query`] and not `from_text`.
+/// The anchor a rule requires is evidence for a *stored* reference; requiring it of a lookup key
+/// asks a question to justify itself, and the questions people actually type do not. `any knowledge
+/// about this? WUPGHGJ7ELJM626` reached anchored extraction as prose about nothing.
 ///
 /// # One flag alone
 ///
@@ -529,14 +541,19 @@ fn terms(stated: &[String], spec_dir: Option<&Path>, text: Option<&str>) -> Resu
     let mut asked = stated.to_vec();
     asked.extend(
         extractor
-            .from_text(text)
+            .from_query(text)
             // The extractor deduplicates its own findings, so only the stated ones are left to check.
             .into_iter()
             .map(|found| format!("{}:{}", found.kind, found.id))
             // A comma is how a bundle separates its terms, so one inside an identifier would arrive
             // as two. A stated term carrying one is refused by name; an inferred one is dropped,
             // because a guess is not worth failing a caller's read over.
-            .filter(|term| !term.contains(',') && !claimed.contains(term)),
+            .filter(|term| !term.contains(',') && !claimed.contains(term))
+            // Bounded, because unanchored inference is bounded only by the prose: a state dump
+            // pasted into a question yielded fifteen hundred candidates in testing, and a query
+            // parameter that long is a request the service rejects rather than answers. Stated
+            // terms are never dropped -- only guesses are, and only after the cap is reached.
+            .take(MAX_INFERRED_TERMS),
     );
     Ok(asked)
 }
@@ -565,7 +582,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Params, encoded, read, target};
+    use super::{MAX_INFERRED_TERMS, Params, encoded, read, target};
     use crate::cli::{OutcomeArg, ReadCli};
     use crate::config::{Env, ReadSettings};
     use crate::error::Error;
@@ -720,6 +737,40 @@ mod tests {
             ),
             "/bundle?entity=chat_thread%3AC0EXAMPLE%2F1700000000.000100%2Cticket%3APROJ-42\
              &actor=agent_a"
+        );
+    }
+
+    /// The question that made `from_query` necessary: a bare identifier, nothing vouching for it.
+    #[test]
+    fn a_bare_identifier_in_a_question_becomes_a_key() {
+        assert_eq!(
+            about("any knowledge abou this? PROJ-42", &[]),
+            "/bundle?entity=ticket%3APROJ-42"
+        );
+        // And with no prose around it at all, which is how people paste a reference.
+        assert_eq!(about("PROJ-42", &[]), "/bundle?entity=ticket%3APROJ-42");
+    }
+
+    /// Guesses are capped; stated terms are not.
+    ///
+    /// The prose here is what a pasted data file looks like to the reader, and the point of the cap
+    /// is that the request stays a request.
+    #[test]
+    fn inferred_terms_are_capped_and_stated_ones_survive_the_cap() {
+        let flood = (0..MAX_INFERRED_TERMS * 2)
+            .map(|n| format!("PROJ-{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let url = about(&flood, &["--entity", "ticket:KEPT-1"]);
+        let terms = url.matches("ticket%3A").count();
+        assert_eq!(
+            terms,
+            MAX_INFERRED_TERMS + 1,
+            "the cap, plus the stated one: {url}"
+        );
+        assert!(
+            url.contains("ticket%3AKEPT-1"),
+            "a stated term is never dropped: {url}"
         );
     }
 
