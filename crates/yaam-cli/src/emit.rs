@@ -75,8 +75,9 @@ use yaam_contract::{ActionRecord, DataClass, RecordId, SchemaVer, attrs, extract
 
 use crate::cli::EmitArgs;
 use crate::config::EmitSettings;
-use crate::error::{Error, Result, config, failed};
+use crate::error::{Error, Result, failed};
 use crate::exit::Exit;
+use crate::infer;
 
 /// The redaction policy a record declares when nothing names one.
 ///
@@ -106,12 +107,6 @@ const LIVE_SKEW_MS: i64 = 5_000;
 /// running, and a flag would let one claim a version whose fields it is not sending.
 const SCHEMA_VER: SchemaVer = SchemaVer(1);
 
-/// What an identifier is, inside the directory `--infer-entities` names.
-const ENTITIES_FILE: &str = "entities.yaml";
-
-/// When prose is evidence that one was meant, in the same directory.
-const EXTRACTORS_FILE: &str = "extractors.yaml";
-
 /// Builds one record from the arguments and sends it, reporting what became of it.
 ///
 /// Validated locally before it is sent, so a record that cannot possibly be accepted fails here —
@@ -120,7 +115,11 @@ pub fn emit(settings: &EmitSettings, args: &EmitArgs, out: &mut dyn Write) -> Re
     // Ahead of the record, so a dry run fails on an unreadable spec directory too. The flag asks for
     // references the record will carry, which makes it part of building one rather than of sending
     // it — and a dry run that skipped the check would rehearse a record the real send could not make.
-    let inferring = args.infer_entities.as_deref().map(extractor).transpose()?;
+    let inferring = args
+        .infer_entities
+        .as_deref()
+        .map(infer::load)
+        .transpose()?;
     let record = record(settings, args, inferring.as_ref(), now_ms())?;
     record
         .validate()
@@ -537,37 +536,6 @@ fn canonical(registry: &Registry, entity: &EntityRef) -> String {
         .unwrap_or_else(|_| entity.id.clone())
 }
 
-/// Loads the extraction rules out of the spec directory `--infer-entities` names.
-///
-/// Both files are required. A directory with no `extractors.yaml` would leave a caller that asked
-/// for inference with a record that has none and no way to tell — the flag is the request, so being
-/// unable to honour it is a configuration failure rather than a quiet nothing.
-fn extractor(dir: &Path) -> Result<Extractor> {
-    let registry = Registry::from_yaml(&spec_text(dir, ENTITIES_FILE)?)
-        .map_err(|error| unusable(dir, ENTITIES_FILE, &error))?;
-    Extractor::from_yaml(registry, &spec_text(dir, EXTRACTORS_FILE)?)
-        .map_err(|error| unusable(dir, EXTRACTORS_FILE, &error))
-}
-
-/// Reads one file of the spec directory, naming what the directory is expected to be.
-fn spec_text(dir: &Path, file: &str) -> Result<String> {
-    std::fs::read_to_string(dir.join(file)).map_err(|error| {
-        config(format!(
-            "--infer-entities {}: {error}. It names a spec directory, which is where {ENTITIES_FILE} \
-             and {EXTRACTORS_FILE} live — the same pair the deployment this record goes to reads",
-            dir.join(file).display()
-        ))
-    })
-}
-
-/// A spec file that was read and could not be used.
-fn unusable(dir: &Path, file: &str, cause: &dyn std::fmt::Display) -> Error {
-    config(format!(
-        "--infer-entities {}: {cause}",
-        dir.join(file).display()
-    ))
-}
-
 /// Reads one `kind:id` entity reference.
 ///
 /// Primary, at [`extract::FIELD_CONFIDENCE`]: an argument is a structured field, and a caller naming
@@ -614,13 +582,13 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        ActionRecord, DEFAULT_REDACTION_POLICY, ENTITIES_FILE, Extractor, emit, extract, extractor,
-        guidance, record,
+        ActionRecord, DEFAULT_REDACTION_POLICY, Extractor, emit, extract, guidance, record,
     };
     use crate::cli::EmitCli;
     use crate::config::{EmitSettings, Env};
     use crate::error::Error;
     use crate::exit::Exit;
+    use crate::infer::{ENTITIES_FILE, load as extractor};
 
     /// The arguments a hook would pass, plus whatever a test adds.
     fn parsed(extra: &[&str]) -> EmitCli {

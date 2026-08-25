@@ -476,6 +476,28 @@ pub enum ReadQuery {
         /// An agent whose recent activity is relevant, in addition to the named entities.
         #[arg(long, value_name = "NAME")]
         actor: Option<String>,
+        /// Also read `--infer-from` for entities to gather, using the rules in this spec directory.
+        ///
+        /// The same directory `yaam-emit --infer-entities` names, holding `entities.yaml` and
+        /// `extractors.yaml`. Both are read, neither is written, and this still opens no store: two
+        /// YAML files saying what an identifier looks like are configuration, not a tree.
+        ///
+        /// What it produces are lookup keys and nothing else. The role and confidence an inferred
+        /// reference carries are the *writer's* business, and the line above still holds — a bundle
+        /// gathers only what a record states at full confidence. So an entity guessed here matches
+        /// records that reference it properly, or it matches nothing; the cost of a wrong guess is
+        /// one wasted lookup rather than a falsehood somebody later reads back as a fact. That is
+        /// why this may infer where `yaam-emit` may not.
+        #[arg(long, value_name = "SPEC_DIR")]
+        infer_entities: Option<PathBuf>,
+        /// The prose to read, when `--infer-entities` says how to read it.
+        ///
+        /// Whatever the caller is about to act on: the message a turn is answering, the title of a
+        /// change under review. Neither flag means anything without the other, and either one alone
+        /// is refused rather than ignored — text nobody read, or rules nothing was read with, is a
+        /// narrower bundle than the caller asked for and no answer says so.
+        #[arg(long, value_name = "TEXT")]
+        infer_from: Option<String>,
         /// Budget for the whole composition, in milliseconds. Absent means the service's own.
         ///
         /// A source not consulted in time names itself in `omitted` and sets `degraded`; it is never

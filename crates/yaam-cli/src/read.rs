@@ -23,6 +23,17 @@
 //! rows, and it exits [`Exit::Ok`]; a read the service refused exits [`Exit::Rejected`] and a read
 //! that never reached it exits [`Exit::Unreachable`]. Collapsing the first into either of the others
 //! would make every quiet day look like an outage.
+//!
+//! # Naming the entities a caller does not know it has
+//!
+//! A bundle composes context out of entities and an actor, which assumes the caller can name them.
+//! A caller that has a *sentence* — the message it is about to answer — can name neither, so it asks
+//! about the actor alone and gets whatever that actor happened to write. Where nothing was ever
+//! written under that name, the answer is empty every time, and nothing about it looks broken.
+//!
+//! `--infer-entities` with `--infer-from` is the way out: the same extractor `yaam-emit` runs over a
+//! record's prose, run here over the request's prose, and what comes out are lookup keys. See
+//! [`terms`] for why that is allowed to guess where the writer is not.
 
 use std::fmt::Display;
 use std::io::{Read, Write};
@@ -34,6 +45,7 @@ use crate::cli::{ReadArgs, ReadQuery};
 use crate::config::ReadSettings;
 use crate::error::{Error, Result, failed};
 use crate::exit::Exit;
+use crate::infer;
 
 /// How long to wait for an answer, in milliseconds.
 ///
@@ -152,14 +164,17 @@ fn target(query: &ReadQuery) -> Result<String> {
         ReadQuery::Bundle {
             entities,
             actor,
+            infer_entities,
+            infer_from,
             deadline_ms,
             limit,
         } => {
             for spec in entities {
                 bundle_term(spec)?;
             }
-            if !entities.is_empty() {
-                params.add("entity", &entities.join(","));
+            let asked = terms(entities, infer_entities.as_deref(), infer_from.as_deref())?;
+            if !asked.is_empty() {
+                params.add("entity", &asked.join(","));
             }
             params.optional("actor", actor.as_deref());
             params.optional("deadline_ms", *deadline_ms);
@@ -460,6 +475,72 @@ fn entity_term(spec: &str) -> Result<(&str, &str)> {
     Ok((kind, id))
 }
 
+/// Every entity a bundle asks about: what the caller stated, then what its prose supports.
+///
+/// # Why this may guess where the writer may not
+///
+/// The extractor is the same one `yaam-emit --infer-entities` runs, and the bar it enforces was set
+/// for the write path: an inferred reference *becomes* a stored join key there, so it is kept below
+/// [`yaam_contract::extract::HIGH_CONFIDENCE_FLOOR`], and a bundle in turn gathers only references a
+/// record states at `1.0` — because a guess in a bundle is a guess the caller cannot tell apart from
+/// a fact.
+///
+/// None of that changes here, and none of it applies to this. What comes out of the extractor here
+/// never reaches a record and never reaches an answer: it is a `kind:id` in a query parameter, and
+/// the service matches it against references records state at full confidence, exactly as it matches
+/// one the caller typed. So a wrong guess asks about an entity nobody wrote anything under and gets
+/// nothing back, at the price of one lookup. A wrong guess at write time is permanent and silent.
+///
+/// The asymmetry is the whole reason this exists: inference cheap enough to be worth doing is
+/// inference on the read side, and the floor the write side holds is untouched by it.
+///
+/// # One flag alone
+///
+/// Refused, both ways round. Text with no rules cannot be read and rules with no text have nothing
+/// to read, and either would compose a *narrower* bundle than the caller asked for while answering
+/// `200` — which is the one failure this whole file is arranged to make impossible.
+fn terms(stated: &[String], spec_dir: Option<&Path>, text: Option<&str>) -> Result<Vec<String>> {
+    let (Some(dir), Some(text)) = (spec_dir, text) else {
+        if spec_dir.is_some() || text.is_some() {
+            return Err(Error::Usage(
+                "inference needs both --infer-entities and --infer-from: one names the rules, the \
+                 other the prose to read with them, and neither does anything alone"
+                    .to_owned(),
+            ));
+        }
+        return Ok(stated.to_vec());
+    };
+
+    let extractor = infer::load(dir)?;
+    // Canonical on both sides, as the emitter compares them: the service canonicalises what it is
+    // given, so `deploy:svc/prod#7` stated and the same inferred are one key by the time it matches.
+    let claimed: Vec<String> = stated
+        .iter()
+        .filter_map(|spec| spec.split_once(':'))
+        .map(|(kind, id)| {
+            let id = extractor
+                .registry()
+                .canonicalise(kind, id)
+                .unwrap_or_else(|_| id.to_owned());
+            format!("{kind}:{id}")
+        })
+        .collect();
+
+    let mut asked = stated.to_vec();
+    asked.extend(
+        extractor
+            .from_text(text)
+            // The extractor deduplicates its own findings, so only the stated ones are left to check.
+            .into_iter()
+            .map(|found| format!("{}:{}", found.kind, found.id))
+            // A comma is how a bundle separates its terms, so one inside an identifier would arrive
+            // as two. A stated term carrying one is refused by name; an inferred one is dropped,
+            // because a guess is not worth failing a caller's read over.
+            .filter(|term| !term.contains(',') && !claimed.contains(term)),
+    );
+    Ok(asked)
+}
+
 /// Checks one entity term a bundle will carry.
 ///
 /// A bundle takes its entities as one comma-separated parameter, so a term holding a comma would
@@ -604,6 +685,110 @@ mod tests {
             asked(&["history", "--entity", "chat_user:x:y"]),
             "/entities/chat_user/x%3Ay"
         );
+    }
+
+    /// The rules the workspace ships, as a caller names them.
+    fn spec_dir() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec")
+            .to_str()
+            .expect("utf-8 path")
+            .to_owned()
+    }
+
+    /// One bundle over prose, with the shipped rules to read it by.
+    fn about(text: &str, extra: &[&str]) -> String {
+        let spec = spec_dir();
+        let mut args = vec!["bundle", "--infer-entities", &spec, "--infer-from", text];
+        args.extend_from_slice(extra);
+        asked(&args)
+    }
+
+    /// Prose the rules anchor becomes a key the bundle looks up, which is the whole point: a caller
+    /// holding a sentence can now name entities it never knew it had.
+    #[test]
+    fn prose_the_rules_anchor_becomes_an_entity_the_bundle_asks_about() {
+        assert_eq!(
+            about("reopened ticket PROJ-42 this morning", &[]),
+            "/bundle?entity=ticket%3APROJ-42"
+        );
+        // Several kinds out of one sentence, in the order the prose names them.
+        assert_eq!(
+            about(
+                "replying in thread C0EXAMPLE/1700000000.000100 about ticket PROJ-42",
+                &["--actor", "agent_a"]
+            ),
+            "/bundle?entity=chat_thread%3AC0EXAMPLE%2F1700000000.000100%2Cticket%3APROJ-42\
+             &actor=agent_a"
+        );
+    }
+
+    /// Prose that anchors nothing asks exactly what the same bundle asked before the flags existed.
+    ///
+    /// The default path is what almost every caller is on, so "adds nothing" has to mean the bytes
+    /// rather than the intent — a request that merely *looked* the same would still be a request.
+    #[test]
+    fn prose_that_names_nothing_asks_byte_for_byte_what_it_asked_before() {
+        let unchanged = asked(&["bundle", "--actor", "agent_a", "--limit", "5"]);
+        assert_eq!(
+            about(
+                "let me know how that went when you get a chance",
+                &["--actor", "agent_a", "--limit", "5"]
+            ),
+            unchanged
+        );
+        assert_eq!(unchanged, "/bundle?actor=agent_a&limit=5");
+    }
+
+    /// A stated entity the prose repeats travels once. Twice would charge the service two source
+    /// reads for one key, and a bundle's cap is spent on the second one either way.
+    #[test]
+    fn an_entity_both_stated_and_inferred_is_asked_about_once() {
+        assert_eq!(
+            about("reopened ticket proj-42", &["--entity", "ticket:PROJ-42"]),
+            "/bundle?entity=ticket%3APROJ-42"
+        );
+    }
+
+    /// Either inference flag alone is refused rather than ignored.
+    ///
+    /// Ignoring one would compose a narrower bundle than the caller asked for and answer `200` — the
+    /// shape of failure this file exists to prevent.
+    #[test]
+    fn either_inference_flag_without_the_other_is_a_usage_error() {
+        let spec = spec_dir();
+        for half in [
+            vec!["bundle", "--infer-entities", &spec],
+            vec!["bundle", "--infer-from", "reopened ticket PROJ-42"],
+        ] {
+            let error = target(&parsed(&half).query).expect_err("half of the pair");
+            assert!(matches!(error, Error::Usage(_)), "{error}");
+            assert!(error.to_string().contains("--infer-from"), "{error}");
+        }
+    }
+
+    /// A spec directory that cannot be used stops the read, and says which file.
+    ///
+    /// A configuration fault rather than a usage one: the flags parsed, and what is wrong is on
+    /// disk. Failing quietly would hand back a bundle missing exactly the entities that were asked
+    /// for by inference.
+    #[test]
+    fn a_spec_directory_that_cannot_be_used_stops_the_read() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let empty = dir.path().to_str().expect("utf-8");
+        let error = target(
+            &parsed(&[
+                "bundle",
+                "--infer-entities",
+                empty,
+                "--infer-from",
+                "reopened ticket PROJ-42",
+            ])
+            .query,
+        )
+        .expect_err("no entities.yaml");
+        assert_eq!(error.exit(), Exit::Config, "{error}");
+        assert!(error.to_string().contains("entities.yaml"), "{error}");
     }
 
     /// The attribute filter is spelled as the record was written, and reaches the service intact.

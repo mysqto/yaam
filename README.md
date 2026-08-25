@@ -61,9 +61,10 @@ Five binaries, one crate, one configuration type. `--root` names the memory tree
 Two of the five open a store and three never do. `yaam-agent`, `yaam-emit` and `yaam-read` run on the
 caller's host and have no `--root` to give them: that is what lets a caller record what it did, and
 read what it remembers, while holding no key material and no path into anyone's memory tree. The one
-directory a caller-side binary will read is the one `yaam-emit --infer-entities` names, and it reads
-two configuration files out of it — a spec directory is not a store, and nothing in that binary could
-open one.
+directory a caller-side binary will read is the one `--infer-entities` names — `yaam-emit` to lift
+references onto a record, `yaam-read bundle` to turn a request's own prose into lookup keys — and
+each reads two configuration files out of it. A spec directory is not a store, and nothing in either
+binary could open one.
 
 The service drains fan-out and sweeps every `--maintenance-ms` (30 s by default) *and* once at
 startup, so a process that comes up over an interrupted write converges without waiting an interval
@@ -90,6 +91,10 @@ yaam-read records --action deploy --attr environment=staging --limit 10
 yaam-read search --query "rolled back" --limit 5      # full text over bodies, structure back
 yaam-read history --entity deploy:api/staging#1146    # one entity's history, newest first
 yaam-read bundle --entity ticket:PROJ-42 --actor agent_a --limit 5   # context for a request
+
+# …and a bundle for a caller that has a sentence rather than a list of entities.
+yaam-read bundle --infer-entities /srv/memory/spec --limit 5 \
+          --infer-from "any news on ticket PROJ-42?"        # looks up ticket:PROJ-42
 
 yaam-read records --dry-run   # the exact request, no sidecar needed
 
@@ -282,7 +287,7 @@ asking.
 | filtered query | `yaam-read records [--action --outcome --agent --attr --from-ms --to-ms --limit]` | `RecordsResponse` |
 | entity history | `yaam-read history --entity kind:id [--min-confidence --limit]` | `RecordsResponse` |
 | full text | `yaam-read search --query TEXT [--limit]` | `RecordsResponse` |
-| context | `yaam-read bundle [--entity kind:id …] [--actor --deadline-ms --limit]` | `BundleResponse` |
+| context | `yaam-read bundle [--entity kind:id …] [--actor --infer-entities --infer-from --deadline-ms --limit]` | `BundleResponse` |
 
 Four subcommands rather than one flat set of flags, because they are four questions and not four
 filters on one: `--query` is required for a search and meaningless to a bundle, a window narrows the
@@ -301,6 +306,31 @@ sidecar, since a read is never queued.
 Percent-encoding is the command's business rather than the caller's, which matters more than it looks:
 several configured entity kinds carry `/`, `#` or `@` inside an identifier, and the signature the
 sidecar adds covers the request target exactly as sent.
+
+#### Naming the entities a caller does not know it has
+
+A bundle composes context out of entities and an actor, which assumes the caller can name them. A
+caller holding a *sentence* — the message it is about to answer — can name neither, so it asks about
+the actor alone and gets whatever that actor happened to write. Where nothing was ever written under
+that name, the answer is empty every time and nothing about it looks broken.
+
+`--infer-entities SPEC_DIR` with `--infer-from TEXT` is the way out: the same extractor `yaam-emit`
+runs over a record's prose, run here over the request's prose, and what comes out are lookup keys.
+Either flag alone is refused — text with no rules cannot be read and rules with no text have nothing
+to read, and either would compose a narrower bundle than was asked for while answering `200`.
+
+**The precision calculus inverts between the two ends, and the floor does not move.** At write time
+an inferred reference *becomes* a stored join key, which is why the rules are held below `0.9` and
+why a bundle joins only on references a record states at `1.0`: a guess in a bundle is a guess the
+caller cannot tell apart from a fact. At read time an inferred entity is only a lookup key. It
+matches records that reference it at full confidence, or it matches nothing — so a wrong guess costs
+one wasted lookup rather than a permanent falsehood, and this may infer freely where the writer may
+not. A record whose only reference was inferred stays out of every bundle, exactly as before.
+
+```bash
+yaam-read bundle --infer-entities /srv/memory/spec \
+          --infer-from "picking the PROJ-42 rollout back up" --limit 5
+```
 
 ### The keyring file
 

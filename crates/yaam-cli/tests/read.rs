@@ -141,6 +141,149 @@ fn every_read_is_answered_through_a_socket_the_caller_holds_no_key_for() {
     service.stop();
 }
 
+/// The rules the workspace ships, as a caller names them.
+fn spec_dir() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec")
+        .to_str()
+        .expect("utf-8 path")
+        .to_owned()
+}
+
+/// Writes one record and returns its identifier.
+fn emit(socket: &std::path::Path, extra: &[&str]) -> String {
+    let mut args = vec![
+        "--socket",
+        socket.to_str().expect("utf-8"),
+        "--agent",
+        "agent_a",
+        "--action",
+        "note",
+        "--outcome",
+        "success",
+    ];
+    args.extend_from_slice(extra);
+    let emitted = yaam_emit(&args, &[]);
+    assert_eq!(
+        emitted.status.code(),
+        Some(0),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    String::from_utf8_lossy(&emitted.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .expect("the record identifier")
+        .to_owned()
+}
+
+/// A bundle asks about entities it read out of the request's own prose — and joins on no more than
+/// it did before.
+///
+/// Two records, and the difference between them is the property under test. One *states*
+/// `ticket:PROJ-77`; the other only mentions `ticket:PROJ-88` in prose, so its one reference was
+/// inferred at the confidence an inferred reference carries. A bundle must return the first and
+/// never the second: read-time inference decides what to look *for*, and is not allowed to decide
+/// what counts as found.
+///
+/// So this is two assertions in one deployment, and neither means much alone. Without the first, an
+/// empty bundle would only show that the lookup key never got there; without the second, the floor
+/// could have been lowered and nothing here would notice.
+#[test]
+fn prose_names_the_entities_a_bundle_asks_about_without_lowering_what_it_joins_on() {
+    let deployment = Deployment::new();
+    let mut service = Service::start(&deployment);
+    let (socket, mut agent) = sidecar(
+        &deployment,
+        "agent",
+        &format!("http://{}", service.address),
+        &service.sealing_public_key,
+    );
+    let spec = spec_dir();
+    let stated = emit(
+        &socket,
+        &[
+            "--summary",
+            "picked the review back up",
+            "--entity",
+            "ticket:PROJ-77",
+        ],
+    );
+    let inferred = emit(
+        &socket,
+        &[
+            "--summary",
+            "reopened ticket PROJ-88 after the overnight report",
+            "--infer-entities",
+            &spec,
+        ],
+    );
+    assert_ne!(stated, inferred);
+
+    let env = hook_env(&read_socket(&socket));
+    let env = as_pairs(&env);
+
+    // The inferred record is really there and really carries the reference. Its history says so,
+    // because a history accepts every confidence — which is exactly what a bundle does not.
+    let history = answered(&["history", "--entity", "ticket:PROJ-88"], &env);
+    assert_eq!(history["records"][0]["record_id"], inferred, "{history}");
+
+    // A sentence naming the stated entity finds the record that stated it. This is the read that
+    // did not exist before: nothing here typed `ticket:PROJ-77`.
+    let found = answered(
+        &[
+            "bundle",
+            "--infer-entities",
+            &spec,
+            "--infer-from",
+            "any news on ticket PROJ-77?",
+            "--limit",
+            "5",
+        ],
+        &env,
+    );
+    assert_eq!(found["records"][0]["record_id"], stated, "{found}");
+
+    // The empty answer below has to mean the floor held, not that the key never travelled. So the
+    // request itself is checked first, where a dry run can print it without a socket.
+    let dry = yaam_read(
+        &[
+            "--dry-run",
+            "bundle",
+            "--infer-entities",
+            &spec,
+            "--infer-from",
+            "any news on ticket PROJ-88?",
+        ],
+        &[],
+    );
+    let printed = String::from_utf8_lossy(&dry.stdout);
+    assert!(printed.contains("entity=ticket%3APROJ-88"), "{printed}");
+
+    // The same sentence about the inferred one asks the same question and is answered with nothing.
+    let empty = answered(
+        &[
+            "bundle",
+            "--infer-entities",
+            &spec,
+            "--infer-from",
+            "any news on ticket PROJ-88?",
+            "--limit",
+            "5",
+        ],
+        &env,
+    );
+    assert_eq!(
+        empty["records"].as_array().map(Vec::len),
+        Some(0),
+        "a reference a record only implies must not reach a bundle: {empty}"
+    );
+
+    terminate(&mut agent, "yaam-agent");
+    service.stop();
+}
+
 /// A read that matched nothing is an answer, not a failure.
 ///
 /// The distinction the whole exit table exists for. Folded into a failure, every quiet day would

@@ -50,6 +50,7 @@ pub mod emit;
 pub mod error;
 pub mod exit;
 pub mod guard;
+pub mod infer;
 pub mod keyring;
 pub mod ops;
 pub mod read;
