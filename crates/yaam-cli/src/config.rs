@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use yaam_core::Paths;
+use yaam_core::resolve::{ReferenceSubjects, SubjectKinds};
+use yaam_crypto::subject::SubjectKey;
 
 use crate::cli::{AgentArgs, EmitArgs, ReadArgs, ServerArgs, StoreArgs};
 use crate::error::{Error, Result, config, failed};
@@ -34,6 +36,8 @@ pub const ENV_KEY_STORE: &str = "YAAM_KEY_STORE";
 
 /// Environment variable naming the file that holds the key-wrapping passphrase.
 pub const ENV_KEY_PASSPHRASE_FILE: &str = "YAAM_KEY_PASSPHRASE_FILE";
+/// Environment variable naming the file that holds the subject-pseudonym secret.
+pub const ENV_SUBJECT_KEY_FILE: &str = "YAAM_SUBJECT_KEY_FILE";
 /// Environment variable naming the address the service listens on.
 pub const ENV_LISTEN: &str = "YAAM_LISTEN";
 /// Environment variable naming the keyring file.
@@ -92,6 +96,8 @@ pub struct Env {
     pub key_store: Option<OsString>,
     /// `YAAM_KEY_PASSPHRASE_FILE`.
     pub key_passphrase_file: Option<OsString>,
+    /// [`ENV_SUBJECT_KEY_FILE`].
+    pub subject_key_file: Option<OsString>,
     /// [`ENV_LISTEN`].
     pub listen: Option<OsString>,
     /// [`ENV_KEYRING`].
@@ -124,6 +130,7 @@ impl Env {
             index: std::env::var_os(ENV_INDEX),
             key_store: std::env::var_os(ENV_KEY_STORE),
             key_passphrase_file: std::env::var_os(ENV_KEY_PASSPHRASE_FILE),
+            subject_key_file: std::env::var_os(ENV_SUBJECT_KEY_FILE),
             listen: std::env::var_os(ENV_LISTEN),
             keyring: std::env::var_os(ENV_KEYRING),
             unseal_key_file: std::env::var_os(ENV_UNSEAL_KEY),
@@ -147,6 +154,12 @@ pub struct StoreSettings {
     pub paths: Paths,
     /// Where the wrapping passphrase is read from, if key material is protected at all.
     pub key_passphrase_file: Option<PathBuf>,
+    /// Where the subject-pseudonym secret is read from, if this store keys erasure on anything.
+    ///
+    /// The path, never the secret. These settings are cloned into the startup log's own description
+    /// and into every error that names the configuration, so the bytes are read at [`StoreSettings::open`]
+    /// and go straight into the resolver that holds them.
+    pub subject_key_file: Option<PathBuf>,
 }
 
 impl StoreSettings {
@@ -218,9 +231,14 @@ impl StoreSettings {
             flags.key_passphrase_file.as_deref(),
             env.key_passphrase_file.as_deref(),
         );
+        let subject_key_file = pick(
+            flags.subject_key_file.as_deref(),
+            env.subject_key_file.as_deref(),
+        );
         Ok(Self {
             paths,
             key_passphrase_file,
+            subject_key_file,
         })
     }
 
@@ -231,15 +249,77 @@ impl StoreSettings {
     /// run the build that wrote it, or delete the index and rebuild from the tree.
     pub fn open(&self) -> Result<yaam_core::Pipeline> {
         let pipeline = self.open_unwrapped()?;
-        match &self.key_passphrase_file {
-            None => Ok(pipeline),
+        let pipeline = match &self.key_passphrase_file {
+            None => pipeline,
             Some(path) => {
                 let wrapper = Self::wrapper(path)?;
                 pipeline
                     .with_key_wrapper(wrapper)
-                    .map_err(|error| failed("fitting the key wrapper", &error))
+                    .map_err(|error| failed("fitting the key wrapper", &error))?
+            }
+        };
+        self.with_subject_resolver(pipeline)
+    }
+
+    /// Fits the resolver this store's `spec/subjects.yaml` asks for, or holds the two halves apart.
+    ///
+    /// Both halves or neither, refused rather than degraded, because each half alone is a deployment
+    /// that believes something untrue about itself. A declaration with no secret is a store that
+    /// cannot key the records it says are erasure units, and would say so one refused write at a
+    /// time; a secret with no declaration is an operator who believes bodies are being sealed while
+    /// every one of them is written in the clear — into the tree, the cold manifests and every
+    /// backup, where no later decision can reach them.
+    ///
+    /// Neither half is the shipped state, and it leaves the store exactly as it was before any of
+    /// this existed: no subject resolves, nothing is sealed.
+    fn with_subject_resolver(&self, pipeline: yaam_core::Pipeline) -> Result<yaam_core::Pipeline> {
+        let declared = SubjectKinds::load(&self.paths.root)
+            .map_err(|error| failed("reading spec/subjects.yaml", &error))?;
+        match (declared, &self.subject_key_file) {
+            (None, None) => Ok(pipeline),
+            (None, Some(path)) => Err(config(format!(
+                "--subject-key-file {} is set and {}/spec/{} declares no erasure units, so nothing \
+                 would be sealed: remove the flag, or declare the entity kinds this store keys \
+                 erasure on",
+                path.display(),
+                self.paths.root.display(),
+                SubjectKinds::SPEC_FILE
+            ))),
+            (Some(kinds), None) => Err(config(format!(
+                "{}/spec/{} keys erasure on {}, and no --subject-key-file is set: this process \
+                 cannot derive a pseudonym, so it would refuse every subject-derived record it was \
+                 sent. Pass the flag or set {ENV_SUBJECT_KEY_FILE}",
+                self.paths.root.display(),
+                SubjectKinds::SPEC_FILE,
+                kinds.kinds().join(", ")
+            ))),
+            (Some(kinds), Some(path)) => {
+                let key = Self::subject_key(path)?;
+                tracing::info!(
+                    kinds = kinds.kinds().join(", "),
+                    "erasure is keyed on the references records state"
+                );
+                Ok(pipeline.with_subject_resolver(ReferenceSubjects::new(kinds, key)))
             }
         }
+    }
+
+    /// Reads the subject-pseudonym secret.
+    ///
+    /// Trailing newlines go, because a file written by `echo` and one written by a secret manager
+    /// would otherwise be two different secrets — and here that means two pseudonyms for one
+    /// transaction, which nothing can relate again afterwards. No message quotes the content: a
+    /// configuration error that did would put the secret into every log that captured the startup
+    /// failure.
+    fn subject_key(path: &Path) -> Result<SubjectKey> {
+        let read = std::fs::read_to_string(path)
+            .map_err(|error| config(format!("cannot read {}: {error}", path.display())))?;
+        SubjectKey::from_hex(read.trim()).map_err(|error| {
+            config(format!(
+                "--subject-key-file {} does not hold a subject key: {error}",
+                path.display()
+            ))
+        })
     }
 
     /// The wrapper the configured passphrase describes.
@@ -308,6 +388,13 @@ impl StoreSettings {
                         " (relocated)"
                     }
                 ),
+            ),
+            (
+                "subject-key",
+                match &self.subject_key_file {
+                    Some(path) => path.display().to_string(),
+                    None => "none: no body can be sealed".to_owned(),
+                },
             ),
         ]
     }
@@ -575,9 +662,12 @@ fn pick_str(flag: Option<&str>, from_env: Option<&std::ffi::OsStr>) -> Option<St
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::{AgentSettings, Env, ServerSettings, StoreSettings, log_level, socket_spec};
+    use super::{
+        AgentSettings, ENV_SUBJECT_KEY_FILE, Env, ServerSettings, StoreSettings, SubjectKinds,
+        log_level, socket_spec,
+    };
     use crate::cli::{AgentArgs, ServerArgs, StoreArgs};
     use crate::exit::Exit;
 
@@ -594,7 +684,126 @@ mod tests {
             index: None,
             key_store: None,
             key_passphrase_file: None,
+            subject_key_file: None,
         }
+    }
+
+    /// Store args naming a subject-key file.
+    fn subject_key_args(root: &Path, file: &Path) -> StoreArgs {
+        StoreArgs {
+            subject_key_file: Some(file.to_path_buf()),
+            ..store_args(Some(root))
+        }
+    }
+
+    /// A tree that declares which entity kinds are erasure units, and a key file for them.
+    fn keyed_tree() -> (tempfile::TempDir, PathBuf) {
+        let dir = tree();
+        let spec = dir.path().join("spec");
+        std::fs::write(
+            spec.join("entities.yaml"),
+            "version: 1\nkinds:\n  order_ref:\n    pattern: '^[a-z0-9]{8,24}$'\n",
+        )
+        .expect("written");
+        std::fs::write(
+            spec.join(SubjectKinds::SPEC_FILE),
+            "version: 1\nkinds:\n  - order_ref\n",
+        )
+        .expect("written");
+        let key = dir.path().join("subject.key");
+        std::fs::write(&key, format!("{}\n", "5a".repeat(32))).expect("written");
+        (dir, key)
+    }
+
+    /// The state every store is in until an operator decides otherwise: nothing declared, no secret,
+    /// and a pipeline that resolves no subject and seals nothing.
+    #[test]
+    fn a_store_that_declares_no_erasure_units_needs_no_subject_key() {
+        let dir = tree();
+        let settings = StoreSettings::resolve(&store_args(Some(dir.path())), &Env::default())
+            .expect("resolved");
+        assert_eq!(settings.subject_key_file, None);
+        settings.open().expect("opened, as it always did");
+        assert!(
+            settings
+                .describe()
+                .iter()
+                .any(|(name, value)| *name == "subject-key" && value.starts_with("none")),
+            "the startup log says which of the two states this is"
+        );
+    }
+
+    #[test]
+    fn a_declaration_and_a_key_together_open_the_store() {
+        let (dir, key) = keyed_tree();
+        let settings = StoreSettings::resolve(&subject_key_args(dir.path(), &key), &Env::default())
+            .expect("resolved");
+        settings.open().expect("opened with a resolver fitted");
+    }
+
+    /// Half a configuration is refused rather than degraded: this half would seal nothing while an
+    /// operator believed otherwise, and a body written in the clear cannot be reclassified later.
+    #[test]
+    fn a_subject_key_without_a_declaration_is_refused() {
+        let dir = tree();
+        let key = dir.path().join("subject.key");
+        std::fs::write(&key, "5a".repeat(32)).expect("written");
+        let settings = StoreSettings::resolve(&subject_key_args(dir.path(), &key), &Env::default())
+            .expect("resolved");
+        let err = settings.open().expect_err("nothing to derive over");
+        assert!(
+            err.to_string().contains("declares no erasure units"),
+            "{err}"
+        );
+    }
+
+    /// And this half would refuse every subject-derived record it was sent, one write at a time, at
+    /// the caller, instead of once at startup.
+    #[test]
+    fn a_declaration_without_a_subject_key_is_refused() {
+        let (dir, _key) = keyed_tree();
+        let settings = StoreSettings::resolve(&store_args(Some(dir.path())), &Env::default())
+            .expect("resolved");
+        let err = settings.open().expect_err("no secret to derive with");
+        assert!(
+            err.to_string().contains("cannot derive a pseudonym"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(ENV_SUBJECT_KEY_FILE), "{err}");
+    }
+
+    #[test]
+    fn a_subject_key_file_that_holds_no_key_is_refused() {
+        let (dir, key) = keyed_tree();
+        for content in ["", "not hex", &"5a".repeat(16)] {
+            std::fs::write(&key, content).expect("written");
+            let settings =
+                StoreSettings::resolve(&subject_key_args(dir.path(), &key), &Env::default())
+                    .expect("resolved");
+            let err = settings.open().expect_err("not a subject key");
+            assert!(
+                err.to_string().contains("does not hold a subject key"),
+                "{content:?}: {err}"
+            );
+        }
+        std::fs::remove_file(&key).expect("removed");
+        let settings = StoreSettings::resolve(&subject_key_args(dir.path(), &key), &Env::default())
+            .expect("resolved");
+        assert!(
+            settings.open().is_err(),
+            "an absent key file is refused too"
+        );
+    }
+
+    /// A trailing newline is not part of the secret, because a file written by `echo` and one written
+    /// by a secret manager would otherwise derive two pseudonyms for one transaction.
+    #[test]
+    fn a_trailing_newline_is_not_part_of_the_subject_key() {
+        let (dir, key) = keyed_tree();
+        std::fs::write(&key, format!("{}\r\n", "5a".repeat(32))).expect("written");
+        let settings = StoreSettings::resolve(&subject_key_args(dir.path(), &key), &Env::default())
+            .expect("resolved");
+        settings.open().expect("opened");
     }
 
     /// Store args naming a passphrase file.
@@ -743,6 +952,7 @@ mod tests {
             index: Some(dir.path().join("elsewhere/index.sqlite")),
             key_store: Some(dir.path().join("secrets")),
             key_passphrase_file: None,
+            subject_key_file: None,
         };
         let settings = StoreSettings::resolve(&flags, &Env::default()).expect("resolved");
         assert_eq!(
@@ -770,6 +980,7 @@ mod tests {
             index: Some(dir.path().join("spec")),
             key_store: None,
             key_passphrase_file: None,
+            subject_key_file: None,
         };
         let error = StoreSettings::resolve(&flags, &Env::default()).expect_err("a directory");
         assert!(error.to_string().contains("--index"), "{error}");
@@ -956,6 +1167,7 @@ mod tests {
             index: Some(blocked),
             key_store: None,
             key_passphrase_file: None,
+            subject_key_file: None,
         };
         std::fs::write(dir.path().join("spec/entities.yaml"), "version: 1\n").expect("write");
         let settings = StoreSettings::resolve(&flags, &Env::default()).expect("resolved");

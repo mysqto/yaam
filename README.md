@@ -50,6 +50,7 @@ spec/             the contract bundle other implementations vendor
   entities.yaml     entity kinds and their canonical ID forms
   extractors.yaml   when text is evidence that a kind was meant — anchors, guards, confidence
   attrs-schema.yaml declared attributes per action, and which of them may sit in plaintext
+  subjects.yaml     which entity kinds are erasure units — absent, and no body is ever sealed
   redaction/        the redaction policies the writer masks against and the service checks
 ```
 
@@ -57,9 +58,10 @@ spec/             the contract bundle other implementations vendor
 
 Five binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
 `--key-store` default to sitting under it, and every setting is also read from the environment
-(`YAAM_ROOT`, `YAAM_INDEX`, `YAAM_KEY_STORE`, `YAAM_LISTEN`, `YAAM_KEYRING`,
-`YAAM_UNSEAL_KEY_FILE`, `YAAM_MAINTENANCE_MS`, `YAAM_AGENT_STATE`, `YAAM_SOCKET`, `YAAM_AGENT`,
-`YAAM_READ_SOCKET`, `YAAM_LOG`). A flag beats the environment.
+(`YAAM_ROOT`, `YAAM_INDEX`, `YAAM_KEY_STORE`, `YAAM_KEY_PASSPHRASE_FILE`,
+`YAAM_SUBJECT_KEY_FILE`, `YAAM_LISTEN`, `YAAM_KEYRING`, `YAAM_UNSEAL_KEY_FILE`,
+`YAAM_MAINTENANCE_MS`, `YAAM_AGENT_STATE`, `YAAM_SOCKET`, `YAAM_AGENT`, `YAAM_READ_SOCKET`,
+`YAAM_LOG`). A flag beats the environment.
 
 Two of the five open a store and three never do. `yaam-agent`, `yaam-emit` and `yaam-read` run on the
 caller's host and have no `--root` to give them: that is what lets a caller record what it did, and
@@ -501,15 +503,59 @@ labelled corpus of short neutral texts — genuine references in context, ordina
 loose pattern, digit runs that are timestamps or quantities, identifiers with nothing vouching for
 them — and the test beside it fails below 0.95 precision.
 
+## Keying erasure on a reference
+
+Nothing in a store is sealed until it declares what an erasure unit *is*. `spec/subjects.yaml` names
+the entity kinds whose reference is one, most preferred first:
+
+```yaml
+version: 1
+kinds:
+  - order_ref
+```
+
+The pseudonym is then `HMAC-SHA256(subject_key, "subject-pseudo:1" ‖ canon_ver ‖ "order_ref:<id>")`,
+rendered as `s_` and 64 hex digits, over the canonical id `entities.yaml` already rewrote on the way
+in. The secret comes from `--subject-key-file` — 32 bytes of hex, a file rather than a value for the
+reason `--key-passphrase-file` is one — and it stays with the service: a caller holding it would be a
+caller able to de-pseudonymise every backup, and callers here are meant to hold no key material.
+
+**Both halves or neither.** A declaration with no secret refuses at startup rather than refusing
+records one at a time; a secret with no declaration refuses too, because the alternative is an
+operator who believes bodies are sealed while every one is written in the clear — into the tree, the
+cold manifests and every backup, where nothing later can reach them. Neither half is the shipped
+state and changes nothing: no subject resolves, and no key is ever minted.
+
+**The erasure unit is the transaction, not the person.** Nothing on the write path claims to know
+whose transaction it is, so nothing on the write path can be wrong about that — which matters because
+this store cannot correct a subject set: re-presenting a published record is a duplicate, there is no
+re-key, and there is no delete. A body sealed to the wrong pseudonym would be erasable by the wrong
+person's request and unreachable by the right one's, and verification would report the erasure
+complete either way. So a person is resolved to references *outside* the store, at erasure time,
+where a miss is recoverable: enumerate again and destroy what was missed, because the keys are still
+there to destroy. That fan-out — person to references, and a reference to its pseudonym under every
+live canonicalisation version — is the operator's, because `erase` takes one hash.
+
+**What it refuses rather than guess.** A record whose class says subject-derived and which states no
+reference of a declared kind is rejected, and so is one that states two references of the same kind:
+two of equal standing have no rule to choose between them, sealing to both would make each
+transaction's erasure destroy the other's body, and picking one would be a coin toss recorded as a
+fact. Only references a caller *stated* count — one inferred from prose is a guess, and a guess may
+not decide whether a body becomes permanently unerasable. A refused record is one that was never
+written, which is the only failure here that can still be fixed.
+
+Changing the canonicalisation is a version, never an edit: the version number is an input to the
+HMAC, so a bump makes every subject hash differently and uniformly, and the old rules stay registered
+because records filed under them keep a hash only those rules reproduce.
+
 ## Deployment seams
 
-Two traits a deployment implements, neither with an implementation in this repo, and both with a
-default that behaves exactly as not using them did.
+Two traits a deployment implements, both with a default that behaves exactly as not using them did.
 
 | | |
 |---|---|
 | `yaam_crypto::keystore::KeyWrapper` | Wraps subject keys before they reach the disk, so a key file recovered from a snapshot or a stale volume is inert without a call to external key custody. `FsKeyStore::unwrapped` is the development default, named so nobody gets it by accident. |
-| `yaam_core::resolve::SubjectResolver` | Decides the subjects a record names. `DeclaredSubjects` trusts the ones it carries; a lookup that is briefly down quarantines the record for a later retry rather than rejecting it. |
+| `yaam_core::resolve::SubjectResolver` | Decides the subjects a record names. `DeclaredSubjects` trusts the ones it carries; a lookup that is briefly down quarantines the record for a later retry rather than rejecting it, and one that will never key a given record rejects it with the reason. `ReferenceSubjects` is the implementation this repo ships — see above — and it is fitted only by a store that declares erasure units. |
 
 ## Crash tests
 

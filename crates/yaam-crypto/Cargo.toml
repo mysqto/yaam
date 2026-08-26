@@ -20,6 +20,12 @@ aes-gcm = "0.11"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 aes-kw = { version = "0.3", features = ["zeroize"] }
 hkdf = "0.13"
+# HMAC-SHA256, for the subject pseudonym. The same construction hkdf already uses, exposed directly
+# because a pseudonym is a keyed hash of an identifier rather than a derivation of another key.
+hmac = "0.13"
+# Unicode NFC, for the canonical form a pseudonym is taken over. Without it one character typed as a
+# composed code point and as a decomposed pair would be two subjects that nothing can relate again.
+unicode-normalization = "0.1"
 sha2 = "0.11"
 rand = "0.10"
 zeroize = "1.9"

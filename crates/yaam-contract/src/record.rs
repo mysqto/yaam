@@ -174,10 +174,19 @@ impl ActionRecord {
     /// record's directory from its date — so an unreadable stamp reaching that far surfaces as a
     /// `NOT NULL` violation inside a publish, naming a column rather than the field that was sent.
     ///
-    /// The subject rule runs both ways. A subject-derived record with no subjects would be sealed
-    /// under a key nobody can destroy — unerasable by construction — and an internal record that
-    /// names subjects claims erasability its plaintext body cannot deliver. Either way the record's
-    /// class and its contents disagree, and only the writer can say which was meant.
+    /// The subject rule runs one way here and the other way on the write path, and the asymmetry is
+    /// deliberate. An internal record that names subjects claims an erasability its plaintext body
+    /// cannot deliver, nothing later can make that claim true, and only the writer knows which half
+    /// it meant — so it is refused wherever a record is read.
+    ///
+    /// A subject-derived record that names none is the same fault only if it is still true after
+    /// resolution. A deployment whose store derives pseudonyms keeps the keying secret in the
+    /// service, precisely so no caller holds it; such a caller cannot compute a pseudonym and would
+    /// have to send a value it knows is wrong to get past a check here. So that half is checked once
+    /// the subjects are settled instead — the write pipeline refuses a record that resolves to no
+    /// subject, before a byte of it is written, because its body would be sealed under a key nobody
+    /// can destroy. Refusing it here as well would not add a guarantee; it would only rule out every
+    /// deployment that resolves subjects on the write path.
     pub fn validate(&self) -> crate::Result<()> {
         if self.action.trim().is_empty() {
             return Err(crate::Error::Invalid("action is empty".to_owned()));
@@ -191,19 +200,11 @@ impl ActionRecord {
             }
         }
 
-        match self.data_class {
-            DataClass::SubjectDerived if self.subjects.is_empty() => {
-                return Err(crate::Error::Invalid(
-                    "subject-derived record names no subject".to_owned(),
-                ));
-            }
-            DataClass::Internal if !self.subjects.is_empty() => {
-                return Err(crate::Error::Invalid(format!(
-                    "internal record names {} subject(s)",
-                    self.subjects.len()
-                )));
-            }
-            _ => {}
+        if self.data_class == DataClass::Internal && !self.subjects.is_empty() {
+            return Err(crate::Error::Invalid(format!(
+                "internal record names {} subject(s)",
+                self.subjects.len()
+            )));
         }
 
         if self.visibility == Visibility::Team
@@ -281,14 +282,21 @@ pub(crate) mod tests {
         internal_record().validate().unwrap();
     }
 
+    /// A subject-derived record may leave its subjects to the store, because a deployment that
+    /// derives pseudonyms in the service is one whose callers cannot compute one. What such a record
+    /// must not do is get written that way, and that is the write pipeline's refusal to make: it is
+    /// the only place where "this resolved to no subject" is a fact rather than a guess about what
+    /// the store will do next.
     #[test]
-    fn a_subject_derived_record_must_name_a_subject() {
+    fn a_subject_derived_record_may_name_no_subject_and_leave_it_to_resolution() {
         let mut r = internal_record();
         r.data_class = DataClass::SubjectDerived;
-        assert!(r.validate().is_err());
+        r.validate()
+            .expect("the subjects are the store's to settle");
 
         r.subjects.push(subject());
-        r.validate().unwrap();
+        r.validate()
+            .expect("and a record that brings its own is no worse");
     }
 
     #[test]

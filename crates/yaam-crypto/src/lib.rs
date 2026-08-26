@@ -32,7 +32,9 @@ pub mod envelope;
 pub mod error;
 pub mod keystore;
 pub mod seal;
+pub mod subject;
 pub mod wrapper;
 
 pub use error::{Error, Result};
 pub use seal::{BareShare, Dek, Epoch, Nonce, SealedBody, WrappedShare};
+pub use subject::{Canon, Pseudonym, SUBJECT_KEY_LEN, SubjectKey};

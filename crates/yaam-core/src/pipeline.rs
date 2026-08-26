@@ -449,6 +449,11 @@ impl Pipeline {
                 );
                 return Err(Error::SubjectUnresolved);
             }
+            // Rejected rather than held, and this is the branch that must not be confused with the
+            // one above: a record the resolver cannot key is a record no retry improves, and a spool
+            // file for it would never empty. The reason reaches the caller, because it is the caller
+            // who holds the record and can fix what it names.
+            Resolution::Refused(reason) => return Err(invalid(reason)),
         };
         check_class(record, &resolved)?;
         let sealed = self.seal_body(record, &resolved, stamp, body)?;
@@ -1049,6 +1054,16 @@ mod tests {
                 Some(subjects) => Resolution::Resolved(subjects.clone()),
                 None => Resolution::Unavailable("no entry for this record yet".to_owned()),
             }
+        }
+    }
+
+    /// A lookup that can say the record itself is the problem, which is a different answer from
+    /// either "here they are" or "ask me later".
+    struct Refuses;
+
+    impl SubjectResolver for Refuses {
+        fn resolve(&self, _record: &yaam_contract::ActionRecord) -> Resolution {
+            Resolution::Refused("the record names two of them".to_owned())
         }
     }
 
@@ -1863,6 +1878,34 @@ mod tests {
                 .expect("not a rejection"),
             Accepted::Quarantined(unknown.record_id)
         );
+    }
+
+    /// A refusal is rejected with its reason and holds nothing back. The distinction that matters:
+    /// the same record arriving while a lookup is down is spooled, and one the resolver will never be
+    /// able to key would sit in that spool for ever, never queryable and never published.
+    #[test]
+    fn a_refused_record_is_rejected_with_its_reason_and_not_spooled() {
+        let mut harness = Harness::new().resolving_with(Refuses);
+        let record = testkit::subject_derived(T09, &[testkit::subject('a')]);
+        let id = record.record_id.clone();
+
+        let err = harness
+            .pipeline
+            .accept(record, BODY)
+            .expect_err("a record no retry improves");
+        assert!(
+            matches!(&err, crate::Error::Invalid(_)) && err.to_string().contains("two of them"),
+            "the caller is told what to fix: {err}"
+        );
+        assert!(
+            !harness
+                .root()
+                .join(crate::layout::QUARANTINE_DIR)
+                .join(format!("{}.md", id.as_str()))
+                .exists(),
+            "a permanent fault does not get a spool file"
+        );
+        assert_eq!(harness.counts()["quarantine_pending"], 0);
     }
 
     #[test]

@@ -36,6 +36,16 @@ pub struct StoreArgs {
     /// A file and not a value: an argument is visible in `ps` to every user on the host.
     #[arg(long, value_name = "PATH")]
     pub key_passphrase_file: Option<PathBuf>,
+    /// File holding the hex-encoded secret that subject pseudonyms are derived under. Required by,
+    /// and only by, a store whose `spec/subjects.yaml` says which entity kinds are erasure units.
+    /// Also read from `YAAM_SUBJECT_KEY_FILE`.
+    ///
+    /// A file rather than a value, for the reason above, and this process's rather than a caller's:
+    /// the secret cannot be rotated once its outputs are in filenames and in tombstones that are
+    /// never deleted, so every host that holds a copy is a host whose compromise de-pseudonymises
+    /// every backup ever taken.
+    #[arg(long, value_name = "PATH")]
+    pub subject_key_file: Option<PathBuf>,
 }
 
 /// Serve the memory service.
@@ -124,10 +134,12 @@ pub struct AgentArgs {
 /// and nothing here could turn the directory holding them into a store. They are configuration a
 /// deployment hands its caller hosts, the way it hands the sidecar an upstream.
 ///
-/// Subjects stay empty and the data class stays `internal`. What a subject *is* — how a person
-/// becomes a pseudonym, and under whose canonicalisation — is still an open decision, and a flag
-/// inviting one would let a caller declare a record erasable that this deployment cannot erase.
-/// A subject resolver is what will fill them in when that is settled, not an argument here.
+/// Subjects stay empty and the data class stays `internal`, and both are fixed rather than
+/// defaulted. A flag inviting either would let a caller declare a record erasable that this
+/// deployment cannot erase — and a caller here could not make the claim true even meaning to: the
+/// secret a pseudonym is derived under lives with the service, so a subject named on this command
+/// line could only be a value invented on a host that holds no key material. A subject resolver in
+/// the service is what fills them in, on a store that declares which references are erasure units.
 #[derive(Debug, Parser)]
 #[command(name = "yaam-emit", version, after_help = exit::HELP)]
 pub struct EmitCli {
@@ -926,9 +938,9 @@ mod tests {
         ));
     }
 
-    /// The decision that stays open has to stay open in the argument surface too. A `--subject`
-    /// would let a caller declare a record erasable under a canonicalisation nobody has chosen, and
-    /// the help is where a reader finds out why there is none.
+    /// The property that a resolver does not relax: a caller cannot declare a record erasable. A
+    /// `--subject` would put a pseudonym on a host that holds no keying secret to derive one with,
+    /// and the help is where a reader finds out why there is none.
     #[test]
     fn the_emitter_offers_no_way_to_name_a_subject() {
         let help = EmitCli::command().render_long_help().to_string();

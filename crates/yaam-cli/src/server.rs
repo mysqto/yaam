@@ -341,6 +341,7 @@ mod tests {
                     index: None,
                     key_store: None,
                     key_passphrase_file: None,
+                    subject_key_file: None,
                 },
                 listen: Some(listen.to_owned()),
                 keyring: Some(self.dir.path().join("keyring.json")),

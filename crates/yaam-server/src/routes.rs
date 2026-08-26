@@ -1132,9 +1132,16 @@ mod tests {
     async fn a_record_that_violates_the_contract_is_permanent() {
         let fake = Arc::new(Fake::new());
         let mut record = testing::record(WRITER);
-        // Subject-derived with no subject: the record claims erasability its body cannot deliver,
-        // and no retry of the same bytes will fix it.
-        record.data_class = yaam_contract::DataClass::SubjectDerived;
+        // Internal and naming a subject: the record claims an erasability its plaintext body cannot
+        // deliver, and no retry of the same bytes will fix it. The mirror case — subject-derived and
+        // naming none — is deliberately not a contract failure, because a store that derives
+        // pseudonyms cannot ask a caller for one; the write path refuses that after resolution.
+        record.subjects = vec![yaam_contract::SubjectRef {
+            hash: yaam_contract::SubjectHash::parse(&format!("s_{}", "ab".repeat(32)))
+                .expect("a valid hash"),
+            role: yaam_contract::Role::Principal,
+            canon_ver: yaam_contract::CanonVer(1),
+        }];
         let body = serde_json::json!({ "record": record }).to_string();
 
         let (status, answer) = serve(&fake, post("/records", Some(WRITER), &body)).await;

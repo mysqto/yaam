@@ -28,6 +28,23 @@ pub enum Error {
     /// A stored blob could not be parsed.
     #[error("malformed sealed block: {0}")]
     MalformedBlock(String),
+    /// A keying secret of the wrong size, which no amount of padding would make into one.
+    #[error("a subject key must be {expected} bytes, got {got}")]
+    SubjectKeyLength {
+        /// Bytes the derivation requires.
+        expected: usize,
+        /// Bytes supplied.
+        got: usize,
+    },
+    /// A keying secret that is not hex. Never quotes the value: a message that did would put the
+    /// secret into every log that captured the startup failure.
+    #[error("a subject key must be hex-encoded")]
+    SubjectKeyNotHex,
+    /// An identifier that canonicalises to nothing. Held apart from a malformed record because the
+    /// remedy is the caller's: one shared pseudonym for every such identifier would make each of
+    /// their bodies erasable by any one of their requests.
+    #[error("a subject identifier canonicalises to nothing under canon version {0}")]
+    SubjectIdEmpty(u32),
     /// Underlying I/O failure.
     #[error("key store io: {0}")]
     Io(#[from] std::io::Error),

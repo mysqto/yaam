@@ -10,7 +10,7 @@
 //! moved by moving a directory:
 //!
 //! ```text
-//! spec/                        configuration: entity kinds, attribute schema, redaction policy
+//! spec/                        configuration: entity kinds, attrs, redaction, erasure units
 //! records/YYYY/MM/DD/<id>.md   the authoritative record tree
 //! records/owner/<agent>/...    owner-visible records, one private subtree per owner
 //! entities/<kind>/<id>/        entity timelines, materialised by fan-out
