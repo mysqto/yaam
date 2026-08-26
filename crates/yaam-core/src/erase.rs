@@ -28,9 +28,17 @@ use crate::{Pipeline, Result, fsutil, layout};
 /// How long a key snapshot may still exist after destruction.
 ///
 /// Erasure cannot be asserted complete while a backup taken before the destruction is still inside
-/// its retention window, because restoring it would restore the key. The window is a property of the
-/// deployment's backup schedule; this is a conservative day.
-pub const KEY_BACKUP_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+/// its retention window, because restoring it would restore the key.
+///
+/// Seven days, because that is the number the erasure SLA states — *immediate for live copies,
+/// complete within seven days* — and this constant is what decides when the tombstone carries the
+/// completion stamp that sentence refers to. A key store on the intended schedule keeps seven daily
+/// copies on a rolling seven-day window, so a copy taken the hour before a destruction is on the
+/// shelf for nearly a week afterwards. A shorter window here would stamp a tombstone complete with
+/// six of those copies still holding the key, and the attestation would be false in the one
+/// direction nobody can check from the live tree. Erring long only makes an operator wait for a
+/// stamp; erring short makes the stamp a lie.
+pub const KEY_BACKUP_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// What an erasure did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -442,13 +450,12 @@ mod tests {
     /// erasure and an undercount would have them approve one they had not understood.
     #[test]
     fn a_preview_counts_what_an_erasure_would_reach() {
-        let (mut harness, subject, _) = with_sealed_record();
+        let (harness, subject, _) = with_sealed_record();
 
-        // A record held back for a different, tombstoned subject: in the quarantine spool, and not
-        // this subject's, so it must not be counted here.
+        // A record held back during a lookup outage, for a different subject who is then erased:
+        // in the quarantine spool, and not this subject's, so it must not be counted here.
         let other = testkit::subject('f');
-        yaam_crypto::keystore::KeyStore::tombstone(harness.pipeline.keys(), &other)
-            .expect("tombstone");
+        let mut harness = harness.resolving_with(testkit::UnavailableLookup);
         harness
             .pipeline
             .accept(
@@ -456,6 +463,9 @@ mod tests {
                 BODY,
             )
             .expect("quarantined");
+        let mut harness = harness.resolving_with(crate::resolve::DeclaredSubjects);
+        yaam_crypto::keystore::KeyStore::tombstone(harness.pipeline.keys(), &other)
+            .expect("tombstone");
 
         // A file the walk cannot parse must be skipped rather than abort the count.
         fs::write(
@@ -609,22 +619,54 @@ mod tests {
         verify_live(&harness.pipeline, &subject).expect("still erased after the rebuild");
     }
 
+    /// A record arriving after the erasure leaves the erasure exactly as complete as it was.
+    ///
+    /// The record is published structure-only by the write path — see
+    /// `pipeline::tests::a_record_for_an_erased_subject_is_published_without_a_body` — and the
+    /// property that belongs here is the erasure side of it: nothing new to destroy, nothing new to
+    /// hold, and a verification that still passes over a tree that has grown a record.
     #[test]
-    fn a_record_arriving_after_an_erasure_is_quarantined_and_then_settled() {
+    fn a_record_arriving_after_an_erasure_leaves_it_verified() {
         let (mut harness, subject, _) = with_sealed_record();
         erase_subject(&mut harness.pipeline, &subject).expect("erased");
 
-        // Late, and unsealable: its subject's keys are gone for good.
         let late = testkit::subject_derived("2026-08-24T09:00:00Z", std::slice::from_ref(&subject));
-        assert!(matches!(
-            harness
-                .pipeline
-                .accept(late, BODY)
-                .expect("held, not dropped"),
-            crate::pipeline::Accepted::Quarantined(_)
-        ));
+        harness
+            .pipeline
+            .accept(late, BODY)
+            .expect("published, not held");
+        assert_eq!(harness.counts()["quarantine_pending"], 0);
+        assert_eq!(harness.counts()["records"], 3);
+
+        let report = erase_subject(&mut harness.pipeline, &subject).expect("erased");
+        assert_eq!(
+            report.bodies_sealed_off, 0,
+            "the late record never had a body to take"
+        );
+        assert_eq!(report.quarantine_settled, 0);
+        verify_live(&harness.pipeline, &subject).expect("still verified");
+    }
+
+    /// A record held during a lookup outage is discarded when its subject is later erased.
+    ///
+    /// The spool copy is the last readable copy of that body, sealed under a quarantine key the
+    /// erasure does not destroy, so leaving it would leave the one thing the erasure was for.
+    #[test]
+    fn a_held_record_is_discarded_by_its_subjects_erasure() {
+        let (harness, _, _) = with_sealed_record();
+        let subject = testkit::subject('b');
+
+        let mut harness = harness.resolving_with(testkit::UnavailableLookup);
+        harness
+            .pipeline
+            .accept(
+                testkit::subject_derived("2026-08-24T09:00:00Z", std::slice::from_ref(&subject)),
+                BODY,
+            )
+            .expect("held, not dropped");
         assert_eq!(harness.counts()["quarantine_pending"], 1);
 
+        let mut harness = harness.resolving_with(crate::resolve::DeclaredSubjects);
         let report = erase_subject(&mut harness.pipeline, &subject).expect("erased");
         assert_eq!(
             report.quarantine_settled, 1,

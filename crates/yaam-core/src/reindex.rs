@@ -338,17 +338,18 @@ mod tests {
             .accept(testkit::owner("2026-08-22T11:30:00Z", "agent_b"), BODY)
             .expect("accepted");
 
-        let erased = testkit::subject('f');
-        yaam_crypto::keystore::KeyStore::tombstone(harness.pipeline.keys(), &erased)
-            .expect("tombstone");
+        // Held back because the subject lookup is down, which is the condition a retry improves and
+        // therefore the only one that spools: an erased subject is published structure-only.
+        let mut harness = harness.resolving_with(testkit::UnavailableLookup);
         harness
             .pipeline
             .accept(
-                testkit::subject_derived("2026-08-23T12:00:00Z", &[erased]),
+                testkit::subject_derived("2026-08-23T12:00:00Z", &[testkit::subject('f')]),
                 BODY,
             )
             .expect("quarantined");
 
+        let mut harness = harness.resolving_with(crate::resolve::DeclaredSubjects);
         harness.pipeline.drain_fanout(100).expect("drained");
         harness
     }

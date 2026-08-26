@@ -461,6 +461,20 @@ impl Pipeline {
     }
 
     /// Seals the body when the record is subject-derived, under the subjects resolution settled on.
+    ///
+    /// A subject whose keys have been destroyed is the case that must not be confused with a subject
+    /// lookup that is merely down, and it is the same distinction [`Resolution::Refused`] draws on
+    /// the resolver side: quarantine is for a condition a retry improves, and an erasure is not one.
+    /// Held back as unresolved, such a record would sit in the spool for ever — because resolution
+    /// can never succeed — holding a *readable* body, under a live quarantine key, about the one
+    /// person who asked for theirs to be gone, until some later erasure run for the same subject
+    /// happened to discard it.
+    ///
+    /// So it is published structure-only instead: the frontmatter still says who and when, the body
+    /// is dropped before it reaches disk, and no key is minted for a tombstoned subject. That is the
+    /// same shape an erased record already has, which is why nothing downstream needs a new field to
+    /// read it — [`crate::unseal::inspect`] reports it as shredded, with the tombstone that accounts
+    /// for it, and a later erasure finds nothing left to take.
     fn seal_body(
         &self,
         record: &ActionRecord,
@@ -472,18 +486,51 @@ impl Pipeline {
             return Ok(Body::Plain(body.to_owned()));
         }
         let subjects: Vec<SubjectHash> = resolved.iter().map(|s| s.hash.clone()).collect();
-        for subject in &subjects {
+        if self.tombstoned(&subjects)? {
+            tracing::warn!(
+                record = record.record_id.as_str(),
+                "a subject of this record is erased, so it is published with no body"
+            );
+            return Ok(Body::Plain(String::new()));
+        }
+        let epoch = Epoch::containing(stamp.ms);
+        match self.seal(&record.record_id, &subjects, &epoch, body) {
+            Ok(sealed) => Ok(Body::Sealed(sealed)),
+            Err(Error::SubjectUnresolved) => {
+                // The question above and the seal are not one operation, so an erasure running in
+                // another process can land between them. Asking again is what keeps that window
+                // from spooling a body whose key is already gone; a key store that cannot answer
+                // the second time leaves the record held, which is where it already was.
+                if self.tombstoned(&subjects).unwrap_or(false) {
+                    tracing::warn!(
+                        record = record.record_id.as_str(),
+                        "a subject of this record was erased mid-write, so it is published with no \
+                         body"
+                    );
+                    Ok(Body::Plain(String::new()))
+                } else {
+                    Err(Error::SubjectUnresolved)
+                }
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Whether any of these subjects has been erased.
+    ///
+    /// A key store that cannot answer is reported as an unresolved subject rather than as "not
+    /// erased": the alternative is sealing a body under a key the store was about to refuse.
+    fn tombstoned(&self, subjects: &[SubjectHash]) -> Result<bool> {
+        for subject in subjects {
             if self
                 .keys
                 .is_tombstoned(subject)
                 .map_err(|_| Error::SubjectUnresolved)?
             {
-                return Err(Error::SubjectUnresolved);
+                return Ok(true);
             }
         }
-        let epoch = Epoch::containing(stamp.ms);
-        let sealed = self.seal(&record.record_id, &subjects, &epoch, body)?;
-        Ok(Body::Sealed(sealed))
+        Ok(false)
     }
 
     /// Seals a body, mapping a key store that cannot answer onto quarantine.
@@ -1032,15 +1079,6 @@ mod tests {
     /// A record's server time, and so the directory it lands in.
     const T09: &str = "2026-08-20T09:14:03.117Z";
 
-    /// A subject lookup that is down. The case the quarantine spool was built for.
-    struct AlwaysUnavailable;
-
-    impl SubjectResolver for AlwaysUnavailable {
-        fn resolve(&self, _record: &yaam_contract::ActionRecord) -> Resolution {
-            Resolution::Unavailable("the lookup is not answering".to_owned())
-        }
-    }
-
     /// A subject lookup driven by a table keyed on the record identifier.
     ///
     /// Stands in for a deployment that decides a record's subjects itself rather than believing what
@@ -1199,35 +1237,70 @@ mod tests {
         );
     }
 
+    /// A record naming an erased subject is published with its structure and without its body.
+    ///
+    /// The behaviour this replaces held it as unresolved, which spooled a *readable* body about an
+    /// erased subject and spooled it for ever: resolution can never succeed for a subject whose
+    /// keys are gone, so nothing settled the file except a later erasure for the same subject
+    /// happening to discard it.
     #[test]
-    fn a_subject_that_cannot_be_resolved_is_quarantined_not_rejected() {
+    fn a_record_for_an_erased_subject_is_published_without_a_body() {
         let mut harness = Harness::new();
         let subject = testkit::subject('c');
-        // An erased subject: minting a key would un-erase it, so the record cannot be sealed.
+        // An erased subject: minting a key would un-erase it, so the body cannot be sealed at all.
         yaam_crypto::keystore::KeyStore::tombstone(harness.pipeline.keys(), &subject)
             .expect("tombstone");
 
-        let record = testkit::subject_derived(T09, &[subject]);
-        let accepted = harness
-            .pipeline
-            .accept(record.clone(), BODY)
-            .expect("not a rejection");
-        assert_eq!(accepted, Accepted::Quarantined(record.record_id.clone()));
+        let record = testkit::subject_derived(T09, std::slice::from_ref(&subject));
+        assert_eq!(
+            harness
+                .pipeline
+                .accept(record.clone(), BODY)
+                .expect("not a rejection"),
+            Accepted::Stored(record.record_id.clone())
+        );
 
-        // Unpublished, unindexed, but on disk and sealed rather than lost.
-        assert!(!harness.path_of(&record).exists());
-        assert_eq!(harness.counts()["records"], 0);
-        assert_eq!(harness.counts()["quarantine_pending"], 1);
-        let spooled = harness
-            .root()
-            .join(".quarantine")
-            .join(record.record_id.as_str().to_owned() + ".md");
-        let text = fs::read_to_string(&spooled).expect("spooled");
+        // Published and indexed, so the structural account survives — and nothing is held back,
+        // because there is nothing a retry would improve.
+        let path = harness.path_of(&record);
+        let text = fs::read_to_string(&path).expect("read");
+        let published = Document::parse(&text).expect("parses");
+        assert!(matches!(published.body, Body::Plain(ref body) if body.is_empty()));
         assert!(
             !text.contains("Rolled out"),
-            "a spooled body must be sealed too"
+            "the body must not reach disk in any form"
         );
-        assert!(text.contains(quarantine_subject("2026-08-20").expect("key").as_str()));
+        assert_eq!(published.record.subjects.len(), 1);
+        assert_eq!(harness.counts()["records"], 1);
+        assert_eq!(harness.counts()["quarantine_pending"], 0);
+        assert!(
+            !harness
+                .root()
+                .join(".quarantine")
+                .join(record.record_id.as_str().to_owned() + ".md")
+                .exists()
+        );
+
+        // And no key was minted for a subject whose keys were destroyed, which is what the older
+        // refusal was protecting: a fresh one here would un-erase them.
+        assert!(
+            yaam_crypto::keystore::KeyStore::get(
+                harness.pipeline.keys(),
+                &subject,
+                &yaam_crypto::Epoch::containing(
+                    yaam_contract::timestamp::parse_ms(T09).expect("parses")
+                ),
+            )
+            .expect("get")
+            .is_none()
+        );
+
+        // It reads back as what it is — shredded, with the erasure that accounts for it — rather
+        // than as a record whose body somebody could go looking for.
+        assert!(matches!(
+            crate::unseal::inspect(&harness.pipeline, &record.record_id).expect("inspected"),
+            crate::unseal::Held::Shredded { ref erasures, .. } if erasures.len() == 1
+        ));
     }
 
     #[test]
@@ -1251,11 +1324,8 @@ mod tests {
 
     #[test]
     fn a_replayed_quarantine_is_recorded_once() {
-        let mut harness = Harness::new();
-        let subject = testkit::subject('e');
-        yaam_crypto::keystore::KeyStore::tombstone(harness.pipeline.keys(), &subject)
-            .expect("tombstone");
-        let record = testkit::subject_derived(T09, &[subject]);
+        let mut harness = Harness::new().resolving_with(testkit::UnavailableLookup);
+        let record = testkit::subject_derived(T09, &[testkit::subject('e')]);
 
         for _ in 0..2 {
             assert!(matches!(
@@ -1791,7 +1861,7 @@ mod tests {
 
     #[test]
     fn a_resolver_that_cannot_answer_quarantines_and_the_record_comes_back() {
-        let mut harness = Harness::new().resolving_with(AlwaysUnavailable);
+        let mut harness = Harness::new().resolving_with(testkit::UnavailableLookup);
         let record = testkit::subject_derived(T09, &[testkit::subject('a')]);
 
         assert_eq!(
@@ -1808,11 +1878,14 @@ mod tests {
             .root()
             .join(".quarantine")
             .join(record.record_id.as_str().to_owned() + ".md");
+        let held = fs::read_to_string(&spooled).expect("spooled");
         assert!(
-            !fs::read_to_string(&spooled)
-                .expect("spooled")
-                .contains("Rolled out"),
+            !held.contains("Rolled out"),
             "a held body is sealed on disk, not merely delayed"
+        );
+        assert!(
+            held.contains(quarantine_subject("2026-08-20").expect("key").as_str()),
+            "sealed under the day's quarantine key, so the spool needs no second key store"
         );
 
         // The lookup comes back and the record is re-presented, which is the settle path that

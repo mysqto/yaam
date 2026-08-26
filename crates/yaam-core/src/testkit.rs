@@ -381,6 +381,19 @@ pub(crate) fn age(path: &Path, by_ms: u64) {
         .expect("set times");
 }
 
+/// A subject lookup that is down. The case the quarantine spool was built for.
+///
+/// Here rather than in one test module because it is now the only honest way to reach the spool: a
+/// tombstoned subject is published structure-only, so a test that wanted a held record and reached
+/// for an erasure to get one would be asserting over a path that no longer holds anything back.
+pub(crate) struct UnavailableLookup;
+
+impl crate::resolve::SubjectResolver for UnavailableLookup {
+    fn resolve(&self, _record: &ActionRecord) -> crate::resolve::Resolution {
+        crate::resolve::Resolution::Unavailable("the lookup is not answering".to_owned())
+    }
+}
+
 /// A subject pseudonym, distinct per `fill`, which must be a lowercase hex digit.
 pub(crate) fn subject(fill: char) -> SubjectHash {
     SubjectHash::parse(&format!("s_{}", fill.to_string().repeat(64))).expect("a valid hash")

@@ -218,14 +218,11 @@ mod tests {
     /// A quarantined record is held on disk, and the depth is read from there.
     #[test]
     fn a_held_record_is_counted_from_the_spool() {
-        let mut harness = Harness::new();
-        let erased = testkit::subject('f');
-        yaam_crypto::keystore::KeyStore::tombstone(harness.pipeline.keys(), &erased)
-            .expect("tombstone");
+        let mut harness = Harness::new().resolving_with(testkit::UnavailableLookup);
         harness
             .pipeline
             .accept(
-                testkit::subject_derived("2026-08-23T12:00:00Z", &[erased]),
+                testkit::subject_derived("2026-08-23T12:00:00Z", &[testkit::subject('f')]),
                 BODY,
             )
             .expect("quarantined");

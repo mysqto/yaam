@@ -163,9 +163,9 @@ pub fn verify_erasure(
     }
     let text = format!(
         "{tombstone}: not yet\neither a key file is still present, or a snapshot taken before the \
-         destruction is still inside its {} hour retention window. The destruction stands; only \
+         destruction is still inside its {} day retention window. The destruction stands; only \
          the attestation waits.\n",
-        erase::KEY_BACKUP_WINDOW_MS / (60 * 60 * 1_000)
+        erase::KEY_BACKUP_WINDOW_MS / (24 * 60 * 60 * 1_000)
     );
     emit(out, &text)?;
     Ok(Exit::Incomplete)
