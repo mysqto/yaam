@@ -167,6 +167,10 @@ pub struct Pseudonym {
 ///   secret into the first log line that formatted it.
 /// - There is no `Display`, no accessor for the bytes, and no [`Clone`]. Bytes go in; tags come out.
 /// - The bytes are cleared on drop.
+///
+/// Where they come from is [`crate::custody`]: a process fetches one of these at startup through
+/// [`crate::custody::SubjectKeySource`] and hands it to the resolver that derives with it. The
+/// constructors here take bytes and hex because that is what a source has to hand over.
 #[derive(ZeroizeOnDrop)]
 pub struct SubjectKey {
     /// Raw HMAC key material.

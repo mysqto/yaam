@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use yaam_core::Paths;
 use yaam_core::resolve::{ReferenceSubjects, SubjectKinds};
+use yaam_crypto::custody::{SubjectKeyFile, SubjectKeySource};
 use yaam_crypto::subject::SubjectKey;
 
 use crate::cli::{AgentArgs, EmitArgs, ReadArgs, ServerArgs, StoreArgs};
@@ -159,6 +160,10 @@ pub struct StoreSettings {
     /// The path, never the secret. These settings are cloned into the startup log's own description
     /// and into every error that names the configuration, so the bytes are read at [`StoreSettings::open`]
     /// and go straight into the resolver that holds them.
+    ///
+    /// A path is also what selects a custody backend — [`SubjectKeyFile`], the only one that ships.
+    /// Custody held by a keychain or a key service is a *different setting* beside this one rather
+    /// than a second meaning for this one, so a deployment that names a file keeps naming a file.
     pub subject_key_file: Option<PathBuf>,
 }
 
@@ -294,9 +299,17 @@ impl StoreSettings {
                 kinds.kinds().join(", ")
             ))),
             (Some(kinds), Some(path)) => {
-                let key = Self::subject_key(path)?;
+                // The one place a custody backend is chosen. A second one — a keychain, a key
+                // service — is a second setting resolved above and a second arm here, and nothing
+                // below this line learns which of them answered: `subject_key` takes the trait and
+                // the pipeline takes the key. Fetching an unrotatable key is not a thing to be
+                // changing once a store has sealed records under it.
+                let source = SubjectKeyFile::at(path);
+                let key =
+                    Self::subject_key(&source, &format!("--subject-key-file {}", path.display()))?;
                 tracing::info!(
                     kinds = kinds.kinds().join(", "),
+                    custody = source.custody(),
                     "erasure is keyed on the references records state"
                 );
                 Ok(pipeline.with_subject_resolver(ReferenceSubjects::new(kinds, key)))
@@ -304,22 +317,21 @@ impl StoreSettings {
         }
     }
 
-    /// Reads the subject-pseudonym secret.
+    /// Fetches the subject-pseudonym secret from `source`, or refuses to start.
     ///
-    /// Trailing newlines go, because a file written by `echo` and one written by a secret manager
-    /// would otherwise be two different secrets — and here that means two pseudonyms for one
-    /// transaction, which nothing can relate again afterwards. No message quotes the content: a
+    /// Takes the trait rather than a backend so a failure means one thing whatever the custody is:
+    /// the process does not come up. There is no retry above this and no degraded mode to fall into —
+    /// a service that started without the key would refuse every subject-derived record it was sent,
+    /// and the obvious remedy an operator would reach for is the one that writes bodies in the clear.
+    ///
+    /// `setting` is what an operator would change, which the source cannot know and this layer does:
+    /// a source names its custody, a flag names itself. No message quotes what was read — a
     /// configuration error that did would put the secret into every log that captured the startup
     /// failure.
-    fn subject_key(path: &Path) -> Result<SubjectKey> {
-        let read = std::fs::read_to_string(path)
-            .map_err(|error| config(format!("cannot read {}: {error}", path.display())))?;
-        SubjectKey::from_hex(read.trim()).map_err(|error| {
-            config(format!(
-                "--subject-key-file {} does not hold a subject key: {error}",
-                path.display()
-            ))
-        })
+    fn subject_key(source: &dyn SubjectKeySource, setting: &str) -> Result<SubjectKey> {
+        source
+            .fetch()
+            .map_err(|error| config(format!("{setting} does not hold a subject key: {error}")))
     }
 
     /// The wrapper the configured passphrase describes.
@@ -665,8 +677,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        AgentSettings, ENV_SUBJECT_KEY_FILE, Env, ServerSettings, StoreSettings, SubjectKinds,
-        log_level, socket_spec,
+        AgentSettings, ENV_SUBJECT_KEY_FILE, Env, ServerSettings, StoreSettings, SubjectKeySource,
+        SubjectKinds, log_level, socket_spec,
     };
     use crate::cli::{AgentArgs, ServerArgs, StoreArgs};
     use crate::exit::Exit;
@@ -793,6 +805,30 @@ mod tests {
             settings.open().is_err(),
             "an absent key file is refused too"
         );
+    }
+
+    /// The same refusal for custody a file cannot exhibit. A key service that is unreachable is the
+    /// failure the seam exists for, and what happens to it must not depend on which backend it was:
+    /// the process does not come up, and the message names the setting an operator would change.
+    #[test]
+    fn a_custody_backend_that_cannot_answer_refuses_at_startup() {
+        struct Unreachable;
+        impl SubjectKeySource for Unreachable {
+            fn fetch(&self) -> yaam_crypto::Result<yaam_crypto::SubjectKey> {
+                Err(yaam_crypto::Error::SubjectKeyUnavailable(
+                    "cannot reach it: the request timed out".to_owned(),
+                ))
+            }
+        }
+
+        let err = StoreSettings::subject_key(&Unreachable, "--subject-key-file /etc/absent")
+            .expect_err("custody that cannot answer is not a key");
+        assert!(
+            err.to_string().contains("does not hold a subject key"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("/etc/absent"), "{err}");
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     /// A trailing newline is not part of the secret, because a file written by `echo` and one written

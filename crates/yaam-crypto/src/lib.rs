@@ -19,6 +19,12 @@
 //! without whatever holds the master key. This crate ships only [`keystore::Passthrough`], which
 //! wraps nothing and says so.
 //!
+//! [`subject::SubjectKey`] is the second master secret and the one that cannot be rotated at all, so
+//! where it is fetched from is its own seam: [`custody::SubjectKeySource`], with
+//! [`custody::SubjectKeyFile`] the implementation that ships. A keychain or key service replaces the
+//! fetch and nothing else, which is only a refactor while it is done before the first record is
+//! sealed.
+//!
 //! Every seal and unseal needs a [`keystore::KeyStore`] to wrap and unwrap the shares, and takes
 //! one as an argument. There is deliberately no ambient store: the consumers are async, so a store
 //! installed in a thread-local would disappear the moment an `.await` moved the task to another
@@ -28,6 +34,7 @@
 #![forbid(unsafe_code)]
 
 pub mod block;
+pub mod custody;
 pub mod envelope;
 pub mod error;
 pub mod keystore;
@@ -35,6 +42,7 @@ pub mod seal;
 pub mod subject;
 pub mod wrapper;
 
+pub use custody::{SubjectKeyFile, SubjectKeySource};
 pub use error::{Error, Result};
 pub use seal::{BareShare, Dek, Epoch, Nonce, SealedBody, WrappedShare};
 pub use subject::{Canon, Pseudonym, SUBJECT_KEY_LEN, SubjectKey};

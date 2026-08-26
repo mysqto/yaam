@@ -520,6 +520,13 @@ in. The secret comes from `--subject-key-file` — 32 bytes of hex, a file rathe
 reason `--key-passphrase-file` is one — and it stays with the service: a caller holding it would be a
 caller able to de-pseudonymise every backup, and callers here are meant to hold no key material.
 
+**Where the secret comes from is a seam, not a file path.** That key can never be rotated — every
+pseudonym ever derived is a function of it — so a deployment that moves it into a keychain or a key
+service has to be able to do so without changing how a live store fetches it.
+`yaam_crypto::custody::SubjectKeySource` is that protocol and `SubjectKeyFile` is the only
+implementation that ships: the key is fetched once, at startup, and a source that cannot answer
+refuses the process rather than minting or defaulting one.
+
 **Both halves or neither.** A declaration with no secret refuses at startup rather than refusing
 records one at a time; a secret with no declaration refuses too, because the alternative is an
 operator who believes bodies are sealed while every one is written in the clear — into the tree, the
@@ -550,10 +557,12 @@ because records filed under them keep a hash only those rules reproduce.
 
 ## Deployment seams
 
-Two traits a deployment implements, both with a default that behaves exactly as not using them did.
+Three traits a deployment implements, each with a shipped implementation that behaves exactly as not
+using it did.
 
 | | |
 |---|---|
+| `yaam_crypto::custody::SubjectKeySource` | Where the subject-pseudonym secret is fetched from at startup. `SubjectKeyFile` is what `--subject-key-file` does; a keychain or key-service source replaces the fetch and nothing else. A fetch may block and may fail transiently, and either way the answer is the key or a refusal to start — never a key this store did not already derive its pseudonyms with. |
 | `yaam_crypto::keystore::KeyWrapper` | Wraps subject keys before they reach the disk, so a key file recovered from a snapshot or a stale volume is inert without a call to external key custody. `FsKeyStore::unwrapped` is the development default, named so nobody gets it by accident. |
 | `yaam_core::resolve::SubjectResolver` | Decides the subjects a record names. `DeclaredSubjects` trusts the ones it carries; a lookup that is briefly down quarantines the record for a later retry rather than rejecting it, and one that will never key a given record rejects it with the reason. `ReferenceSubjects` is the implementation this repo ships — see above — and it is fitted only by a store that declares erasure units. |
 

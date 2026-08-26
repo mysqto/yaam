@@ -40,6 +40,16 @@ pub enum Error {
     /// secret into every log that captured the startup failure.
     #[error("a subject key must be hex-encoded")]
     SubjectKeyNotHex,
+    /// The subject key could not be reached at all — the file is not there, the key service did not
+    /// answer. Held apart from the two above, which say key material arrived and was not a key: those
+    /// name a file an operator fixes in place, this one names custody that has to be reachable before
+    /// the process can run at all.
+    ///
+    /// Carries the source's own account of why, wrapped by the startup path that knows which setting
+    /// selected the source. Never the key or anything derived from it: this text reaches a startup
+    /// log.
+    #[error("{0}")]
+    SubjectKeyUnavailable(String),
     /// An identifier that canonicalises to nothing. Held apart from a malformed record because the
     /// remedy is the caller's: one shared pseudonym for every such identifier would make each of
     /// their bodies erasable by any one of their requests.
