@@ -37,6 +37,7 @@ fn every_documented_exit_code_comes_out_of_the_binary() {
     .expect("record file");
 
     let pseudonym = format!("s_{}", "a".repeat(64));
+    let identifier = record.record_id.as_str().to_owned();
     let cases: Vec<(Vec<&str>, i32, &str)> = vec![
         (vec!["--help"], 0, "help is a success"),
         (vec!["--nonesuch"], 2, "an unknown flag is a usage error"),
@@ -46,6 +47,37 @@ fn every_documented_exit_code_comes_out_of_the_binary() {
             vec!["--root", root, "erase", "--subject", &pseudonym],
             5,
             "an unconfirmed erasure does nothing",
+        ),
+        (
+            vec![
+                "--root",
+                root,
+                "unseal",
+                "--record",
+                &identifier,
+                "--operator",
+                "operator_a",
+                "--reason",
+                "a subject asked what is retained",
+            ],
+            5,
+            "an unconfirmed read of a body reads nothing",
+        ),
+        (
+            vec![
+                "--root",
+                root,
+                "unseal",
+                "--record",
+                &identifier,
+                "--operator",
+                "operator_a",
+                "--reason",
+                "a subject asked what is retained",
+                "--confirm-read-body",
+            ],
+            8,
+            "a body no key gates is not this command's to hand back",
         ),
         (
             vec!["--root", root, "verify-erasure", "--tombstone", "tomb-x"],

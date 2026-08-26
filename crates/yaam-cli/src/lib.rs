@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `yaam-server` | The HTTP service, plus the maintenance its store needs. |
 //! | `yaam-agent` | The local sidecar: two sockets per caller, sealing and signing on their behalf. |
-//! | `yaam` | The operator command line: rebuild, drain, erase, verify, back up, restore, read health, guard a commit, derive knowledge. |
+//! | `yaam` | The operator command line: rebuild, drain, erase, verify, read a sealed body, back up, restore, read health, guard a commit, derive knowledge. |
 //! | `yaam-emit` | One record, built from arguments and written to a caller socket. |
 //! | `yaam-read` | One read, sent to a caller read socket; the service's answer, unchanged. |
 //!
@@ -37,6 +37,7 @@
 //! Not here. Every judgement these binaries appear to make is a library call:
 //! [`yaam_core::reindex::reindex_all`], [`yaam_core::drain`], [`yaam_core::erase`],
 //! [`yaam_core::backup`], [`yaam_core::backup::excluded_paths`] behind [`guard`],
+//! [`yaam_core::unseal::read_body`],
 //! [`yaam_core::health::check`], [`yaam_knowledge::rebuild`], [`yaam_agent::listener::serve_until`],
 //! [`yaam_server::routes::router`]. What is here is argument parsing, refusals that belong before
 //! anything starts, signal handling, rendering and exit codes.
@@ -56,6 +57,7 @@ pub mod knowledge;
 pub mod ops;
 pub mod read;
 pub mod server;
+pub mod unseal;
 
 #[cfg(test)]
 mod fixtures;
@@ -244,6 +246,19 @@ fn run_operator(cli: &OperatorCli, env: &Env, out: &mut dyn Write) -> Result<Exi
             confirm_destroy_keys,
         } => ops::erase(&mut pipeline, subject, *confirm_destroy_keys, out),
         Command::VerifyErasure { tombstone } => ops::verify_erasure(&mut pipeline, tombstone, out),
+        Command::Unseal {
+            record,
+            operator,
+            reason,
+            confirm_read_body,
+        } => unseal::unseal(
+            &mut pipeline,
+            record,
+            operator,
+            reason,
+            *confirm_read_body,
+            out,
+        ),
         Command::Check => ops::check(&pipeline, out),
         Command::Backup { to } => ops::backup(&pipeline, to, out),
         Command::Restore { .. } | Command::GuardCommit { .. } | Command::Knowledge { .. } => {

@@ -51,3 +51,15 @@ actions:
       decline_reason: { type: string, class: sensitive }
       amount_minor: { type: integer, class: sensitive }
       currency: { type: string, class: structural }
+
+  # Written by `yaam unseal` and by no agent: one record per audited read of a sealed body, at
+  # `visibility: operator`. It declares no attributes on purpose — what it has to say is who read
+  # which body and why, and an operator's typed reason promoted to a queryable key would be a
+  # retained plaintext field nobody chose to retain.
+  #
+  # One outcome, because the record is published before a key is fetched and attests the grant
+  # rather than the plaintext: it says this operator was authorised to read this body, at this
+  # instant, for this reason. Whether the bytes then decrypted is a question about the key store,
+  # and the tombstone log is what answers it.
+  unseal:
+    outcome: [success]

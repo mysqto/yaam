@@ -47,6 +47,7 @@ pub mod pipeline;
 pub mod reindex;
 pub mod resolve;
 pub mod sweeper;
+pub mod unseal;
 
 mod fsutil;
 mod layout;

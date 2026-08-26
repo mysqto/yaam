@@ -21,7 +21,8 @@ index that makes it queryable in single-digit milliseconds.
 | **Derived index** | SQLite + FTS5, rebuildable from the tree. Delete it and run `yaam reindex`. |
 | **Crash-recoverable** | Write-ahead staging, atomic publish, a sweeper that converges. No claim of distributed atomicity. |
 | **Erasable bodies** | Per-record keys, per-subject key encryption. Deleting a subject's keys makes their record bodies permanently unreadable in every copy, including backups. |
-| **Reads return structure, never a body** | A read answers with each matching record's frontmatter — action, outcome, declared attributes, entity references, subject pseudonyms, timestamps — and never its prose. The rule does not branch on data class: a sealed body is withheld because it is a body, and a plaintext one for the same reason. Reading a body is a tree-level operation, not a request. |
+| **Reads return structure, never a body** | A read answers with each matching record's frontmatter — action, outcome, declared attributes, entity references, subject pseudonyms, timestamps — and never its prose. The rule does not branch on data class: a sealed body is withheld because it is a body, and a plaintext one for the same reason. A plaintext body is read from the tree; a sealed one only through `yaam unseal`, which records the reading before it performs it. |
+| **One audited way back to a sealed body** | `yaam unseal` publishes an operator-visible record naming who read the body and why, and only then fetches a key. A store that cannot record the read cannot answer it, so there is no path that returns a sealed body without a line saying it did. |
 | **Derived knowledge** | One note per entity under `knowledge/`, rebuilt wholesale from the record tree by `yaam knowledge build`. Every line restates a structured field some record declared and names the records it came from. Nothing is derived from a record whose body is erasable, so a key destruction has no aggregate to chase. |
 | **Idempotent** | Every write is keyed. Replays, retries and re-drives are safe. |
 | **Redacted at the source** | The writer masks, the service only checks and refuses what is still unmasked — so a record's `fields_masked` is the writer's own account. `yaam_contract::mask` is the one implementation of masking, reading the same policy file the service checks against. |
@@ -125,6 +126,10 @@ yaam --root /srv/memory drain --max-jobs 500        # …up to a bound; the rest
 yaam --root /srv/memory erase --subject s_…         # prints what it would destroy, and stops
 yaam --root /srv/memory erase --subject s_… --confirm-destroy-keys
 yaam --root /srv/memory verify-erasure --tombstone tomb-…
+yaam --root /srv/memory unseal --record 01ARZ… --operator lead_ops \
+     --reason "subject access request"                # prints whose keys it would use, and stops
+yaam --root /srv/memory unseal --record 01ARZ… --operator lead_ops \
+     --reason "subject access request" --confirm-read-body
 yaam --root /srv/memory backup --to /srv/backups/2026-08-20   # authoritative half only
 yaam --root /restored     restore --from /srv/backups/2026-08-20   # copy, rebuild, then drain
 ```
@@ -333,6 +338,45 @@ not. A record whose only reference was inferred stays out of every bundle, exact
 yaam-read bundle --infer-entities /srv/memory/spec \
           --infer-from "picking the PROJ-42 rollout back up" --limit 5
 ```
+
+### Reading a sealed body
+
+A sealed body has one way back and it is not a request. `yaam-read` and the service never unseal, so
+customer plaintext cannot reach an agent's context, a chat message or a log line — all places outside
+the reach of a key destruction. What is left is one operator command on the host that holds the key
+store:
+
+```sh
+yaam --root /srv/memory unseal --record 01ARZ… --operator lead_ops \
+     --reason "subject access request"                       # whose keys it would use, then stops
+yaam --root /srv/memory unseal --record 01ARZ… --operator lead_ops \
+     --reason "subject access request" --confirm-read-body   # …and means it
+```
+
+**The audit record is written before the key is fetched, and that ordering is the feature.** One
+record per reading, `action: unseal` and `visibility: operator`, naming the operator and the reason —
+published, fsynced and indexed before anything is decrypted. So a store that cannot record the read
+cannot answer it, and the two failure shapes are a recorded read that then failed and nothing at all.
+The other order — decrypt, hand back, then record — turns the first unwritable tree into a body
+somebody holds and nothing anywhere says was read, which no later pass can discover. Written
+afterwards, an audit trail is a courtesy; written first, it is a precondition.
+
+The audit record is `internal` and names no subject, so no erasure reaches it: a trail a data subject
+could destroy is a trail that disappears exactly when somebody asks who read their data before it
+went. It names the subject pseudonyms in its prose, deliberately, for the same reason the tombstone
+log keeps them.
+
+`--confirm-read-body` is `erase`'s register, because the two are irreversible in the same way: an
+erasure cannot be undone, and a reading cannot be unread. Without it the command prints whose keys
+the read would use, whether they are still there, and whose name the record will carry — then exits
+`5` having written nothing.
+
+**A body whose keys are gone says so.** An erased subject's record is refused with the tombstone that
+accounts for it and a sentence saying no copy anywhere will open again — never with an empty answer
+that reads like a record nobody wrote, which is the report that has an operator opening an incident
+about a store doing exactly what it promised. Every non-answer exits `8`: gone for ever, never sealed,
+archived out of the tree, or an identifier nothing carries — each with the prose that says which,
+because the next move differs and an empty page would not.
 
 ### Deriving knowledge
 

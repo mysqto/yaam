@@ -590,6 +590,42 @@ pub enum Command {
         #[arg(long, value_name = "ID")]
         tombstone: String,
     },
+    /// Read one record's sealed body, writing the audit record of that reading first.
+    ///
+    /// The only path back to a sealed body anywhere in this workspace, and deliberately the only
+    /// one: `yaam-read` and the service never unseal, so customer plaintext cannot reach an agent's
+    /// context, a chat message or a log line — all places outside the reach of a key destruction.
+    ///
+    /// The reading is recorded before a key is fetched, in a record of `action: unseal` and
+    /// `visibility: operator` naming the operator and the reason. That ordering is the command: a
+    /// store that cannot record the read cannot answer it, so there is no failure that hands back a
+    /// body nobody can tell was handed back.
+    ///
+    /// Not an endpoint, for the reason erasure's local half is not one either: the operator role
+    /// here is custody of the key store, which is a property of the host and not of a signature.
+    /// A record whose subjects have been erased is refused with the erasure that accounts for it,
+    /// never with an empty answer that reads like a record nobody wrote.
+    Unseal {
+        /// The record, as the 26-character identifier it is filed under.
+        #[arg(long, value_name = "ID")]
+        record: String,
+        /// Who is reading it. Becomes the audit record's agent.
+        ///
+        /// An attestation, not an authentication: whoever can reach the key store can read what it
+        /// opens, so what this buys is a name in the trail beside the reason — which is what an
+        /// auditor asks for and what a hash of a key would not tell them.
+        #[arg(long, value_name = "NAME")]
+        operator: String,
+        /// Why. Becomes the audit record's body, and there is no default.
+        ///
+        /// It goes through the deployment's redaction policy like any other body, so a reason
+        /// carrying something the policy masks fails the read rather than entering the store.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Mean it. Without this the command prints whose keys the read would use and stops.
+        #[arg(long)]
+        confirm_read_body: bool,
+    },
     /// Read the store's health: schema version, index drift, sweeper backlog, quarantine depth,
     /// dead-lettered fan-out.
     ///
@@ -996,6 +1032,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The other command that acts on one confirmation, held to the same shape.
+    ///
+    /// A read of a sealed body is not undoable either: the audit record naming whoever read it is
+    /// permanent. So the flag is the same kind of statement `erase`'s is, and a default that meant
+    /// it would be a body printed by somebody who was only looking.
+    #[test]
+    fn reading_a_sealed_body_needs_its_own_flag_to_be_meant() {
+        let unconfirmed = OperatorCli::try_parse_from([
+            "yaam",
+            "--root",
+            "/x",
+            "unseal",
+            "--record",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--operator",
+            "operator_a",
+            "--reason",
+            "a subject asked what is retained",
+        ])
+        .expect("parsed");
+        assert!(matches!(
+            unconfirmed.command,
+            Command::Unseal {
+                confirm_read_body: false,
+                ..
+            }
+        ));
+
+        // Neither the operator nor the reason has a default: an audit line with nobody's name on it,
+        // for no stated purpose, answers neither question anybody asks of the trail.
+        for missing in [
+            vec![
+                "--record",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "--operator",
+                "operator_a",
+            ],
+            vec!["--record", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--reason", "why"],
+            vec!["--operator", "operator_a", "--reason", "why"],
+        ] {
+            let mut args = vec!["yaam", "--root", "/x", "unseal"];
+            args.extend(missing.iter().copied());
+            OperatorCli::try_parse_from(&args).expect_err(&format!("{args:?} is incomplete"));
+        }
     }
 
     #[test]

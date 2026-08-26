@@ -347,6 +347,15 @@ impl Pipeline {
         &self.keys
     }
 
+    /// The redaction policy every record written here must declare.
+    ///
+    /// Read off the loaded policy rather than spelled by the caller: a record this crate builds for
+    /// itself — an audit record, say — has to name the policy in force in *this* store, and a
+    /// constant here would refuse the write on every deployment that configured a different one.
+    pub(crate) fn redaction_policy(&self) -> &str {
+        self.redaction.name()
+    }
+
     /// Opens a read handle onto the index.
     ///
     /// A second connection rather than a shared one: reads must not be able to migrate the schema,
