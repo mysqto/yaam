@@ -1,0 +1,367 @@
+{
+  "$defs": {
+    "AttrValue": {
+      "anyOf": [
+        {
+          "description": "Text.",
+          "type": "string"
+        },
+        {
+          "description": "Whole number.",
+          "format": "int64",
+          "type": "integer"
+        },
+        {
+          "description": "Truth value.",
+          "type": "boolean"
+        }
+      ],
+      "description": "A scalar attribute value. Deliberately flat — `attrs` is not a document store."
+    },
+    "CanonVer": {
+      "description": "Version of the canonicalisation ruleset that produced a subject hash.\n\nStamped per subject rather than per record: a re-keyed record can legitimately carry subjects\nresolved under different rulesets. Lookups fan out across live versions.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "CorrelatedPair": {
+      "description": "One correlated pair: a record, and a record that followed it inside the window.\n\nTwo structures rather than two identifiers, and a pair rather than a flat set. Which decline went\nwith which deploy *is* the answer — a flat list of both sides is what `GET /records` already gives\na caller, and it cannot say what happened near what once either side matches more than once.",
+      "properties": {
+        "left": {
+          "$ref": "#/$defs/RecordStructure",
+          "description": "The record the question was asked about: the earlier of the two."
+        },
+        "right": {
+          "$ref": "#/$defs/RecordStructure",
+          "description": "The record that followed it, at or after `left` and no later than `within_ms` after."
+        }
+      },
+      "required": [
+        "left",
+        "right"
+      ],
+      "type": "object"
+    },
+    "DataClass": {
+      "description": "Whether a record's body is erasable.",
+      "oneOf": [
+        {
+          "const": "internal",
+          "description": "System and operational activity. Body stored in plaintext.",
+          "type": "string"
+        },
+        {
+          "const": "subject_derived",
+          "description": "Traceable to a data subject. Body sealed; erasable by destroying subject keys.",
+          "type": "string"
+        }
+      ]
+    },
+    "EntityRef": {
+      "additionalProperties": false,
+      "description": "A reference from a record to an entity, with the role the entity played.\n\nUnknown fields are refused for the reason `ActionRecord` refuses them: an entity reference is\na join key, and a field that silently vanished here would leave the record joining on something\nother than what was sent.",
+      "properties": {
+        "confidence": {
+          "description": "Extraction confidence. Below `1.0` means inferred from text rather than a structured field.\n\nThe bound is published because `ActionRecord::validate` enforces it: a caller that can read\nthe schema can fail before sending rather than after.",
+          "format": "float",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "id": {
+          "description": "The canonical identifier.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "The entity kind, e.g. `order_ref`.",
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/EntityRole",
+          "description": "How the entity relates to the record."
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "role",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "EntityRole": {
+      "description": "The part an entity plays in a record.",
+      "oneOf": [
+        {
+          "const": "primary",
+          "description": "The record is chiefly about this entity.",
+          "type": "string"
+        },
+        {
+          "const": "context",
+          "description": "Supporting context.",
+          "type": "string"
+        },
+        {
+          "const": "related",
+          "description": "Mentioned, related but not central.",
+          "type": "string"
+        }
+      ]
+    },
+    "Outcome": {
+      "description": "How the outcome of an action is reported.",
+      "oneOf": [
+        {
+          "const": "success",
+          "description": "The action did what it set out to do.",
+          "type": "string"
+        },
+        {
+          "const": "failure",
+          "description": "It failed.",
+          "type": "string"
+        },
+        {
+          "const": "partial",
+          "description": "It partly succeeded, and the record says how.",
+          "type": "string"
+        },
+        {
+          "const": "declined",
+          "description": "It was refused, by us or by a downstream system.",
+          "type": "string"
+        }
+      ]
+    },
+    "RecordId": {
+      "description": "A ULID, and the write's idempotency key. Crockford base32: uppercase, without `I`, `L`, `O` or `U`, so a transcription slip cannot turn one valid identifier into another.",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "type": "string"
+    },
+    "RecordStructure": {
+      "additionalProperties": false,
+      "description": "One record as a read returns it: every frontmatter key, and no body.\n\nDeserialised from the frontmatter a record was stored with rather than rebuilt from parts, so a\nread describes the record on disk and not this build's idea of it. Unknown fields are refused for\nthe reason `ActionRecord` refuses them: a stored key this type does not declare is one nothing\ndownstream reads, and passing it through would forward whatever the store happened to hold.",
+      "properties": {
+        "action": {
+          "description": "What was done.",
+          "type": "string"
+        },
+        "agent": {
+          "description": "Which agent produced this.",
+          "type": "string"
+        },
+        "agent_ver": {
+          "description": "Agent version, for attributing behaviour to a release.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "at": {
+          "description": "Source-reported time. May be skewed; never used for ordering.",
+          "type": "string"
+        },
+        "attrs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AttrValue"
+          },
+          "description": "Declared, classified attributes. Structural keys only — a sensitive one is refused on write,\nso it is not in frontmatter to be read back.",
+          "type": "object"
+        },
+        "backfilled": {
+          "description": "`true` when `received_at` came from an upstream source rather than the service's clock.",
+          "type": "boolean"
+        },
+        "correlation_id": {
+          "description": "Ties every stage of one interaction together.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data_class": {
+          "$ref": "#/$defs/DataClass",
+          "description": "Whether the body is erasable. Reported so a caller knows what it is *not* being given."
+        },
+        "entities": {
+          "description": "Entities this record joins on.",
+          "items": {
+            "$ref": "#/$defs/EntityRef"
+          },
+          "type": "array"
+        },
+        "fields_masked": {
+          "description": "Fields the policy masked. Informational.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Outcome",
+          "description": "How it went."
+        },
+        "received_at": {
+          "description": "Time stamped by the service. Authoritative for ordering and windowing.",
+          "type": "string"
+        },
+        "record_id": {
+          "$ref": "#/$defs/RecordId",
+          "description": "Identity the record is addressable by."
+        },
+        "redaction_policy": {
+          "description": "Redaction policy applied before the write.",
+          "type": "string"
+        },
+        "schema_ver": {
+          "$ref": "#/$defs/SchemaVer",
+          "description": "Schema version the record was written under."
+        },
+        "subjects": {
+          "description": "Data subjects named by this record, as keyed pseudonyms. Never a direct identifier.",
+          "items": {
+            "$ref": "#/$defs/SubjectRef"
+          },
+          "type": "array"
+        },
+        "tags": {
+          "description": "Free tags.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "team": {
+          "description": "Team, present when `visibility` is team-scoped.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "visibility": {
+          "$ref": "#/$defs/Visibility",
+          "description": "Read scope the record was stored under."
+        }
+      },
+      "required": [
+        "record_id",
+        "schema_ver",
+        "at",
+        "received_at",
+        "backfilled",
+        "agent",
+        "action",
+        "outcome",
+        "attrs",
+        "entities",
+        "subjects",
+        "visibility",
+        "data_class",
+        "redaction_policy",
+        "fields_masked",
+        "tags"
+      ],
+      "type": "object"
+    },
+    "SchemaVer": {
+      "description": "Version of the record schema a row was written under.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "SubjectHash": {
+      "description": "Keyed pseudonym for an erasable data subject — an HMAC over a canonical subject identifier, never a direct identifier, so it is safe in paths, indexes and tombstones. Pseudonymous, not anonymous: whoever holds the keying secret can still relink it. Hex is lowercase, because one spelling per hash is what lets it serve as both a map key and a path component with no normalisation step a caller could forget.",
+      "pattern": "^s_[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "SubjectRef": {
+      "additionalProperties": false,
+      "description": "One data subject named by a record.\n\nUnknown fields are refused for the reason `ActionRecord` refuses them: a field this type does\nnot declare is one nothing downstream will ever read.",
+      "properties": {
+        "canon_ver": {
+          "$ref": "#/$defs/CanonVer",
+          "description": "Canonicalisation ruleset that produced `hash`."
+        },
+        "hash": {
+          "$ref": "#/$defs/SubjectHash",
+          "description": "The keyed pseudonym."
+        },
+        "role": {
+          "$ref": "#/$defs/SubjectRole",
+          "description": "The part this subject plays."
+        }
+      },
+      "required": [
+        "hash",
+        "role",
+        "canon_ver"
+      ],
+      "type": "object"
+    },
+    "SubjectRole": {
+      "description": "The part a subject plays in a record.",
+      "oneOf": [
+        {
+          "const": "principal",
+          "description": "Acted, or was acted for.",
+          "type": "string"
+        },
+        {
+          "const": "party",
+          "description": "Named in the record without being its principal.",
+          "type": "string"
+        }
+      ]
+    },
+    "Visibility": {
+      "description": "Who may read a record.",
+      "oneOf": [
+        {
+          "const": "owner",
+          "description": "The actor only.\n\nStored apart: a subtree of its own per owner, whose directories and files admit no group or\nother access. The two halves cover each other — a scoped read answers nothing to anybody\nelse, and a reader on the host cannot go around the query by opening the file unless it is\nthe identity the writer runs as.",
+          "type": "string"
+        },
+        {
+          "const": "team",
+          "description": "A named team.",
+          "type": "string"
+        },
+        {
+          "const": "org",
+          "description": "Everyone in the deployment.",
+          "type": "string"
+        },
+        {
+          "const": "operator",
+          "description": "Audit records. Readable only by the operator role.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://github.com/mysqto/yaam/blob/main/spec/schemas/correlations.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Answer to a correlation.\n\nIts own shape rather than a `RecordsResponse`, because the pairing is the answer: flattened into\none `records` list it would be a set of records the caller has to re-join by timestamp, which is\nthe arithmetic this endpoint exists to stop doing by hand.",
+  "properties": {
+    "pairs": {
+      "description": "Matching pairs. Newest left record first, and within one left record its right ones in the\norder they happened.",
+      "items": {
+        "$ref": "#/$defs/CorrelatedPair"
+      },
+      "type": "array"
+    },
+    "token_estimate": {
+      "description": "Rough token cost of this answer, advisory only.\n\nMeasured over both halves of every pair, so a left record matching several right ones is\ncounted once per pair — which is what returning it once per pair costs.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "pairs",
+    "token_estimate"
+  ],
+  "title": "CorrelationsResponse",
+  "type": "object"
+}

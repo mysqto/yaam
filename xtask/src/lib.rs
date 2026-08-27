@@ -380,6 +380,7 @@ mod tests {
             BTreeSet::from([
                 "action-record.v1.json",
                 "bundle.v1.json",
+                "correlations.v1.json",
                 "envelope.v1.json",
                 "record-structure.v1.json",
                 "records.v1.json",

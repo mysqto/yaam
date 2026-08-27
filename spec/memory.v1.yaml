@@ -11,12 +11,12 @@ openapi: 3.1.0
 info:
   title: yaam memory service
   version: 1.0.0
-  summary: Signed HTTP surface over an agent memory store — six endpoints, no rebuild endpoint.
+  summary: Signed HTTP surface over an agent memory store — seven endpoints, no rebuild endpoint.
   license:
     name: MIT
     identifier: MIT
   description: |
-    Six endpoints. Markdown is the source of truth underneath; the index this service reads is
+    Seven endpoints. Markdown is the source of truth underneath; the index this service reads is
     derived and disposable.
 
     ## Every request is signed, reads included
@@ -62,10 +62,15 @@ info:
 
     ## A read returns structure, and never a body
 
-    Every read — `GET /records`, `GET /search`, `GET /entities/{kind}/{id}`, `GET /bundle` — answers
-    with each matching record's stored frontmatter: identifiers, timestamps, agent, action,
-    outcome, declared attributes, entity references, subject pseudonyms, visibility, data class and
-    tags. That is a `RecordStructure`, and it is the whole of what a read hands back.
+    Every read — `GET /records`, `GET /search`, `GET /entities/{kind}/{id}`, `GET /correlate`,
+    `GET /bundle` — answers with each matching record's stored frontmatter: identifiers, timestamps,
+    agent, action, outcome, declared attributes, entity references, subject pseudonyms, visibility,
+    data class and tags. That is a `RecordStructure`, and it is the whole of what a read hands back.
+
+    `GET /correlate` returns two of them per row rather than one, because its answer is a *pair* —
+    which record happened near which — and neither half is anything other than the same structure.
+    A correlation that answered with the identifiers it joined would be the one read handing back
+    two names a caller cannot resolve instead of one.
 
     `GET /search` is the one read whose *input* is prose, and it is not an exception to any of this:
     the needle goes in and structure comes out. A caller can ask which record mentions a word
@@ -443,11 +448,18 @@ paths:
         of it — the busiest identifier in a store would otherwise decide what every reader pays.
 
         `from_ms` and `to_ms` narrow it to a half-open span of that same server-stamped time. One
-        entity inside one window is the shape of a correlation — what else touched this ticket while
-        that decline was happening — and it is the reason this is not simply `GET /records` with an
-        entity filter: the window is applied inside the query, so the page cap chooses among rows the
-        window already selected. A caller narrowing afterwards has it the other way round, and the
-        page silently decides which part of the window they see.
+        entity inside one window answers *what else touched this ticket while that decline was
+        happening*, and it is the reason this is not simply `GET /records` with an entity filter: the
+        window is applied inside the query, so the page cap chooses among rows the window already
+        selected. A caller narrowing afterwards has it the other way round, and the page silently
+        decides which part of the window they see.
+
+        It is not the correlation, though it was the closest thing to one before `GET /correlate`
+        existed. This read answers with a window's worth of an entity's history and leaves *which of
+        those records happened near which* to whoever read it; a correlation asks that directly, joins
+        on time rather than on a shared entity, and returns the pairs. Reach for this one when the
+        question is about a thing, and for `GET /correlate` when it is about two events being near each
+        other.
 
         Answers the same `RecordsResponse` as `GET /records`, so both reads hand back structure and
         neither hands back a body. One shape for both, because "what a read returns" is a property of
@@ -499,6 +511,91 @@ paths:
         '503':
           $ref: '#/components/responses/Unavailable'
 
+  /correlate:
+    get:
+      tags: [context]
+      operationId: correlateRecords
+      summary: Which records of one shape were followed by records of another
+      description: |
+        The join the cross-agent question reduces to: something failed, and something else happened
+        nearby. Two filters in one request — the same names `GET /records` accepts, prefixed by which
+        side of the join they constrain — and `within_ms`, which says how long after a `left` record a
+        `right` one still counts.
+
+        **Directional.** A pair is returned when the `right` record was stamped at or after the
+        `left` one and no later than `within_ms` after it, on the server-stamped clock. So *"which
+        declines had a deploy in the half hour after them"* puts the decline on the left, and *"which
+        deploys were followed by a decline"* puts the deploy there. There is no backwards window and
+        no `within_ms` below zero: the way to ask what came *before* something is to swap the sides,
+        and a negative value is `422` rather than the empty page it would otherwise produce.
+
+        **The window is required, and only on the left.** `left.from_ms` and `left.to_ms` bound the
+        side the join is driven from; omitting either is `422`. That is stricter than `GET /records`,
+        which answers happily with no window at all, and the reason is the plan rather than the
+        parameter: this is a non-equi range join, its cost is (rows on the left) × (rows the right
+        index has to walk per left row), and the left window is the only thing a request can say that
+        bounds the first term. Unwindowed, with the covering index absent or unused, the same
+        statement measured 4.2 s over 200,000 records against 1.0 ms with it. Second, an unwindowed
+        correlation answers with "the most recent pairs in the store", which moves as records arrive —
+        the implicit `recent` this query deliberately does not have, because a question whose meaning
+        depends on when it ran cannot be tested.
+
+        There is deliberately no `right.from_ms`. The right side's window *is* the left side's plus
+        `within_ms`, computed by the join, so a second one would be a second answer to the same
+        question — and a caller that made the two disagree would get an empty page for a reason
+        nothing in the request shows.
+
+        `limit` caps the number of **pairs** and carries no prefix, because it is not a page on either
+        side. A `right.limit` is `400` rather than accepted and ignored: a page size on the right of a
+        join bounds nothing, and a parameter that silently does nothing is worse than one that is not
+        there. Absent means the pair cap of `100` — half the row cap the other reads default to,
+        because a pair row is two structures.
+
+        A `left` record matching several `right` records is returned once per pair, its frontmatter
+        repeated in each. The duplication is the shape of the answer rather than a defect in it: what
+        was asked for is which records were near which. Narrow `within_ms` to reduce it.
+
+        Scoped like every other read, and scoped on **both** sides inside the join. A pair joins two
+        records whose visibility was decided separately, so a scope test applied to one side only —
+        or applied to the pairs after the join — would hand a caller the record on the other side of
+        it, which no other read here admits them to.
+      parameters:
+        - $ref: '#/components/parameters/left_action'
+        - $ref: '#/components/parameters/left_outcome'
+        - $ref: '#/components/parameters/left_agent'
+        - $ref: '#/components/parameters/left_attr'
+        - $ref: '#/components/parameters/left_from_ms'
+        - $ref: '#/components/parameters/left_to_ms'
+        - $ref: '#/components/parameters/right_action'
+        - $ref: '#/components/parameters/right_outcome'
+        - $ref: '#/components/parameters/right_agent'
+        - $ref: '#/components/parameters/right_attr'
+        - $ref: '#/components/parameters/within_ms'
+        - $ref: '#/components/parameters/correlate_limit'
+      responses:
+        '200':
+          $ref: '#/components/responses/Correlations'
+        '400':
+          $ref: '#/components/responses/BadQuery'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          description: |
+            Permanent. `within_ms` is negative, one or both of `left.from_ms` and `left.to_ms` is
+            missing, or `left.attr` / `right.attr` is not `key=value`. Fix the request; the same
+            parameters will never answer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: >-
+                  unprocessable: a correlation needs both `left.from_ms` and `left.to_ms`: the window
+                  bounds the side the join is driven from, and there is no implicit `recent`
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /bundle:
     get:
       tags: [context]
@@ -758,6 +855,153 @@ components:
         maximum: 100
       example: 5
 
+    left_action:
+      name: left.action
+      in: query
+      required: false
+      description: |
+        Exact match on the action of the earlier record. The `left.` and `right.` prefixes are how one
+        request carries two filters: each name is the one `GET /records` accepts, prefixed by the side
+        of the join it constrains. Packing a side into one value — `left=action:deploy,outcome=failure`
+        — was the alternative and is refused for the reason the parameter set is closed at all: a typo
+        inside a packed value cannot be rejected, and a filter that got dropped would widen that side
+        of the join to everything.
+      schema:
+        type: string
+      example: transact
+    left_outcome:
+      name: left.outcome
+      in: query
+      required: false
+      description: Outcome of the earlier record, spelled as the record serialises it.
+      schema:
+        $ref: '#/components/schemas/Outcome'
+    left_agent:
+      name: left.agent
+      in: query
+      required: false
+      description: |
+        Author of the earlier record. The record's author, not the caller — a credential's own scope
+        is applied to both sides on top and cannot be widened from here.
+      schema:
+        type: string
+      example: ledger_bot
+    left_attr:
+      name: left.attr
+      in: query
+      required: false
+      description: |
+        One structural attribute the earlier record must carry, as `key=value`, compared as text
+        exactly as `attr` is on `GET /records`.
+      schema:
+        type: string
+        pattern: '^[^=]+=.*$'
+      example: provider=gateway_two
+    left_from_ms:
+      name: left.from_ms
+      in: query
+      required: true
+      description: |
+        Inclusive start of the window the earlier record is searched in, in milliseconds of the
+        server-stamped time. **Required**, together with `left.to_ms` — unlike every other window on
+        this service, which may be omitted entirely. It bounds the side the join is driven from, and
+        it is what stops this read costing whatever the store holds; see the endpoint description.
+
+        Its absence is `422`, not `400`: it parses as a window this service will not answer rather
+        than as a query string it could not read, which is the same status and the same reason as half
+        a window on `GET /records`. `within_ms` is the other required parameter and its absence *is*
+        `400`, because there is nothing to parse at all. A client whose retry policy branches on the
+        code should read both as permanent.
+      schema:
+        type: integer
+        format: int64
+      example: 1755676800000
+    left_to_ms:
+      name: left.to_ms
+      in: query
+      required: true
+      description: Exclusive end of that window, on the same clock. Required, with `left.from_ms`.
+      schema:
+        type: integer
+        format: int64
+      example: 1755763200000
+    right_action:
+      name: right.action
+      in: query
+      required: false
+      description: |
+        Exact match on the action of the later record — the one that has to have happened nearby.
+      schema:
+        type: string
+      example: deploy
+    right_outcome:
+      name: right.outcome
+      in: query
+      required: false
+      description: Outcome of the later record, spelled as the record serialises it.
+      schema:
+        $ref: '#/components/schemas/Outcome'
+    right_agent:
+      name: right.agent
+      in: query
+      required: false
+      description: Author of the later record.
+      schema:
+        type: string
+      example: deploy_bot
+    right_attr:
+      name: right.attr
+      in: query
+      required: false
+      description: One structural attribute the later record must carry, as `key=value`.
+      schema:
+        type: string
+        pattern: '^[^=]+=.*$'
+      example: environment=production
+    within_ms:
+      name: within_ms
+      in: query
+      required: true
+      description: |
+        How long after a `left` record a `right` one still counts, in milliseconds. Required: there is
+        no length of time that means "nearby" to every caller, and one this document defaulted would
+        answer a question nobody asked. Its absence is `400` — the query string is rejected before a
+        handler runs, as for any missing required parameter — while a missing `left.from_ms` is `422`.
+        Both are permanent.
+
+        The bound is inclusive at both ends and one-sided in time — `right` at or after `left`, and no
+        later than `left + within_ms`. A negative value is `422`, not an empty answer: the join is
+        directional, so it describes a window that closes before it opens, and the way to ask about
+        what came before something is to swap the two sides.
+
+        Uncapped, and it is the parameter that decides how much of the right index each left row
+        walks. There is no principled maximum — a decline and a deploy a week apart is a real question
+        — so the cost of a wide one is stated rather than refused.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+      example: 1800000
+    correlate_limit:
+      name: limit
+      in: query
+      required: false
+      description: |
+        Most **pairs** to return. Absent means the pair cap of `100`.
+
+        Half the `200` rows the other reads default to, because a pair row is two structures: the page
+        size here is a byte budget rather than a row count, and a page of pairs at the single-record
+        default would be the one answer allowed to be twice the size of every other.
+
+        It caps pairs and not either side's rows, which is why it carries no `left.`/`right.` prefix.
+        A `right.limit` is `400` rather than accepted: a page size on the right of a join bounds
+        nothing, and a parameter that silently does nothing is worse than one that is absent.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+      example: 20
+
     q:
       name: q
       in: query
@@ -882,6 +1126,70 @@ components:
                 redaction_policy: default-v1
                 fields_masked: []
                 tags: [release]
+    Correlations:
+      description: |
+        Matching pairs, the newest `left` record first and — within one `left` record — its `right`
+        records in the order they happened. Each half is the record's stored structure, so a
+        correlation withholds a body exactly as every other read does.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CorrelationsResponse'
+          example:
+            pairs:
+              - left:
+                  record_id: 01ARZ3NDEKTSV4RRFFQ69G5FB2
+                  schema_ver: 1
+                  at: '2026-08-20T09:15:00Z'
+                  received_at: '2026-08-20T09:15:00Z'
+                  backfilled: false
+                  agent: ledger_bot
+                  agent_ver: 1.4.0
+                  correlation_id: c-8f21
+                  action: transact
+                  outcome: declined
+                  attrs:
+                    provider: gateway_two
+                    decline_code: do_not_honour
+                  entities:
+                    - kind: ticket
+                      id: PROJ-42
+                      role: primary
+                      confidence: 1.0
+                  subjects: []
+                  visibility: org
+                  team: null
+                  data_class: internal
+                  redaction_policy: default-v1
+                  fields_masked: []
+                  tags: [transact]
+                right:
+                  record_id: 01ARZ3NDEKTSV4RRFFQ69G5FAV
+                  schema_ver: 1
+                  at: '2026-08-20T09:30:00Z'
+                  received_at: '2026-08-20T09:30:00Z'
+                  backfilled: false
+                  agent: deploy_bot
+                  agent_ver: 1.4.0
+                  correlation_id: c-8f22
+                  action: deploy
+                  outcome: failure
+                  attrs:
+                    service: api
+                    environment: production
+                  entities:
+                    - kind: ticket
+                      id: PROJ-42
+                      role: primary
+                      confidence: 1.0
+                  subjects: []
+                  visibility: org
+                  team: null
+                  data_class: internal
+                  redaction_policy: default-v1
+                  fields_masked: []
+                  tags: [deploy]
+            token_estimate: 316
     BadQuery:
       description: |
         The query string was not understood — an unknown parameter, or one that would not parse into
@@ -1380,7 +1688,9 @@ components:
 
         The answer to `GET /records`, `GET /search` and `GET /entities/{kind}/{id}` alike: what a
         read returns is a property of this service, not of which read was made — including the read
-        whose input was prose.
+        whose input was prose. `GET /correlate` answers a `CorrelationsResponse` instead, which is the
+        same structure two at a time: a pair, because its question is about two records rather than
+        one.
       required: [records, token_estimate]
       properties:
         records:
@@ -1397,6 +1707,55 @@ components:
             Present for the same reason it is on a bundle: these reads hand back the same rows,
             and a caller paging them had no way to size an answer before consuming it.
           example: 158
+
+    CorrelatedPair:
+      type: object
+      description: |
+        One record, and a record that happened inside the window after it. Both as `RecordStructure`,
+        because an identifier here would be two names a caller cannot resolve rather than one.
+
+        The order of the two fields is the answer's meaning: `left` is the earlier record and the one
+        the question was asked about, `right` is what followed it. A client that read them the other
+        way round would report the cause as the consequence.
+      required: [left, right]
+      properties:
+        left:
+          allOf:
+            - $ref: '#/components/schemas/RecordStructure'
+          description: The earlier record — the side `left.*` filtered and `left.from_ms` bounded.
+        right:
+          allOf:
+            - $ref: '#/components/schemas/RecordStructure'
+          description: |
+            The later record: stamped at or after `left`, and no later than `within_ms` after it.
+
+    CorrelationsResponse:
+      type: object
+      description: |
+        The answer to `GET /correlate`, and the one read answer that is not a list of records.
+
+        Pairs, because which record happened near which is the whole question. Flattened into one
+        `records` list it would be a set the caller has to re-join by timestamp — which is the
+        arithmetic this endpoint exists to stop somebody doing by hand, and the reason the endpoint
+        was added rather than the caller being told to make two reads and intersect them.
+
+        A `left` record matching several `right` records appears once per pair, its structure repeated.
+        `token_estimate` counts it each time, because that is what returning it each time costs.
+      required: [pairs, token_estimate]
+      properties:
+        pairs:
+          type: array
+          description: |
+            Newest `left` record first; within one `left` record, its `right` records oldest first.
+          items:
+            $ref: '#/components/schemas/CorrelatedPair'
+        token_estimate:
+          type: integer
+          minimum: 0
+          description: |
+            Rough token cost of this answer, measured over both halves of every pair returned.
+            Advisory, and not a promise about any tokeniser.
+          example: 316
 
     BundleResponse:
       type: object

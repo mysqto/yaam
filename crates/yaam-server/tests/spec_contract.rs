@@ -136,6 +136,17 @@ impl Service for Fake {
         Ok(Vec::new())
     }
 
+    fn correlate(
+        &self,
+        _caller: &Caller,
+        _left: &Filter,
+        _right: &Filter,
+        _within_ms: i64,
+    ) -> yaam_server::Result<Vec<(RecordStructure, RecordStructure)>> {
+        self.gate()?;
+        Ok(Vec::new())
+    }
+
     fn bundle(&self, _caller: &Caller, _request: &bundle::Request) -> yaam_server::Result<Bundle> {
         self.gate()?;
         Ok(Bundle::default())
@@ -262,6 +273,7 @@ fn cases() -> Vec<Case> {
     all.extend(query_cases());
     all.extend(search_cases());
     all.extend(entity_cases());
+    all.extend(correlate_cases());
     all.extend(bundle_cases());
     all.extend(erase_cases());
     all
@@ -432,6 +444,54 @@ fn entity_cases() -> Vec<Case> {
         case("GET", template, uri, Some(READER), "", Mode::Unaskable),
         case("GET", template, uri, Some(READER), "", Mode::Internal),
         case("GET", template, uri, Some(READER), "", Mode::Unavailable),
+    ]
+}
+
+fn correlate_cases() -> Vec<Case> {
+    let path = "/correlate";
+    // A window on the left and a nearness: the two this endpoint refuses to guess at, so every case
+    // that means to reach a handler has to carry both.
+    let uri = "/correlate?left.action=transact&left.from_ms=10&left.to_ms=20&within_ms=1000";
+    vec![
+        case("GET", path, uri, Some(READER), "", Mode::Stored),
+        // A mistyped side must not widen that half of the join to everything.
+        case(
+            "GET",
+            path,
+            "/correlate?nonsense=1",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case("GET", path, uri, None, "", Mode::Stored),
+        // Permanent: half a left window, no window at all, and a backwards nearness — none of which
+        // is a narrower question, and each of which would otherwise answer `200` with no pairs.
+        case(
+            "GET",
+            path,
+            "/correlate?left.from_ms=10&within_ms=1000",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case(
+            "GET",
+            path,
+            "/correlate?left.from_ms=10&left.to_ms=20&within_ms=-1",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case(
+            "GET",
+            path,
+            "/correlate?left.from_ms=10&left.to_ms=20&within_ms=1&left.attr=environment",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case("GET", path, uri, Some(READER), "", Mode::Internal),
+        case("GET", path, uri, Some(READER), "", Mode::Unavailable),
     ]
 }
 
@@ -780,6 +840,7 @@ async fn the_documented_query_parameters_are_the_ones_each_endpoint_accepts() {
             "get",
             "/entities/ticket/PROJ-42?nonsense=1",
         ),
+        ("/correlate", "get", "/correlate?nonsense=1"),
         ("/bundle", "get", "/bundle?nonsense=1"),
     ];
     for (template, method, uri) in probes {
@@ -822,6 +883,26 @@ fn the_documented_default_row_cap_is_the_one_the_index_applies() {
         .expect("the parameter is described");
     let cap = format!("`{}`", yaam_store::query::DEFAULT_STRUCTURE_LIMIT);
     assert!(described.contains(&cap), "{described} does not name {cap}");
+}
+
+#[test]
+fn the_documented_pair_cap_is_the_one_the_index_applies() {
+    // The pair cap is the number a client plans a correlation's paging around, and it is not the row
+    // cap: a pair row is two structures, so the two figures are deliberately different and a
+    // document that named the wrong one would have a client size its answers at twice the truth.
+    let spec = spec();
+    let described = node(
+        &spec,
+        &["components", "parameters", "correlate_limit", "description"],
+    )
+    .as_str()
+    .expect("the parameter is described");
+    let cap = format!("`{}`", yaam_store::query::DEFAULT_PAIR_LIMIT);
+    assert!(described.contains(&cap), "{described} does not name {cap}");
+    assert!(
+        described.contains(&format!("`{}`", yaam_store::query::DEFAULT_STRUCTURE_LIMIT)),
+        "the pair cap is only meaningful beside the row cap it halves: {described}"
+    );
 }
 
 #[test]

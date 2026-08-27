@@ -364,6 +364,13 @@ enum Ask {
     /// full-text row is a set like a bundle's. It asserts at the same layer as every row above: the
     /// needle is signed into the request target and the answer is the structure the route returned.
     Search(&'static str),
+    /// A signed correlation at `GET /correlate`, whose answer is pairs rather than records.
+    ///
+    /// Ordered, and the order carries the direction: newest left record first, and within one left
+    /// record its right ones oldest first. A row's `finds` names each pair as `left>right`, so what
+    /// went red is legible without opening the fixtures — and a join that stopped being directional
+    /// would answer with pairs no row spells.
+    Correlated(&'static str),
 }
 
 /// What the answer must carry for the question to have been answered.
@@ -402,14 +409,91 @@ struct Case {
 const RECENTLY: (&str, &str) = ("2026-08-20T00:00:00Z", "2026-08-21T00:00:00Z");
 
 /// The golden set. Add a question by adding a row.
+/// The hour the first decline happened in, which is narrower than [`RECENTLY`] by one left record.
+///
+/// A correlation's window binds the side the join is driven from, so narrowing it drops that side's
+/// rows and the pairs they carried. This is the pair of instants that makes a golden row say so.
+const FIRST_DECLINE_HOUR: (&str, &str) = ("2026-08-20T09:00:00Z", "2026-08-20T10:00:00Z");
+
 const GOLDEN: &[Case] = &[
-    // ---- the flagship cross-bot question, in the two reads it actually takes ----
+    // ---- the flagship cross-bot question, and the two reads it used to take ----
     //
     // "Refund failures in the last week where the gateway declined AND a related PR was deployed in
-    // the same window." No single read answers it: `/records` takes a window and no entity, and
-    // `/entities` takes an entity and no window. So it is asked as two reads and intersected by
-    // whoever asked -- and both halves are golden, because a question answered by hand is still a
-    // question the store has to be able to answer.
+    // the same window." It is one read now, and the row directly below is it: `/correlate` joins the
+    // two shapes on time and answers with the pairs. The two rows after it are how the question was
+    // asked before that -- two reads and an intersection performed by whoever asked -- and they stay
+    // golden, because the halves are still questions the store has to be able to answer, and because
+    // a correlation that drifted would otherwise be checked against nothing.
+    // Three hours as the nearness, because the bound is inclusive and the last decline of the day
+    // sits exactly three hours before the last deploy: it is the width at which narrowing the
+    // *window* and narrowing the *nearness* each remove a different pair, which is what lets the two
+    // rows below assert two different things.
+    Case {
+        question: "which gateway declines had a deploy in the three hours after them",
+        ask: Ask::Correlated(concat!(
+            "/correlate?left.action=transact&left.outcome=declined&right.action=deploy",
+            "&left.from_ms={from}&left.to_ms={to}&within_ms=10800000"
+        )),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        // `deploy_ok` is the assertion that matters here. It names the same ticket as the decline it
+        // sits fifteen minutes *before*, so a join that stopped being directional -- one that
+        // matched a right record within `within_ms` either side -- would pair it with
+        // `transact_declined_on_ticket` and this row would go red. `deploy_stale` is the second: it
+        // is a deploy outside the window entirely.
+        finds: &[
+            "transact_declined>promote_ok",
+            "transact_declined_on_ticket>deploy_failed",
+            "transact_declined_on_ticket>deploy_partial",
+        ],
+        // Nothing holds of all six records: the two sides are two actions with two outcomes, which
+        // is the whole point of a correlation. What each returned record *is* is asserted anyway --
+        // the runner compares every one of them against the record that was written, field for
+        // field -- so the claim this row makes is its set of pairs and their order.
+        needs: &[],
+    },
+    // The same question with the window narrowed to the hour the first decline happened in. One left
+    // record instead of two, so the pair the later decline carried is gone -- which is what says the
+    // window binds. A window accepted and ignored would answer this row with the row above's three
+    // pairs.
+    //
+    // `deploy_partial` is worth reading twice: it happened at 10:00, *outside* this window, and it is
+    // still on the right of a pair. The window bounds the left side and the right side reaches
+    // `within_ms` past it, which is the asymmetry this endpoint exists to express and the reason
+    // there is no `right.from_ms`.
+    Case {
+        question: "the same question, narrowed to the hour the first decline happened in",
+        ask: Ask::Correlated(concat!(
+            "/correlate?left.action=transact&left.outcome=declined&right.action=deploy",
+            "&left.from_ms={from}&left.to_ms={to}&within_ms=10800000"
+        )),
+        window: Some(FIRST_DECLINE_HOUR),
+        agent: "ops_bot",
+        finds: &[
+            "transact_declined_on_ticket>deploy_failed",
+            "transact_declined_on_ticket>deploy_partial",
+        ],
+        needs: &[],
+    },
+    // The same two shapes, asked the other way round -- which is the shape the question is usually
+    // *written* in: a deploy went out, and then something was declined. Direction is the caller's
+    // choice and not the join's, and this row is where that is pinned: a join whose direction
+    // inverted would answer it with `deploy_failed>transact_declined_on_ticket`, pairing the decline
+    // with the deploy that came fifteen minutes after it rather than the one before.
+    Case {
+        question: "which deploys were followed by a gateway decline inside the half hour",
+        ask: Ask::Correlated(concat!(
+            "/correlate?left.action=deploy&right.action=transact&right.outcome=declined",
+            "&left.from_ms={from}&left.to_ms={to}&within_ms=1800000"
+        )),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        finds: &["deploy_ok>transact_declined_on_ticket"],
+        // Both halves name the ticket, which is what made this pair worth reporting rather than a
+        // coincidence of the clock: a correlation joins on time, and the shared reference is the
+        // evidence that the two records are about the same thing.
+        needs: &[Needs::Entity("ticket:PROJ-42")],
+    },
     Case {
         question: "which gateway declines happened in the window (half one)",
         ask: Ask::Ordered("/records?action=transact&outcome=declined&from_ms={from}&to_ms={to}"),
@@ -781,6 +865,20 @@ const GOLDEN: &[Case] = &[
         finds: &[],
         needs: &[],
     },
+    // The nearness, narrowed until nothing is near. Every fixture and every filter is the flagship
+    // row's; only `within_ms` changed, so this is what says the join is bounded by it rather than by
+    // the window alone -- and a `within_ms` accepted and ignored would answer this with three pairs.
+    Case {
+        question: "did any decline have a deploy in the minute after it",
+        ask: Ask::Correlated(concat!(
+            "/correlate?left.action=transact&left.outcome=declined&right.action=deploy",
+            "&left.from_ms={from}&left.to_ms={to}&within_ms=60000"
+        )),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        finds: &[],
+        needs: &[],
+    },
     Case {
         question: "does a needle nothing was written with match anything",
         ask: Ask::Search("unwrittenneedle"),
@@ -946,8 +1044,11 @@ async fn write_fixtures(app: &axum::Router) -> BTreeMap<&'static str, ActionReco
 /// came back under a field nobody parsed is a body that leaked, and a parsed check only sees the
 /// fields somebody thought to look for.
 struct Answer {
-    /// Every structure in the answer, in the order it arrived.
+    /// Every structure in the answer, in the order it arrived. A correlation's pairs are flattened
+    /// into it, left then right, so the per-record assertions below hold of both halves.
     records: Vec<RecordStructure>,
+    /// The pairs a correlation answered, empty for every other read.
+    pairs: Vec<(RecordStructure, RecordStructure)>,
     /// The answer as text.
     raw: String,
     /// The cost the answer reported for itself.
@@ -967,6 +1068,46 @@ fn parse_answer(raw: String) -> Answer {
     .expect("a plausible token estimate");
     Answer {
         records,
+        pairs: Vec::new(),
+        raw,
+        token_estimate,
+    }
+}
+
+/// Parses a correlation's answer, which is pairs and not a list of records.
+///
+/// The absence of a `records` key is asserted rather than assumed: an answer that flattened its pairs
+/// into one list would satisfy every count below while having lost the one thing the read is for,
+/// which is *which* record happened near which.
+fn parse_pairs(raw: String) -> Answer {
+    let parsed: Value = serde_json::from_str(&raw).expect("a JSON answer");
+    assert!(
+        parsed.get("records").is_none(),
+        "a correlation answers pairs, not records: {raw}"
+    );
+    let pairs: Vec<(RecordStructure, RecordStructure)> = parsed["pairs"]
+        .as_array()
+        .expect("a correlation answers an array of pairs")
+        .iter()
+        .map(|pair| {
+            (
+                serde_json::from_value(pair["left"].clone()).expect("a left structure"),
+                serde_json::from_value(pair["right"].clone()).expect("a right structure"),
+            )
+        })
+        .collect();
+    let token_estimate = usize::try_from(
+        parsed["token_estimate"]
+            .as_u64()
+            .expect("every read reports what it cost"),
+    )
+    .expect("a plausible token estimate");
+    Answer {
+        records: pairs
+            .iter()
+            .flat_map(|(left, right)| [left.clone(), right.clone()])
+            .collect(),
+        pairs,
         raw,
         token_estimate,
     }
@@ -978,7 +1119,7 @@ fn parse_answer(raw: String) -> Answer {
 /// so nothing here can assert about rows a request did not return.
 async fn ask(case: &Case, app: &axum::Router) -> Answer {
     let uri = match case.ask {
-        Ask::Ordered(uri) | Ask::Unordered(uri) => target(case, uri),
+        Ask::Ordered(uri) | Ask::Unordered(uri) | Ask::Correlated(uri) => target(case, uri),
         Ask::Search(needle) => {
             // Full text takes no window, so a row that named one would have it quietly dropped.
             assert!(
@@ -989,7 +1130,11 @@ async fn ask(case: &Case, app: &axum::Router) -> Answer {
             format!("/search?q={needle}&limit={SEARCH_LIMIT}")
         }
     };
-    parse_answer(send(app, Method::GET, &uri, case.agent, b"").await)
+    let raw = send(app, Method::GET, &uri, case.agent, b"").await;
+    match case.ask {
+        Ask::Correlated(_) => parse_pairs(raw),
+        _ => parse_answer(raw),
+    }
 }
 
 /// A case's request target, with its window filled in.
@@ -1008,6 +1153,24 @@ fn target(case: &Case, uri: &str) -> String {
 /// A timestamp as the milliseconds a window is expressed in.
 fn millis(at: &str) -> i64 {
     yaam_contract::timestamp::parse_ms(at).expect("a timestamp the contract can read")
+}
+
+/// The `left>right` label of one pair, in the spelling a golden row states it in.
+///
+/// The arrow is the direction, and it is in the label rather than implied by position: a join that
+/// stopped being directional would answer with pairs no row spells, and the failure names them.
+fn pair_labels(
+    pairs: &[(RecordStructure, RecordStructure)],
+    written: &BTreeMap<&str, ActionRecord>,
+) -> Vec<String> {
+    pairs
+        .iter()
+        .map(|(left, right)| {
+            let named = labels(std::slice::from_ref(left), written);
+            let follower = labels(std::slice::from_ref(right), written);
+            format!("{}>{}", named[0], follower[0])
+        })
+        .collect()
 }
 
 /// The labels a set of structures corresponds to, by matching identifiers against what was written.
@@ -1108,6 +1271,15 @@ async fn every_golden_query_finds_exactly_the_records_its_question_needs() {
         // asserted where the read promises one.
         match case.ask {
             Ask::Ordered(_) => assert_eq!(found, case.finds, "`{question}` (newest first)"),
+            // Pairs, and the order is part of the answer: newest left record first, and within one
+            // left record its right ones oldest first. A row states each pair as `left>right`, so a
+            // join that reversed its direction or lost its window fails on the set rather than on a
+            // count.
+            Ask::Correlated(_) => assert_eq!(
+                pair_labels(&answer.pairs, &written),
+                case.finds,
+                "`{question}` (newest left first, its right records in order)"
+            ),
             Ask::Unordered(_) | Ask::Search(_) => {
                 let mut sorted = found.clone();
                 sorted.sort();
@@ -1155,14 +1327,26 @@ async fn every_golden_query_finds_exactly_the_records_its_question_needs() {
 #[test]
 fn the_table_and_the_fixtures_describe_each_other() {
     let known: Vec<&str> = FIXTURES.iter().map(|fixture| fixture.label).collect();
+    // A correlation row names a pair as `left>right`, so both halves are checked — a mistyped label
+    // on either side of the arrow would otherwise be unsatisfiable in a way that reads like a bug in
+    // the store rather than a typo in the table.
     for case in GOLDEN {
-        for label in case.finds {
-            assert!(known.contains(label), "`{}` names `{label}`", case.question);
+        for label in case.finds.iter().flat_map(|found| found.split('>')) {
+            assert!(
+                known.contains(&label),
+                "`{}` names `{label}`",
+                case.question
+            );
         }
     }
     for label in &known {
         assert!(
-            GOLDEN.iter().any(|case| case.finds.contains(label)),
+            GOLDEN.iter().any(|case| {
+                case.finds
+                    .iter()
+                    .flat_map(|found| found.split('>'))
+                    .any(|named| named == *label)
+            }),
             "`{label}` is written and no golden query asks for it"
         );
     }

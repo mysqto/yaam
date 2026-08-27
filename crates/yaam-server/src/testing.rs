@@ -168,6 +168,28 @@ impl Service for Fake {
         Ok(self.records.clone())
     }
 
+    fn correlate(
+        &self,
+        caller: &Caller,
+        left: &Filter,
+        right: &Filter,
+        within_ms: i64,
+    ) -> Result<Vec<(RecordStructure, RecordStructure)>> {
+        // Both filters and the nearness are in the recorded call for the reason the entity window is:
+        // a parameter absent from here is one the route could drop without a test noticing.
+        self.called(format!(
+            "correlate {} {left:?} {right:?} {within_ms}",
+            caller.agent
+        ))?;
+        // Each held record paired with itself, which is the smallest answer that still has two sides:
+        // a route test asserting the pair shape must not be able to pass on an empty page.
+        Ok(self
+            .records
+            .iter()
+            .map(|record| (record.clone(), record.clone()))
+            .collect())
+    }
+
     fn bundle(&self, caller: &Caller, request: &bundle::Request) -> Result<Bundle> {
         self.called(format!("bundle {} {request:?}", caller.agent))?;
         Ok(Bundle {

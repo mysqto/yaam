@@ -94,7 +94,8 @@ query. Lettered rows are variants added here, not estimates on record.
 | 7a | as 7, the busiest entity and one actor | — | 396 | 0.678 | 0.757 | |
 
 Milliseconds. Full output — p90, max, the cold sample, and the plan behind each distinct statement
-shape (figures 1, 2, 3, 4, 5, 5b, 6 and 6a) — is what `cargo run --release -p yaam-bench` prints.
+shape (figures 1, 2, 3, 4, 5, 5b, 6 and 6a, plus the structure projections `2s` and `5s`) — is what
+`cargo run --release -p yaam-bench` prints.
 The lettered variants issue the same statements with different parameters, figure 7 is figures 1 and
 4 composed, and figure 8 is not a query.
 
@@ -188,6 +189,12 @@ Two consequences the benchmark measures rather than argues:
 - **Unwindowed** (figure 5b): the planner flips the join to drive from the right side, nothing can
   stop early, and the temp b-tree sorts every pair. 1,080 ms at 100k, 4,248 ms at 200k — quadratic.
   There is no implicit "recent" in `correlate`, so this is a query a caller can legitimately issue.
+
+Both consequences are why `GET /correlate` requires its left window rather than merely capping the
+read: the quadratic case above is one index away, and the window is the only parameter a request can
+carry that bounds the term that grows. Nothing here changes for the projection the endpoint returns —
+the pair of *structures* is the same statement with the frontmatter column added to both sides of the
+select list, which costs a table lookup per returned row and leaves both seeks in place (plan `5s`).
 
 **One index fixes both.** Adding `records_action_time (action, received_ms, record_id)` to the same
 200k index, and re-running the identical statement:

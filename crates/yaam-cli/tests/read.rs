@@ -89,7 +89,7 @@ fn answered(args: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
 
 /// Every read the service answers, through the socket that signs for a caller holding no key.
 ///
-/// One deployment for all four, because starting a service and a sidecar is the expensive part and
+/// One deployment for all five, because starting a service and a sidecar is the expensive part and
 /// what is under test is the request each read makes rather than the state each one needs.
 #[test]
 fn every_read_is_answered_through_a_socket_the_caller_holds_no_key_for() {
@@ -136,6 +136,62 @@ fn every_read_is_answered_through_a_socket_the_caller_holds_no_key_for() {
     );
     assert_eq!(bundle["records"][0]["record_id"], id, "{bundle}");
     assert_eq!(bundle["degraded"], false, "{bundle}");
+
+    // Last, because it needs a second record and every read above asserts on the newest one.
+    // A join cannot pair a record with itself, so a correlation over one record could only ever
+    // answer an empty page — which would not prove the read reaches the index at all.
+    let second = write_one(&socket);
+    // Two deploys inside the same second, correlated: the read whose answer is pairs rather than
+    // records, and the one the service refuses to answer without a window.
+    let day = 24 * 60 * 60 * 1000;
+    let stamped = records["records"][0]["received_at"]
+        .as_str()
+        .expect("a read reports the server-stamped time");
+    let at = yaam_contract::timestamp::parse_ms(stamped).expect("a contract timestamp");
+    let correlated = answered(
+        &[
+            "correlate",
+            "--left-action",
+            "deploy",
+            "--right-action",
+            "deploy",
+            "--left-from-ms",
+            &(at - day).to_string(),
+            "--left-to-ms",
+            &(at + day).to_string(),
+            "--within-ms",
+            &day.to_string(),
+        ],
+        &env,
+    );
+    // Pairs, not records: which record happened near which is what the read answers, and both halves
+    // are the records this test wrote.
+    assert!(correlated.get("records").is_none(), "{correlated}");
+    let written = [id.as_str(), second.as_str()];
+    let pair = &correlated["pairs"][0];
+    assert!(
+        written.contains(&pair["left"]["record_id"].as_str().unwrap_or_default()),
+        "{correlated}"
+    );
+    assert!(
+        written.contains(&pair["right"]["record_id"].as_str().unwrap_or_default()),
+        "{correlated}"
+    );
+    assert_ne!(pair["left"]["record_id"], pair["right"]["record_id"]);
+    // Structure on both sides, so a correlation withholds prose twice per row.
+    assert!(pair["left"].get("summary").is_none(), "{correlated}");
+    assert!(pair["right"].get("summary").is_none(), "{correlated}");
+
+    // A window is the one thing this read will not guess at, and the refusal names the flag rather
+    // than a query parameter the caller never typed.
+    let refused = yaam_read(&["correlate", "--within-ms", "1000"], &env);
+    // `2`, the usage code, as the other refusals in this file name their codes as literals.
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--left-from-ms"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
 
     terminate(&mut agent, "yaam-agent");
     service.stop();

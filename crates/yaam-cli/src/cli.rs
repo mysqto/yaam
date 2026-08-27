@@ -394,12 +394,13 @@ pub struct ReadArgs {
 
 /// The reads this service answers.
 ///
-/// Subcommands rather than one flat set of flags, because the four are four questions and not four
+/// Subcommands rather than one flat set of flags, because the five are five questions and not five
 /// filters on one. `--query` is required for a search and meaningless to a bundle; `--entity` names
-/// exactly one entity for a history and any number for a bundle; a window narrows a records query
-/// and is not a parameter of the others. Flattened together, every one of those would be accepted
-/// here and refused a round trip later — the service answers an unknown parameter with `400` rather
-/// than ignoring it — and `--help` would describe a request surface that does not exist.
+/// exactly one entity for a history and any number for a bundle; a window narrows a records query,
+/// is required by a correlation, and is not a parameter of the others at all. Flattened together,
+/// every one of those would be accepted here and refused a round trip later — the service answers an
+/// unknown parameter with `400` rather than ignoring it — and `--help` would describe a request
+/// surface that does not exist.
 ///
 /// Every filter is optional wherever the service says it is optional, and absent means absent: this
 /// sends no parameter the caller did not name, because each of them has a documented default at the
@@ -480,6 +481,66 @@ pub enum ReadQuery {
         #[arg(long, value_name = "TEXT")]
         query: String,
         /// Page size. Absent leaves the service's own cap in force.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+    /// Which records of one shape were followed by records of another, as pairs.
+    ///
+    /// The join a cross-agent question reduces to: something failed, and something else happened
+    /// nearby. Two filters in one read — `--left-*` for the earlier record, `--right-*` for the one
+    /// that has to have followed it — and `--within-ms` for how long after still counts.
+    ///
+    /// Directional. A pair comes back when the right record was stamped at or after the left one, so
+    /// "what was deployed just before this decline" is asked by putting the deploy on the left. There
+    /// is no backwards window: swap the sides.
+    ///
+    /// `--left-from-ms` and `--left-to-ms` are required, which no other read here demands. They bound
+    /// the side the join is driven from, and it is the only thing a request can say that stops this
+    /// read costing whatever the store happens to hold.
+    Correlate {
+        /// Exact match on the earlier record's action.
+        #[arg(long, value_name = "ACTION")]
+        left_action: Option<String>,
+        /// Restrict the earlier record to one outcome.
+        #[arg(long, value_name = "OUTCOME")]
+        left_outcome: Option<OutcomeArg>,
+        /// Restrict the earlier record to one author.
+        #[arg(long, value_name = "NAME")]
+        left_agent: Option<String>,
+        /// Require a structural attribute on the earlier record, as `key=value`.
+        #[arg(long, value_name = "KEY=VALUE")]
+        left_attr: Option<String>,
+        /// Inclusive start of the window the earlier record is searched in, in milliseconds.
+        ///
+        /// Required, with `--left-to-ms`. There is deliberately no implicit "recent": a question
+        /// whose meaning depends on when it ran cannot be tested.
+        #[arg(long, value_name = "MS")]
+        left_from_ms: Option<i64>,
+        /// Exclusive end of that window, on the same clock. Required, with `--left-from-ms`.
+        #[arg(long, value_name = "MS")]
+        left_to_ms: Option<i64>,
+        /// Exact match on the later record's action.
+        #[arg(long, value_name = "ACTION")]
+        right_action: Option<String>,
+        /// Restrict the later record to one outcome.
+        #[arg(long, value_name = "OUTCOME")]
+        right_outcome: Option<OutcomeArg>,
+        /// Restrict the later record to one author.
+        #[arg(long, value_name = "NAME")]
+        right_agent: Option<String>,
+        /// Require a structural attribute on the later record, as `key=value`.
+        #[arg(long, value_name = "KEY=VALUE")]
+        right_attr: Option<String>,
+        /// How long after the earlier record a later one still counts, in milliseconds.
+        ///
+        /// Required: no length of time means "nearby" to every caller. There is no window on the
+        /// right side — the right side's window is the left one plus this.
+        #[arg(long, value_name = "MS")]
+        within_ms: i64,
+        /// Most pairs to return. Absent leaves the service's own pair cap in force.
+        ///
+        /// Pairs, not records: a pair row is two structures, so the service's cap here is half its
+        /// cap on the other reads.
         #[arg(long, value_name = "N")]
         limit: Option<u32>,
     },
@@ -875,7 +936,7 @@ mod tests {
     /// Each read is its own subcommand, and each demands what only it needs.
     #[test]
     fn every_read_is_its_own_subcommand_with_its_own_requirements() {
-        ReadCli::try_parse_from(["yaam-read"]).expect_err("no default read: there are four");
+        ReadCli::try_parse_from(["yaam-read"]).expect_err("no default read: there are five");
         ReadCli::try_parse_from(["yaam-read", "records"]).expect("every filter is optional");
         ReadCli::try_parse_from(["yaam-read", "search"])
             .expect_err("a search for nothing is not a search for everything");
@@ -889,6 +950,23 @@ mod tests {
             .expect_err("a full-text read takes no filters");
         ReadCli::try_parse_from(["yaam-read", "bundle", "--query", "x"])
             .expect_err("a bundle has no needle");
+        // A correlation is the one read that demands a nearness: no length of time means "nearby" to
+        // every caller, so there is nothing to default it to.
+        ReadCli::try_parse_from(["yaam-read", "correlate"])
+            .expect_err("a correlation has to say what nearby means");
+        ReadCli::try_parse_from(["yaam-read", "correlate", "--within-ms", "1000"])
+            .expect("the window is refused when the request is built, naming the flag");
+        // The unprefixed filters belong to the other read: a correlation has two sides, and
+        // `--action` would not say which of them it meant.
+        ReadCli::try_parse_from([
+            "yaam-read",
+            "correlate",
+            "--within-ms",
+            "1000",
+            "--action",
+            "deploy",
+        ])
+        .expect_err("a correlation filters a side, not the request");
     }
 
     /// Each knowledge command demands what only it needs, and the group defaults to nothing.

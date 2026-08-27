@@ -689,6 +689,18 @@ fn plans(index: &Path, targets: &Targets, queries: &Queries) -> String {
             "5b",
             explain::correlate(&store, &failed_deploys(None), &ticket_updates(), day),
         ),
+        // The projection a request gets. Its own entry for the reason `2s` has one: the frontmatter
+        // column is in neither covering index, so whether selecting it on *both* sides of the join
+        // costs the seeks is a property of the plan and of nothing a timing would show.
+        (
+            "5s",
+            explain::correlate_structures(
+                &store,
+                &failed_deploys(Some(queries.month)),
+                &ticket_updates(),
+                day,
+            ),
+        ),
         (
             "6",
             explain::search(&store, &queries.phrase, 100, &reader()),

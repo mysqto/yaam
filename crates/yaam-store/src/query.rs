@@ -35,6 +35,22 @@ pub const DEFAULT_STRUCTURE_LIMIT: u32 = 200;
 /// the two numbers are only meaningful relative to each other.
 const _: () = assert!(DEFAULT_STRUCTURE_LIMIT < DEFAULT_LIMIT);
 
+/// Pairs a correlation of *structure* returns when the caller names no page size.
+///
+/// Half [`DEFAULT_STRUCTURE_LIMIT`], because a pair row is two structures. The page size here is a
+/// byte budget rather than a row count — a page of pairs at the structure default would be twice the
+/// answer every other read is allowed to give, and the caller asking a two-sided question is the
+/// last one who should be charged double for it without saying so.
+///
+/// It bounds the answer and not the duplication inside it: a left record paired with several right
+/// ones is returned once per pair, frontmatter and all, because a pair is what was asked for. A
+/// caller that wants fewer copies narrows `within_ms`.
+pub const DEFAULT_PAIR_LIMIT: u32 = 100;
+
+/// A pair page must not default to the single-structure page size. Checked at compile time, for the
+/// reason above: the two numbers only mean anything relative to each other.
+const _: () = assert!(DEFAULT_PAIR_LIMIT < DEFAULT_STRUCTURE_LIMIT);
+
 /// How many full-text matches [`search`] may examine per row it returns.
 ///
 /// The scope test runs after the match, so the candidate set has to be wider than the page or a
@@ -247,6 +263,19 @@ impl Select {
         }
     }
 
+    /// The select list a join reads: this projection over each side, left first.
+    ///
+    /// Spelled out rather than composed from [`Select::columns`] with the alias substituted, because
+    /// the column *order* is what the row reader unpacks by position — and a projection whose two
+    /// halves could be assembled in either order is one a refactor can silently transpose, handing
+    /// every caller the pair backwards.
+    fn pair_columns(self) -> &'static str {
+        match self {
+            Self::Id => "l.record_id, r.record_id",
+            Self::Structure => "l.record_id, l.frontmatter, r.record_id, r.frontmatter",
+        }
+    }
+
     /// The page size a caller that named none gets, which is a property of what the row costs.
     fn default_limit(self) -> u32 {
         match self {
@@ -445,7 +474,7 @@ pub fn correlate(
     right: &Filter,
     within_ms: i64,
 ) -> crate::Result<Vec<(RecordId, RecordId)>> {
-    let (sql, binds) = correlate_sql(left, right, within_ms);
+    let (sql, binds) = correlate_sql(left, right, within_ms, Select::Id);
     let lease = store.lease()?;
     let mut stmt = lease.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(binds), |row| {
@@ -462,16 +491,68 @@ pub fn correlate(
     Ok(pairs)
 }
 
+/// The correlation as pairs of *structure* rather than pairs of identifiers.
+///
+/// [`correlate`] with the wider select list: the same join, the same direction, the same window, the
+/// same scope test on both sides — and each side's stored frontmatter instead of its bare identifier.
+/// What a caller asking a correlation wanted, because an identifier is answerable only by a read this
+/// service does not offer a caller, and a pair of them is two names it cannot resolve rather than
+/// one.
+///
+/// One statement, not this join for the ids and a second read for their structure. The second read
+/// is where a scope predicate gets forgotten, and here it would be forgotten twice — a pair joins two
+/// records whose visibility was decided separately, so a hydration step that dropped the predicate
+/// would hand back the record on the other side of the join to a caller no read admits it to.
+///
+/// `left.limit` caps the number of *pairs*, defaulting to [`DEFAULT_PAIR_LIMIT`]: a pair row carries
+/// two structures, so it is half what a single-structure page costs. A left record matching several
+/// right ones is returned once per pair, its frontmatter repeated — the duplication is the shape of
+/// the answer rather than a defect in it, and `within_ms` is what a caller narrows to reduce it.
+pub fn correlate_structures(
+    store: &crate::Store,
+    left: &Filter,
+    right: &Filter,
+    within_ms: i64,
+) -> crate::Result<Vec<(RecordStructure, RecordStructure)>> {
+    let (sql, binds) = correlate_sql(left, right, within_ms, Select::Structure);
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut pairs = Vec::new();
+    for row in rows {
+        let (left_id, left_front, right_id, right_front) = row?;
+        pairs.push((
+            crate::stored_structure(left_id, &left_front)?,
+            crate::stored_structure(right_id, &right_front)?,
+        ));
+    }
+    Ok(pairs)
+}
+
 /// Builds the correlation query and its bindings.
-fn correlate_sql(left: &Filter, right: &Filter, within_ms: i64) -> (String, Vec<SqlValue>) {
+fn correlate_sql(
+    left: &Filter,
+    right: &Filter,
+    within_ms: i64,
+    select: Select,
+) -> (String, Vec<SqlValue>) {
     let mut binds: Vec<SqlValue> = vec![within_ms.into()];
-    let mut sql = "SELECT l.record_id, r.record_id
+    let mut sql = format!(
+        "SELECT {}
          FROM records AS l
          JOIN records AS r
            ON r.received_ms >= l.received_ms
           AND r.received_ms <= l.received_ms + ?
-         WHERE l.id <> r.id"
-        .to_owned();
+         WHERE l.id <> r.id",
+        select.pair_columns()
+    );
     for predicate in correlate_predicates(left, "l", &mut binds) {
         sql.push_str(" AND ");
         sql.push_str(&predicate);
@@ -481,8 +562,14 @@ fn correlate_sql(left: &Filter, right: &Filter, within_ms: i64) -> (String, Vec<
         sql.push_str(&predicate);
     }
     sql.push_str(" ORDER BY l.received_ms DESC, r.received_ms ASC, l.id DESC, r.id ASC");
-    // A correlation returns pairs of identifiers, so it pages at the cheaper default.
-    push_limit(&mut sql, &mut binds, left.limit, Select::Id);
+    // The page a correlation defaults to is the pair's, not the projection's: a pair of identifiers
+    // is cheap and a pair of structures is two rows of frontmatter, so [`push_limit`]'s per-projection
+    // default is the wrong one on this read and the page is resolved here instead.
+    let page = match select {
+        Select::Id => left.limit,
+        Select::Structure => Some(left.limit.unwrap_or(DEFAULT_PAIR_LIMIT)),
+    };
+    push_limit(&mut sql, &mut binds, page, select);
     (sql, binds)
 }
 
@@ -815,7 +902,22 @@ pub mod explain {
         right: &Filter,
         within_ms: i64,
     ) -> crate::Result<String> {
-        let (sql, binds) = correlate_sql(left, right, within_ms);
+        let (sql, binds) = correlate_sql(left, right, within_ms, Select::Id);
+        plan(store, &sql, binds)
+    }
+
+    /// How [`super::correlate_structures`] would run.
+    ///
+    /// Its own helper for the reason [`by_entity_structures`] has one, doubled: the wider select list
+    /// costs a table lookup per row on *both* sides of the join, and whether the join still seeks
+    /// rather than scans once the frontmatter is in the select list is a property of the plan.
+    pub fn correlate_structures(
+        store: &crate::Store,
+        left: &Filter,
+        right: &Filter,
+        within_ms: i64,
+    ) -> crate::Result<String> {
+        let (sql, binds) = correlate_sql(left, right, within_ms, Select::Structure);
         plan(store, &sql, binds)
     }
 
@@ -885,9 +987,9 @@ mod tests {
     use yaam_contract::Visibility;
 
     use super::{
-        DEFAULT_LIMIT, DEFAULT_STRUCTURE_LIMIT, Extent, Filter, MAX_CANDIDATES, SCOPE_HEADROOM,
-        Scope, Select, SqlValue, Window, by_entity_sql, candidate_ceiling, correlate_sql,
-        filter_sql, scope_predicate, search_sql,
+        DEFAULT_LIMIT, DEFAULT_PAIR_LIMIT, DEFAULT_STRUCTURE_LIMIT, Extent, Filter, MAX_CANDIDATES,
+        SCOPE_HEADROOM, Scope, Select, SqlValue, Window, by_entity_sql, candidate_ceiling,
+        correlate_sql, filter_sql, scope_predicate, search_sql,
     };
 
     /// What a reader on one team is entitled to.
@@ -990,24 +1092,29 @@ mod tests {
             scope: reader(),
             ..Filter::default()
         };
-        let (sql, binds) = correlate_sql(&left, &right, 60_000);
-        let plan = plan(&sql, binds);
-        assert!(
-            !plan.contains("SCAN"),
-            "range join fell back to a scan:\n{plan}"
-        );
-        // Each side wants the index that matches what it pins. The left pins action and outcome;
-        // the right pins action alone, and asking it to use the outcome-leading index leaves a gap
-        // mid-key that turns the range into a per-row filter. Measured, that was 25x.
-        assert!(
-            plan.contains("USING INDEX records_action_outcome_time"),
-            "the side pinning action and outcome should use the index covering both:\n{plan}"
-        );
-        assert!(
-            plan.contains("USING INDEX records_action_time"),
-            "the side pinning action alone should use the action-leading index, not the one with \
-             outcome mid-key:\n{plan}"
-        );
+        // Both projections, because the wider select list is what a request-driven correlation runs
+        // and the frontmatter column is in neither covering index: if selecting it cost the join its
+        // seeks, the read exposed on the wire would be the slow one and this test would still pass.
+        for select in [Select::Id, Select::Structure] {
+            let (sql, binds) = correlate_sql(&left, &right, 60_000, select);
+            let plan = plan(&sql, binds);
+            assert!(
+                !plan.contains("SCAN"),
+                "range join fell back to a scan for {select:?}:\n{plan}"
+            );
+            // Each side wants the index that matches what it pins. The left pins action and outcome;
+            // the right pins action alone, and asking it to use the outcome-leading index leaves a
+            // gap mid-key that turns the range into a per-row filter. Measured, that was 25x.
+            assert!(
+                plan.contains("USING INDEX records_action_outcome_time"),
+                "the side pinning action and outcome should use the index covering both:\n{plan}"
+            );
+            assert!(
+                plan.contains("USING INDEX records_action_time"),
+                "the side pinning action alone should use the action-leading index, not the one \
+                 with outcome mid-key:\n{plan}"
+            );
+        }
     }
 
     #[test]
@@ -1171,7 +1278,7 @@ mod tests {
         // read the whole index into memory — which works until the index is large.
         for (sql, binds) in [
             filter_sql(&Filter::default(), Select::Id),
-            correlate_sql(&Filter::default(), &Filter::default(), 1),
+            correlate_sql(&Filter::default(), &Filter::default(), 1, Select::Id),
         ] {
             assert!(sql.contains("LIMIT ?"), "{sql}");
             assert!(
@@ -1186,6 +1293,21 @@ mod tests {
         assert!(
             binds.contains(&SqlValue::from(i64::from(DEFAULT_STRUCTURE_LIMIT))),
             "{binds:?}"
+        );
+
+        // And a page of *pairs* of structure lower again, because the row is two of them. A pair
+        // page that defaulted to the structure page would be the one read allowed to answer with
+        // twice what every other read may.
+        let (sql, binds) =
+            correlate_sql(&Filter::default(), &Filter::default(), 1, Select::Structure);
+        assert!(sql.contains("LIMIT ?"), "{sql}");
+        assert!(
+            binds.contains(&SqlValue::from(i64::from(DEFAULT_PAIR_LIMIT))),
+            "{binds:?}"
+        );
+        assert!(
+            !binds.contains(&SqlValue::from(i64::from(DEFAULT_STRUCTURE_LIMIT))),
+            "a pair page must not fall back to the single-structure page: {binds:?}"
         );
 
         // A caller that names one still gets exactly that.
@@ -1292,20 +1414,26 @@ mod tests {
                 .expect("a plan")
                 .contains("records_fts")
         );
-        let join = super::explain::correlate(&store, &filter, &filter, 1_000).expect("a plan");
-        assert_eq!(
-            join.matches("records_action_outcome_time").count(),
-            2,
-            "{join}"
-        );
+        for join in [
+            super::explain::correlate(&store, &filter, &filter, 1_000).expect("a plan"),
+            super::explain::correlate_structures(&store, &filter, &filter, 1_000).expect("a plan"),
+        ] {
+            assert_eq!(
+                join.matches("records_action_outcome_time").count(),
+                2,
+                "{join}"
+            );
+        }
     }
 
     #[test]
     fn no_query_reads_the_clock() {
         // A time function in the plan would make the result depend on when it ran.
-        let (correlation, _) = correlate_sql(&Filter::default(), &Filter::default(), 1);
+        let (correlation, _) = correlate_sql(&Filter::default(), &Filter::default(), 1, Select::Id);
+        let (pairs, _) =
+            correlate_sql(&Filter::default(), &Filter::default(), 1, Select::Structure);
         let (filtered, _) = filter_sql(&Filter::default(), Select::Id);
-        for sql in [correlation, filtered] {
+        for sql in [correlation, pairs, filtered] {
             assert!(!sql.contains("unixepoch"), "clock read in: {sql}");
             assert!(!sql.contains("'now'"), "clock read in: {sql}");
         }

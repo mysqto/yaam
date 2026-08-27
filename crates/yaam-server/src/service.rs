@@ -84,6 +84,32 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
         limit: Option<u32>,
     ) -> Result<Vec<RecordStructure>>;
 
+    /// Answers which records of one shape were followed by records of another, inside `within_ms`.
+    ///
+    /// The join every cross-agent question reduces to: something failed, and something else happened
+    /// nearby. Directional — the right record was stamped at or after the left one — so "what
+    /// happened *before* this" is asked by putting the earlier thing on the left, and there is no
+    /// spelling of a backwards window.
+    ///
+    /// Each side comes back as its stored structure, for the reason [`Service::query`] does: a pair
+    /// of identifiers is two names the caller cannot resolve rather than one.
+    ///
+    /// An implementation must narrow *both* sides to [`Caller::scope`], and narrow them inside the
+    /// join. A pair joins two records whose visibility was decided separately, so a scope test
+    /// applied to one side only — or applied after the join — would hand a caller the record on the
+    /// other side of it, which is a way to read what no other read here returns.
+    ///
+    /// `left.window` bounds the search, and the endpoint above requires it: a correlation with no
+    /// window is a question whose answer moves with the store rather than with the records, and its
+    /// cost is a property of the plan rather than of the page. `left.limit` caps the number of pairs.
+    fn correlate(
+        &self,
+        caller: &Caller,
+        left: &Filter,
+        right: &Filter,
+        within_ms: i64,
+    ) -> Result<Vec<(RecordStructure, RecordStructure)>>;
+
     /// Composes context for a request.
     ///
     /// The entities it names are canonicalised as [`Service::entity`] canonicalises its own, and for
@@ -270,6 +296,26 @@ impl Service for CoreService {
             &caller.scope(),
         )
         .map_err(yaam_core::Error::from)?)
+    }
+
+    fn correlate(
+        &self,
+        caller: &Caller,
+        left: &Filter,
+        right: &Filter,
+        within_ms: i64,
+    ) -> Result<Vec<(RecordStructure, RecordStructure)>> {
+        // Both sides, from the same credential. Scoping one side and not the other would return the
+        // record on the unscoped side to whoever could name a filter matching the scoped one, so the
+        // two assignments are the whole of what makes this read as safe as the others.
+        let scoped = |filter: &Filter| Filter {
+            scope: caller.scope(),
+            ..filter.clone()
+        };
+        Ok(
+            query::correlate_structures(self.store()?, &scoped(left), &scoped(right), within_ms)
+                .map_err(yaam_core::Error::from)?,
+        )
     }
 
     fn bundle(&self, caller: &Caller, request: &bundle::Request) -> Result<Bundle> {

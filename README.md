@@ -24,6 +24,7 @@ index that makes it queryable in single-digit milliseconds.
 | **Reads return structure, never a body** | A read answers with each matching record's frontmatter — action, outcome, declared attributes, entity references, subject pseudonyms, timestamps — and never its prose. The rule does not branch on data class: a sealed body is withheld because it is a body, and a plaintext one for the same reason. A plaintext body is read from the tree; a sealed one only through `yaam unseal`, which records the reading before it performs it. |
 | **One audited way back to a sealed body** | `yaam unseal` publishes an operator-visible record naming who read the body and why, and only then fetches a key. A store that cannot record the read cannot answer it, so there is no path that returns a sealed body without a line saying it did. |
 | **Derived knowledge** | One note per entity under `knowledge/`, rebuilt wholesale from the record tree by `yaam knowledge build`. Every line restates a structured field some record declared and names the records it came from. Nothing is derived from a record whose body is erasable, so a key destruction has no aggregate to chase. |
+| **Correlation is one read** | *Which declines had a deploy near them* is a directional range join over the server-stamped clock, answered as pairs of records by `GET /correlate` — not two reads and an intersection performed by the caller. Its window is required rather than optional: a join whose left side is unbounded is a query whose answer moves with the store, and whose cost moves with the planner. |
 | **Idempotent** | Every write is keyed. Replays, retries and re-drives are safe. |
 | **Redacted at the source** | The writer masks, the service only checks and refuses what is still unmasked — so a record's `fields_masked` is the writer's own account. `yaam_contract::mask` is the one implementation of masking, reading the same policy file the service checks against. |
 | **Portable** | Any harness that speaks HTTP can participate; a local sidecar handles signing and sealing, for reads as well as writes, so callers hold no keys. |
@@ -96,6 +97,11 @@ yaam-read records --action deploy --attr environment=staging --limit 10
 yaam-read search --query "rolled back" --limit 5      # full text over bodies, structure back
 yaam-read history --entity deploy:api/staging#1146    # one entity's history, newest first
 yaam-read bundle --entity ticket:PROJ-42 --actor agent_a --limit 5   # context for a request
+
+# Two shapes joined on time: which declines had a deploy in the half hour after them. One read,
+# answered as pairs. The window is required — see below.
+yaam-read correlate --left-action transact --left-outcome declined --right-action deploy \
+          --left-from-ms 1787184000000 --left-to-ms 1787270400000 --within-ms 1800000
 
 # …and a bundle for a caller that has a sentence rather than a list of entities.
 yaam-read bundle --infer-entities /srv/memory/spec --limit 5 \
@@ -296,12 +302,14 @@ asking.
 | filtered query | `yaam-read records [--action --outcome --agent --attr --from-ms --to-ms --limit]` | `RecordsResponse` |
 | entity history | `yaam-read history --entity kind:id [--min-confidence --limit]` | `RecordsResponse` |
 | full text | `yaam-read search --query TEXT [--limit]` | `RecordsResponse` |
+| correlation | `yaam-read correlate --within-ms MS --left-from-ms MS --left-to-ms MS [--left-action --left-outcome --left-agent --left-attr --right-action --right-outcome --right-agent --right-attr --limit]` | `CorrelationsResponse` |
 | context | `yaam-read bundle [--entity kind:id …] [--actor --infer-entities --infer-from --deadline-ms --limit]` | `BundleResponse` |
 
-Four subcommands rather than one flat set of flags, because they are four questions and not four
+Five subcommands rather than one flat set of flags, because they are five questions and not five
 filters on one: `--query` is required for a search and meaningless to a bundle, a window narrows the
-filtered query alone, and the service answers a parameter it does not know with `400` rather than
-ignoring it. Flattened together, `--help` would describe a request surface that does not exist.
+filtered query and is *required* by a correlation, and the service answers a parameter it does not
+know with `400` rather than ignoring it. Flattened together, `--help` would describe a request surface
+that does not exist.
 
 Nothing the caller did not name is sent. Every optional parameter has a documented default at the
 service, and a copy of one here would be a second place for it to be out of date.
@@ -315,6 +323,48 @@ sidecar, since a read is never queued.
 Percent-encoding is the command's business rather than the caller's, which matters more than it looks:
 several configured entity kinds carry `/`, `#` or `@` inside an identifier, and the signature the
 sidecar adds covers the request target exactly as sent.
+
+#### Two things happening near each other
+
+`yaam-read correlate` is the one read whose answer is not a list of records. It joins two shapes on
+the server-stamped clock and answers with **pairs** — a `left` record, and a `right` record that
+followed it inside `--within-ms` — because which record happened near which is the question, and a
+flat list of both sides is what `yaam-read records` already gives you.
+
+```bash
+# Which gateway declines had a deploy in the three hours after them, over one day.
+yaam-read correlate --left-action transact --left-outcome declined \
+          --right-action deploy --within-ms 10800000 \
+          --left-from-ms 1787184000000 --left-to-ms 1787270400000
+```
+
+It replaces two workarounds, and both were worse than they looked. Reading the declines and the
+deploys separately and intersecting them by hand leaves the caller doing arithmetic over two pages
+that were capped independently. Reading one entity's history inside a window is nearer, but it answers
+*what touched this ticket* and leaves which of those records happened near which to whoever read it —
+and it can only join records that already share an entity, where a correlation joins on time. Reach
+for `history` when the question is about a thing, and for `correlate` when it is about two events
+being near each other.
+
+**It is directional, and that is the flag people get backwards.** A pair comes back when the `right`
+record was stamped at or after the `left` one. So *"what was deployed just before this decline"* puts
+the **deploy** on the left — there is no backwards window, and `--within-ms` below zero is refused
+rather than answered with the empty page it would produce, because an empty page reads as "nothing
+happened nearby".
+
+**`--left-from-ms` and `--left-to-ms` are required**, which no other read here demands. Two reasons,
+and the second is the one that decides it. A correlation with no window answers "the most recent pairs
+in the store", which moves as records arrive — and a query whose meaning depends on when it ran cannot
+be tested. And this is a non-equi range join whose cost is (rows on the left) × (rows the right index
+walks per left row); the left window is the only thing a request can say that bounds the first term.
+The covering index keeps it cheap today — 1.6 ms for a thousand pairs over 200,000 records, windowed
+or not — but the same statement measured 4.2 s unwindowed before that index existed, and the window is
+what keeps a planner's change of mind from being an outage. There is deliberately no window on the
+right: the right side's window *is* the left side's plus `--within-ms`.
+
+`--limit` caps **pairs**, and the service's own cap is half its cap on the other reads, because a pair
+row is two records' frontmatter. A left record matching several right records comes back once per
+pair, repeated — narrow `--within-ms` rather than raising the limit.
 
 #### Naming the entities a caller does not know it has
 

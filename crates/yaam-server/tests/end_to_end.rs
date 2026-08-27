@@ -260,6 +260,22 @@ fn scoped_tree() -> (Tree, axum::Router, Vec<RecordId>) {
     (tree, app, ids)
 }
 
+/// A correlation over the whole of `days`, joining anything within `within_ms`.
+///
+/// Built from instants rather than written as epoch millis: a correlation is the one read that
+/// *requires* its window, and a magic number in the target would leave the reader unable to tell a
+/// window that covers the fixture from one that happens to.
+fn correlation_over(from: &str, to: &str, within_ms: i64) -> String {
+    let millis = |at: &str| {
+        yaam_contract::timestamp::parse_ms(at).expect("a timestamp the contract can read")
+    };
+    format!(
+        "/correlate?left.from_ms={}&left.to_ms={}&within_ms={within_ms}",
+        millis(from),
+        millis(to)
+    )
+}
+
 /// One signed read, as the response the caller receives.
 async fn read_response(app: &axum::Router, agent: &str, uri: &str) -> axum::response::Response {
     let request = Request::builder()
@@ -389,14 +405,18 @@ async fn no_read_returns_a_body_for_either_data_class() {
     ));
 
     for uri in [
-        "/records",
+        "/records".to_owned(),
         // The needle matches the plaintext body, so this read has prose in hand and still must not
         // hand any back. The sealed record indexes no text and so cannot match at all.
-        "/search?q=shards",
-        "/entities/ticket/PROJ-42",
-        "/entities/order_ref/ord10014721",
-        "/bundle?entity=ticket:PROJ-42,order_ref:ord10014721",
+        "/search?q=shards".to_owned(),
+        "/entities/ticket/PROJ-42".to_owned(),
+        "/entities/order_ref/ord10014721".to_owned(),
+        // Two records a day apart, so this pairs the plaintext one with the sealed one — the read
+        // that has two chances per row to hand back prose, and must take neither.
+        correlation_over("2026-08-20T00:00:00Z", "2026-08-22T00:00:00Z", 86_400_000),
+        "/bundle?entity=ticket:PROJ-42,order_ref:ord10014721".to_owned(),
     ] {
+        let uri = uri.as_str();
         let body = read_as(&app, "agent_b", uri).await;
         assert!(
             !body.contains("summary"),
@@ -445,11 +465,16 @@ async fn a_caller_outside_a_records_scope_receives_neither_its_structure_nor_its
     let hidden = [ids[1].as_str(), ids[3].as_str(), ids[4].as_str()];
 
     for uri in [
-        "/records",
-        "/search?q=shards",
-        "/entities/ticket/PROJ-42",
-        "/bundle?entity=ticket:PROJ-42",
+        "/records".to_owned(),
+        "/search?q=shards".to_owned(),
+        "/entities/ticket/PROJ-42".to_owned(),
+        // Every record in the fixture shares one instant, so a nearness of zero pairs each visible
+        // record with each other visible one. Both sides of the join are scoped or a hidden record
+        // arrives as somebody else's right-hand half — which no other read here would return.
+        correlation_over("2026-08-20T00:00:00Z", "2026-08-21T00:00:00Z", 0),
+        "/bundle?entity=ticket:PROJ-42".to_owned(),
     ] {
+        let uri = uri.as_str();
         let body = read_as(&app, "agent_b", uri).await;
         for id in hidden {
             assert!(

@@ -128,6 +128,7 @@ impl AppState {
 /// | `GET /records` | Filtered query. |
 /// | `GET /search` | Which records mention something. Full text over bodies, structure back. |
 /// | `GET /entities/{kind}/{id}` | One page of an entity's history, newest first. |
+/// | `GET /correlate` | Which records of one shape were followed by records of another. |
 /// | `GET /bundle` | Compose context for a request. |
 /// | `POST /erase` | Destroy a subject's keys. Operator only, and rebuilds the index. |
 ///
@@ -144,6 +145,7 @@ pub fn router(state: AppState) -> Router {
         .route("/records", post(write_record).get(query_records))
         .route("/search", get(search_records))
         .route("/entities/{kind}/{id}", get(entity_records))
+        .route("/correlate", get(correlate_records))
         .route("/bundle", get(compose_bundle))
         .route("/erase", post(erase_subject))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
@@ -222,19 +224,28 @@ pub struct RecordQuery {
     pub limit: Option<u32>,
 }
 
+/// One attribute filter, split at the first `=`, or the refusal naming the parameter it came from.
+///
+/// Shared by the three parameters that spell one — `attr`, `left.attr` and `right.attr` — because
+/// which of them the caller mistyped is the whole content of the refusal. A local copy per handler
+/// would name whichever parameter the copy was written for.
+fn attr_filter(spec: Option<String>, name: &str) -> Result<Option<(String, String)>> {
+    match spec {
+        Some(pair) => Ok(Some(
+            pair.split_once('=')
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .ok_or_else(|| {
+                    Error::Unprocessable(format!("`{name}` must be `key=value`, got `{pair}`"))
+                })?,
+        )),
+        None => Ok(None),
+    }
+}
+
 impl RecordQuery {
     /// Turns query parameters into an index filter.
     fn into_filter(self) -> Result<Filter> {
-        let attr = match self.attr {
-            Some(pair) => Some(
-                pair.split_once('=')
-                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
-                    .ok_or_else(|| {
-                        Error::Unprocessable(format!("`attr` must be `key=value`, got `{pair}`"))
-                    })?,
-            ),
-            None => None,
-        };
+        let attr = attr_filter(self.attr, "attr")?;
         // Half a window is not a narrower query, it is a different one, so supplying the missing
         // bound here would answer a question the caller did not ask.
         let window = match (self.from_ms, self.to_ms) {
@@ -257,6 +268,161 @@ impl RecordQuery {
             limit: self.limit,
             ..Filter::default()
         })
+    }
+}
+
+/// One correlated pair: a record, and a record that followed it inside the window.
+///
+/// Two structures rather than two identifiers, and a pair rather than a flat set. Which decline went
+/// with which deploy *is* the answer — a flat list of both sides is what `GET /records` already gives
+/// a caller, and it cannot say what happened near what once either side matches more than once.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CorrelatedPair {
+    /// The record the question was asked about: the earlier of the two.
+    pub left: RecordStructure,
+    /// The record that followed it, at or after `left` and no later than `within_ms` after.
+    pub right: RecordStructure,
+}
+
+/// Answer to a correlation.
+///
+/// Its own shape rather than a [`RecordsResponse`], because the pairing is the answer: flattened into
+/// one `records` list it would be a set of records the caller has to re-join by timestamp, which is
+/// the arithmetic this endpoint exists to stop doing by hand.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CorrelationsResponse {
+    /// Matching pairs. Newest left record first, and within one left record its right ones in the
+    /// order they happened.
+    pub pairs: Vec<CorrelatedPair>,
+    /// Rough token cost of this answer, advisory only.
+    ///
+    /// Measured over both halves of every pair, so a left record matching several right ones is
+    /// counted once per pair — which is what returning it once per pair costs.
+    pub token_estimate: usize,
+}
+
+impl CorrelationsResponse {
+    /// Wraps pairs and measures what returning them costs.
+    fn new(pairs: Vec<(RecordStructure, RecordStructure)>) -> Self {
+        // Both halves of every pair, through the same measurement every other read uses: a left
+        // record returned in three pairs is counted three times, because that is what returning it
+        // three times costs the caller.
+        let token_estimate = yaam_contract::structure::estimate_tokens(
+            pairs.iter().flat_map(|(left, right)| [left, right]),
+        );
+        Self {
+            pairs: pairs
+                .into_iter()
+                .map(|(left, right)| CorrelatedPair { left, right })
+                .collect(),
+            token_estimate,
+        }
+    }
+}
+
+/// The two halves of a correlation, and how near they have to be.
+///
+/// Two filters in one request, spelled `left.` and `right.` — the same names `GET /records` accepts,
+/// prefixed by which side of the join they constrain. Packing a side into one value (`left=action:…`)
+/// was the alternative and is worse for the reason this struct is closed: a typo inside a packed
+/// value cannot be refused, and a filter that got dropped widens that side of the join to everything.
+///
+/// The window is `left.`-prefixed and required, and there is deliberately no `right.from_ms`: the
+/// right side's window is the left side's plus `within_ms`, computed by the join. A second window
+/// would be a second answer to the same question, and a caller that made the two disagree would get
+/// an empty page for a reason nothing in the request shows.
+///
+/// `limit` carries no prefix because it caps *pairs* rather than either side's rows, and a
+/// `right.limit` is refused rather than accepted-and-ignored: a page size on the right of a join
+/// means nothing, and a parameter that silently does nothing is worse than one that is not there.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorrelateQuery {
+    /// Restrict the left side to one action.
+    #[serde(rename = "left.action")]
+    pub left_action: Option<String>,
+    /// Restrict the left side to one outcome, spelled as the contract serialises it.
+    #[serde(rename = "left.outcome")]
+    pub left_outcome: Option<String>,
+    /// Restrict the left side to one agent.
+    #[serde(rename = "left.agent")]
+    pub left_agent: Option<String>,
+    /// Require a structural attribute on the left side, as `key=value`.
+    #[serde(rename = "left.attr")]
+    pub left_attr: Option<String>,
+    /// Inclusive start of the window the left side is searched in. Required.
+    #[serde(rename = "left.from_ms")]
+    pub left_from_ms: Option<i64>,
+    /// Exclusive end of that window. Required.
+    #[serde(rename = "left.to_ms")]
+    pub left_to_ms: Option<i64>,
+    /// Restrict the right side to one action.
+    #[serde(rename = "right.action")]
+    pub right_action: Option<String>,
+    /// Restrict the right side to one outcome.
+    #[serde(rename = "right.outcome")]
+    pub right_outcome: Option<String>,
+    /// Restrict the right side to one agent.
+    #[serde(rename = "right.agent")]
+    pub right_agent: Option<String>,
+    /// Require a structural attribute on the right side, as `key=value`.
+    #[serde(rename = "right.attr")]
+    pub right_attr: Option<String>,
+    /// How long after a left record a right one still counts, in milliseconds. Required.
+    pub within_ms: i64,
+    /// Most pairs to return. Absent means the index's own pair cap, not every pair.
+    pub limit: Option<u32>,
+}
+
+impl CorrelateQuery {
+    /// Turns query parameters into the two filters and the nearness the join takes.
+    ///
+    /// Both refusals happen here rather than at the index, because both are the caller's to fix and
+    /// neither is visible in an empty answer.
+    fn into_join(self) -> Result<(Filter, Filter, i64)> {
+        // Required, unlike every other window on this service. A correlation is a join whose plan
+        // decides its cost, and the left window is the only parameter that bounds the side the plan
+        // drives from: without it the answer is "the most recent pairs in the store", which moves as
+        // records arrive and is the implicit "recent" this query deliberately does not have.
+        let window = match (self.left_from_ms, self.left_to_ms) {
+            (Some(from_ms), Some(to_ms)) => Window { from_ms, to_ms },
+            _ => {
+                return Err(Error::Unprocessable(
+                    "a correlation needs both `left.from_ms` and `left.to_ms`: the window bounds \
+                     the side the join is driven from, and there is no implicit `recent`"
+                        .to_owned(),
+                ));
+            }
+        };
+        // A negative nearness asks for a right record before the left one, which this join cannot
+        // express: it is directional, and the way to ask "what came before" is to swap the sides.
+        // Refused rather than answered empty, because an empty page reads as "nothing happened".
+        if self.within_ms < 0 {
+            return Err(Error::Unprocessable(format!(
+                "`within_ms` is {} and the join is directional: a right record is at or after its \
+                 left one, so ask about what came before by swapping the two sides",
+                self.within_ms
+            )));
+        }
+        // The page goes on the left filter, which is where the index reads a pair cap from. The
+        // right side carries none: it is not a page, and one there would silently do nothing.
+        let left = Filter {
+            action: self.left_action,
+            outcome: self.left_outcome,
+            agent: self.left_agent,
+            attr: attr_filter(self.left_attr, "left.attr")?,
+            window: Some(window),
+            limit: self.limit,
+            ..Filter::default()
+        };
+        let right = Filter {
+            action: self.right_action,
+            outcome: self.right_outcome,
+            agent: self.right_agent,
+            attr: attr_filter(self.right_attr, "right.attr")?,
+            ..Filter::default()
+        };
+        Ok((left, right, self.within_ms))
     }
 }
 
@@ -497,6 +663,25 @@ async fn entity_records(
         blocking(move || service.entity(&caller, &kind, &id, min_confidence, window, limit))
             .await?;
     Ok(Json(RecordsResponse::new(records)))
+}
+
+/// Answers which records of one shape were followed by records of another.
+///
+/// The join both halves of the cross-agent question used to be asked as: two reads and an
+/// intersection the caller performed, or one entity's history inside a window and a judgement about
+/// what in it was related. One signed request now, and the pairing comes back as a fact about the
+/// store rather than as arithmetic somebody did afterwards.
+async fn correlate_records(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Query(params): Query<CorrelateQuery>,
+) -> Result<Json<CorrelationsResponse>> {
+    // Before the read: a missing window and a backwards nearness are both the caller's mistakes, and
+    // both would otherwise answer `200` with a page that reads as "nothing happened nearby".
+    let (left, right, within_ms) = params.into_join()?;
+    let service = state.service();
+    let pairs = blocking(move || service.correlate(&caller, &left, &right, within_ms)).await?;
+    Ok(Json(CorrelationsResponse::new(pairs)))
 }
 
 /// Composes context for a caller.
@@ -1026,6 +1211,140 @@ mod tests {
             fake.calls()[0],
             "entity agent-reader ticket T-1 0 None Some(5)"
         );
+    }
+
+    /// Both sides of the join reach the index as the caller spelled them, and the answer is pairs.
+    #[tokio::test]
+    async fn a_correlation_carries_both_filters_and_answers_in_pairs() {
+        let held = [testing::record(WRITER)];
+        let fake = Arc::new(Fake::new().holding(&held));
+        let (status, body) = serve(
+            &fake,
+            get(
+                "/correlate?left.action=transact&left.outcome=declined&left.from_ms=1000\
+                 &left.to_ms=2000&right.action=deploy&right.attr=environment%3Dproduction\
+                 &within_ms=1800000&limit=7",
+                Some(READER),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // A pair, not a flat list: which record happened near which is the answer, and a `records`
+        // key here would mean the pairing was flattened away on the way out.
+        assert!(body["records"].is_null(), "{body}");
+        assert_eq!(
+            body["pairs"][0]["left"]["record_id"], body["pairs"][0]["right"]["record_id"],
+            "{body}"
+        );
+        assert!(
+            body["token_estimate"].as_u64().is_some_and(|n| n > 0),
+            "{body}"
+        );
+
+        let call = &fake.calls()[0];
+        // The window on the left filter and nowhere else, the page on the left filter because that
+        // is where the index reads a pair cap from, and no page on the right at all.
+        assert!(
+            call.contains("Window { from_ms: 1000, to_ms: 2000 }"),
+            "{call}"
+        );
+        assert!(call.contains("action: Some(\"transact\")"), "{call}");
+        assert!(call.contains("action: Some(\"deploy\")"), "{call}");
+        assert!(
+            call.contains("attr: Some((\"environment\", \"production\"))"),
+            "{call}"
+        );
+        assert!(call.contains("limit: Some(7)"), "{call}");
+        assert!(call.ends_with(" 1800000"), "{call}");
+    }
+
+    /// A correlation with no window is refused, and that is a rule `GET /records` does not have.
+    ///
+    /// The window is what bounds the side the join is driven from. Without it the answer is the most
+    /// recent pairs in the store — an implicit "recent" that moves as records arrive, which is the
+    /// one thing this query is documented not to have.
+    #[tokio::test]
+    async fn a_correlation_without_a_window_is_refused_rather_than_run_over_everything() {
+        for target in [
+            "/correlate?right.action=deploy&within_ms=1000",
+            "/correlate?left.from_ms=1000&right.action=deploy&within_ms=1000",
+            "/correlate?left.to_ms=2000&right.action=deploy&within_ms=1000",
+        ] {
+            let fake = Arc::new(Fake::new());
+            let (status, body) = serve(&fake, get(target, Some(READER))).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{target}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("left.from_ms"),
+                "{target}: {body}"
+            );
+            assert!(fake.calls().is_empty(), "{target} reached the index");
+        }
+    }
+
+    /// A backwards nearness is refused rather than answered with the empty page it would produce.
+    ///
+    /// The join is directional, so a negative `within_ms` describes a window that closes before it
+    /// opens and can match nothing. Answered as `200` with no pairs, it would read as "nothing
+    /// happened near that", which is the wrong conclusion to hand anybody.
+    #[tokio::test]
+    async fn a_backwards_nearness_is_refused_rather_than_answered_empty() {
+        let fake = Arc::new(Fake::new());
+        let (status, body) = serve(
+            &fake,
+            get(
+                "/correlate?left.from_ms=1000&left.to_ms=2000&within_ms=-1",
+                Some(READER),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("swapping"),
+            "the refusal has to say how to ask about what came before: {body}"
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    /// A nearness is required, so a correlation cannot be asked without saying what "nearby" means.
+    #[tokio::test]
+    async fn a_correlation_with_no_nearness_is_refused_rather_than_defaulted() {
+        let fake = Arc::new(Fake::new());
+        let (status, _) = serve(
+            &fake,
+            get("/correlate?left.from_ms=1000&left.to_ms=2000", Some(READER)),
+        )
+        .await;
+
+        // `400`, like every other unparseable query string: it is refused before a handler runs.
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(fake.calls().is_empty());
+    }
+
+    /// A page size on the right of a join means nothing, so naming one is refused.
+    ///
+    /// Accepted and ignored, it would be a parameter a caller sets to bound an answer that it does
+    /// not bound — the same failure an unknown filter is refused for, one step subtler.
+    #[tokio::test]
+    async fn a_page_size_on_the_right_of_the_join_is_refused_rather_than_ignored() {
+        let fake = Arc::new(Fake::new());
+        for target in [
+            "/correlate?left.from_ms=1&left.to_ms=2&within_ms=1&right.limit=5",
+            "/correlate?left.from_ms=1&left.to_ms=2&within_ms=1&right.from_ms=1&right.to_ms=2",
+            "/correlate?left.from_ms=1&left.to_ms=2&within_ms=1&action=deploy",
+        ] {
+            let (status, _) = serve(&fake, get(target, Some(READER))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{target}");
+        }
+        assert!(fake.calls().is_empty());
     }
 
     #[tokio::test]

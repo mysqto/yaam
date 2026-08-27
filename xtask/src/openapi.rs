@@ -66,6 +66,9 @@ fn missing_spine(documented: &BTreeMap<String, Json>) -> Vec<String> {
         "WriteRequest",
         "EntityRef",
         "SubjectRef",
+        // The pair. Its two fields are the ones a client gets backwards, and without it here a
+        // document that stopped naming the shape would make the comparison silent instead of loud.
+        "CorrelatedPair",
     ]
     .into_iter()
     .filter(|name| !documented.contains_key(*name))
@@ -270,7 +273,7 @@ mod tests {
     #[test]
     fn a_document_that_stopped_naming_a_shape_is_reported() {
         let found = missing_spine(&BTreeMap::new());
-        assert_eq!(found.len(), 5, "{found:?}");
+        assert_eq!(found.len(), 6, "{found:?}");
         assert!(
             found[0].contains("`ActionRecord` is no longer"),
             "{found:?}"

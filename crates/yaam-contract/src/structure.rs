@@ -86,10 +86,15 @@ pub const BYTES_PER_TOKEN: usize = 4;
 /// the figure describes this answer rather than an answer of this many records. Two records of the
 /// same shape can differ several-fold once their attributes, entities and tags are counted, which is
 /// why this is measured bytes and not a count times a constant.
+///
+/// Takes anything that yields the structures rather than a slice of them, so an answer that is not
+/// *shaped* like a list of records can still be measured by this one implementation: a correlation
+/// returns pairs, and its cost is the same ratio over both halves of each. Measuring it any other way
+/// would divide before summing, and two reads returning the same rows would report different costs.
 #[must_use]
-pub fn estimate_tokens(records: &[RecordStructure]) -> usize {
+pub fn estimate_tokens<'a>(records: impl IntoIterator<Item = &'a RecordStructure>) -> usize {
     records
-        .iter()
+        .into_iter()
         .map(RecordStructure::wire_bytes)
         .sum::<usize>()
         .div_ceil(BYTES_PER_TOKEN)

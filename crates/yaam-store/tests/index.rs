@@ -1079,6 +1079,64 @@ fn correlate_finds_the_pair_inside_the_window_and_nothing_outside_it() {
 }
 
 #[test]
+fn a_correlated_pair_comes_back_as_two_structures_and_neither_carries_prose() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    let failure = record("deploy", Outcome::Failure, "2026-08-20T10:00:00Z");
+    publish(&mut writer, &failure).expect("publish");
+    let nearby = record("ticket", Outcome::Success, "2026-08-20T10:00:30Z");
+    publish(&mut writer, &nearby).expect("publish");
+    // Thirty seconds *before* the failure, and otherwise the record the join is looking for. The
+    // join is directional, so this must never appear on the right of a pair.
+    let earlier = record("ticket", Outcome::Success, "2026-08-20T09:59:30Z");
+    publish(&mut writer, &earlier).expect("publish");
+
+    let store = Store::open_read(&path).expect("open read");
+    let left = Filter {
+        action: Some("deploy".to_owned()),
+        outcome: Some("failure".to_owned()),
+        ..unfiltered()
+    };
+    let right = Filter {
+        action: Some("ticket".to_owned()),
+        ..unfiltered()
+    };
+
+    let pairs = query::correlate_structures(&store, &left, &right, 60_000).expect("correlate");
+    assert_eq!(pairs.len(), 1, "expected exactly the nearby pair");
+    let (asked, found) = &pairs[0];
+    // The pair, in the order the question was asked in: the left filter's record on the left. A
+    // transposed select list would answer every caller's question backwards.
+    assert_eq!(asked.record_id.as_str(), failure.record_id.as_str());
+    assert_eq!(found.record_id.as_str(), nearby.record_id.as_str());
+    // Structure and not an identifier, which is the whole reason this read exists: the caller has
+    // the record rather than a name it cannot resolve.
+    assert_eq!(asked.action, "deploy");
+    assert_eq!(found.action, "ticket");
+    assert_eq!(asked.outcome, Outcome::Failure);
+    // The body is in neither select list, so it is in neither half of the pair — the same rule
+    // every other structure read holds, and it has two chances to be broken here.
+    let wire = serde_json::to_string(&pairs).expect("a serialisable pair");
+    assert!(!wire.contains("nothing notable"), "{wire}");
+    assert!(!wire.contains("summary"), "{wire}");
+
+    // The identifier read and the structure read select the same rows, or one of them is answering a
+    // different question under the same name.
+    let same = query::correlate(&store, &left, &right, 60_000).expect("correlate");
+    assert_eq!(
+        same.iter()
+            .map(|(l, r)| (l.as_str(), r.as_str()))
+            .collect::<Vec<_>>(),
+        pairs
+            .iter()
+            .map(|(l, r)| (l.record_id.as_str(), r.record_id.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn truncate_derived_empties_every_table_and_keeps_the_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("index.db");

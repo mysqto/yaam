@@ -169,6 +169,7 @@ fn target(query: &ReadQuery) -> Result<String> {
                 params.query()
             )
         }
+        ReadQuery::Correlate { .. } => correlation_target(query)?,
         ReadQuery::Search { query, limit } => {
             params.add("q", query);
             params.optional("limit", *limit);
@@ -195,6 +196,78 @@ fn target(query: &ReadQuery) -> Result<String> {
             format!("/bundle{}", params.query())
         }
     })
+}
+
+/// The request target one correlation asks for.
+///
+/// Its own function rather than a fifth arm of [`target`], because it carries two refusals and twelve
+/// parameters: the arm was the longest thing in that match by a factor of three, and a reader looking
+/// for what a *records* query sends had to scroll past all of it.
+fn correlation_target(query: &ReadQuery) -> Result<String> {
+    let ReadQuery::Correlate {
+        left_action,
+        left_outcome,
+        left_agent,
+        left_attr,
+        left_from_ms,
+        left_to_ms,
+        right_action,
+        right_outcome,
+        right_agent,
+        right_attr,
+        within_ms,
+        limit,
+    } = query
+    else {
+        // Unreachable through [`target`], which matches the variant before calling this. Refused
+        // rather than panicked: a future read that reached the wrong builder should say so.
+        return Err(Error::Usage(
+            "this is the correlation's target builder and the read is not one".to_owned(),
+        ));
+    };
+    // The service requires the whole window rather than tolerating half of it or none, so both halves
+    // of that are refused here: the caller left out a flag, and hearing which one is worth more than
+    // a round trip that names a query parameter nobody typed.
+    if left_from_ms.is_none() || left_to_ms.is_none() {
+        return Err(Error::Usage(
+            "a correlation needs both --left-from-ms and --left-to-ms; the window bounds the side \
+             the join is driven from, and there is deliberately no implicit `recent` — a query \
+             whose meaning depends on when it ran cannot be tested"
+                .to_owned(),
+        ));
+    }
+    // A negative nearness describes a window that closes before it opens. The join is directional, so
+    // the answer is to swap the sides rather than to negate the number.
+    if *within_ms < 0 {
+        return Err(Error::Usage(format!(
+            "--within-ms {within_ms} is negative and the join is directional: a right record is at \
+             or after its left one, so ask what came before by swapping --left-* and --right-*"
+        )));
+    }
+    for spec in [left_attr, right_attr].into_iter().flatten() {
+        attr_filter(spec)?;
+    }
+    let mut params = Params::default();
+    params.optional("left.action", left_action.as_deref());
+    params.optional(
+        "left.outcome",
+        left_outcome.map(crate::cli::OutcomeArg::as_stored),
+    );
+    params.optional("left.agent", left_agent.as_deref());
+    params.optional("left.attr", left_attr.as_deref());
+    params.optional("left.from_ms", *left_from_ms);
+    params.optional("left.to_ms", *left_to_ms);
+    params.optional("right.action", right_action.as_deref());
+    params.optional(
+        "right.outcome",
+        right_outcome.map(crate::cli::OutcomeArg::as_stored),
+    );
+    params.optional("right.agent", right_agent.as_deref());
+    params.optional("right.attr", right_attr.as_deref());
+    // Not optional, and not defaulted here either: it is what the caller meant by "nearby".
+    params.add("within_ms", &within_ms.to_string());
+    params.optional("limit", *limit);
+    Ok(format!("/correlate{}", params.query()))
 }
 
 /// The bytes one read puts on the socket.
@@ -677,6 +750,30 @@ mod tests {
         );
         assert_eq!(
             asked(&[
+                "correlate",
+                "--left-action",
+                "transact",
+                "--left-outcome",
+                "declined",
+                "--left-from-ms",
+                "1000",
+                "--left-to-ms",
+                "2000",
+                "--right-action",
+                "deploy",
+                "--right-attr",
+                "environment=production",
+                "--within-ms",
+                "1800000",
+                "--limit",
+                "20"
+            ]),
+            "/correlate?left.action=transact&left.outcome=declined&left.from_ms=1000\
+             &left.to_ms=2000&right.action=deploy&right.attr=environment%3Dproduction\
+             &within_ms=1800000&limit=20"
+        );
+        assert_eq!(
+            asked(&[
                 "bundle",
                 "--entity",
                 "ticket:PROJ-42",
@@ -691,12 +788,80 @@ mod tests {
         );
     }
 
+    /// A correlation refuses here what the service would refuse, so the caller hears the flag.
+    ///
+    /// Both refusals are about a question that cannot be asked rather than one with no answer, and an
+    /// empty page would read as "nothing happened nearby" in each case.
+    #[test]
+    fn a_correlation_that_cannot_be_asked_is_refused_before_a_socket_is_opened() {
+        for args in [
+            vec!["correlate", "--within-ms", "1000"],
+            vec!["correlate", "--left-from-ms", "1", "--within-ms", "1000"],
+            vec!["correlate", "--left-to-ms", "2", "--within-ms", "1000"],
+        ] {
+            let error = target(&parsed(&args).query).expect_err("a window is required");
+            assert!(
+                matches!(&error, Error::Usage(said) if said.contains("--left-from-ms")),
+                "{args:?}: {error}"
+            );
+        }
+        // Directional, so a backwards nearness is a question this join cannot express.
+        let error = target(
+            &parsed(&[
+                "correlate",
+                "--left-from-ms",
+                "1",
+                "--left-to-ms",
+                "2",
+                "--within-ms=-1",
+            ])
+            .query,
+        )
+        .expect_err("a backwards window is refused");
+        assert!(
+            matches!(&error, Error::Usage(said) if said.contains("swapping")),
+            "{error}"
+        );
+        // And an attribute filter that is not a pair, on either side.
+        for side in ["--left-attr", "--right-attr"] {
+            let error = target(
+                &parsed(&[
+                    "correlate",
+                    "--left-from-ms",
+                    "1",
+                    "--left-to-ms",
+                    "2",
+                    "--within-ms",
+                    "1",
+                    side,
+                    "environment",
+                ])
+                .query,
+            )
+            .expect_err("an attribute filter is a pair");
+            assert!(matches!(error, Error::Usage(_)), "{side}: {error}");
+        }
+    }
+
     /// A flag the caller did not name is not sent, because the service's own default is the one
     /// figure that should decide it.
     #[test]
     fn nothing_the_caller_did_not_ask_for_is_sent() {
         assert_eq!(asked(&["records"]), "/records");
         assert_eq!(asked(&["bundle"]), "/bundle");
+        // Every optional side of a correlation left out, and the two required parameters alone.
+        assert_eq!(
+            asked(&[
+                "correlate",
+                "--left-from-ms",
+                "1",
+                "--left-to-ms",
+                "2",
+                "--within-ms",
+                "3"
+            ]),
+            "/correlate?left.from_ms=1&left.to_ms=2&within_ms=3"
+        );
         assert_eq!(
             asked(&["history", "--entity", "ticket:PROJ-42"]).find('?'),
             None
