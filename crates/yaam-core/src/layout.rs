@@ -39,6 +39,15 @@ pub(crate) const QUARANTINE_DIR: &str = ".quarantine";
 pub(crate) const DEAD_LETTER_DIR: &str = ".dead-letter";
 /// The derived index.
 pub(crate) const INDEX_FILE: &str = "index.sqlite";
+/// Which subject key this store's pseudonyms were derived from, as a check value that is not the
+/// key. Written by [`crate::arming`] at the first open that finds none, and read at every open
+/// after.
+pub(crate) const SUBJECT_CHECK_FILE: &str = "subject-key-check.json";
+/// The temporary an atomic replacement of [`SUBJECT_CHECK_FILE`] passes through.
+///
+/// Named because [`crate::backup`] classifies every entry under the root, and an arming interrupted
+/// by a crash would otherwise leave a backup reporting a file nobody decided about.
+pub(crate) const SUBJECT_CHECK_TEMP: &str = "subject-key-check.tmp";
 /// The append-only erasure log.
 pub(crate) const TOMBSTONE_LOG: &str = "tombstones.jsonl";
 /// Extension of every record file.

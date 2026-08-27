@@ -50,6 +50,14 @@ pub enum Error {
     /// log.
     #[error("{0}")]
     SubjectKeyUnavailable(String),
+    /// A recorded key check value that is not one: not hex, or not 32 bytes of it.
+    ///
+    /// Held apart from a value that does not match, which is the point of the variant: a value this
+    /// build cannot read says nothing about whether the key is right, and a caller that treated the
+    /// two alike would either refuse a correct key or accept a wrong one. Quotes nothing — a check
+    /// value is not a secret, but a file that will not parse is not known to be a check value.
+    #[error("a subject-key check value must be 64 hex digits")]
+    SubjectKeyCheckMalformed,
     /// An identifier that canonicalises to nothing. Held apart from a malformed record because the
     /// remedy is the caller's: one shared pseudonym for every such identifier would make each of
     /// their bodies erasable by any one of their requests.

@@ -24,6 +24,12 @@
 //! sweeper's own bound, and a rebuild is also what replays the tombstone log so that a backup
 //! predating an erasure cannot re-index the structure that erasure removed.
 //!
+//! `subject-key-check.json` travels for a reason worth separating from the rest: it is not content
+//! but a check on the key that produced content. A restore installs a tree full of pseudonyms and
+//! then wants a key entered by hand, which is the moment a wrong one is most likely and its
+//! consequence — a second pseudonym space, unrelatable for ever — least reversible. See
+//! [`crate::arming`].
+//!
 //! `audit/` is the one derived thing that travels anyway, and its entry says why: reproducing it
 //! needs a drain to run, and an account of which records named which subjects is not worth
 //! betting on one.
@@ -129,6 +135,23 @@ pub const MANIFEST: &[Entry] = &[
         disposition: Disposition::Included,
         reason: "the erasure log, and it travels *because* a restore replays it. Without it a \
                  backup taken before an erasure re-indexes the structure that erasure removed",
+    },
+    Entry {
+        name: layout::SUBJECT_CHECK_FILE,
+        disposition: Disposition::Included,
+        reason: "which subject key the tree's pseudonyms were derived from, as a check value that \
+                 is not the key. It travels because the pseudonyms do: a restored tree armed with \
+                 a different subject key would file a second, unrelatable pseudonym for every \
+                 subject already in it, and re-entering a key by hand is exactly what a restore \
+                 involves. Safe to carry for the reason the key store is not — a fixed-label HMAC \
+                 names the key without revealing it, and resurrects nothing an erasure destroyed",
+    },
+    Entry {
+        name: layout::SUBJECT_CHECK_TEMP,
+        disposition: Disposition::Excluded,
+        reason: "half a check value, from an arming interrupted between the write and the rename. \
+                 Named rather than left unclassified so a crash cannot make every later backup \
+                 report a file nobody decided about; the value it was becoming is what travels",
     },
     Entry {
         name: layout::KEYSTORE_DIR,
@@ -797,6 +820,9 @@ mod tests {
             std::fs::create_dir_all(&held).expect("a directory to leave behind");
             std::fs::write(held.join("held.md"), "---\n---\nx\n").expect("a file to leave behind");
         }
+        // And half a subject-key check value, as an arming interrupted before its rename leaves.
+        std::fs::write(harness.root().join(layout::SUBJECT_CHECK_TEMP), "{\n")
+            .expect("a temporary to leave behind");
 
         let drill = Drill::new();
         let report = back_up(&harness.pipeline, &drill.backup()).expect("backed up");
@@ -820,6 +846,42 @@ mod tests {
         assert!(copied.contains(&PathBuf::from(MANIFEST_FILE)));
     }
 
+    /// A restore is where a subject key gets re-entered by hand, so the record of which key armed
+    /// the tree has to be in the copy. Asserted end to end rather than by reading the manifest: a
+    /// classification is a claim about a copy, and this is the copy.
+    #[test]
+    fn a_restored_tree_still_refuses_a_key_it_was_not_armed_with() {
+        let mut harness = Harness::new();
+        let armed = yaam_crypto::SubjectKey::from_bytes(&[0x5a; 32]).expect("32 bytes");
+        crate::arming::verify_or_arm(harness.root(), &armed).expect("armed");
+        harness
+            .pipeline
+            .accept(testkit::internal(T09), BODY)
+            .expect("accepted");
+
+        let drill = Drill::new();
+        back_up(&harness.pipeline, &drill.backup()).expect("backed up");
+        assert!(
+            contents(&drill.backup()).contains(&PathBuf::from(layout::SUBJECT_CHECK_FILE)),
+            "the check value has to travel, or arming a restored tree is silent again"
+        );
+
+        let destination = drill.destination();
+        restore(&destination, &drill.backup()).expect("restored");
+        let substitute = yaam_crypto::SubjectKey::from_bytes(&[0x5b; 32]).expect("32 bytes");
+        assert!(
+            matches!(
+                crate::arming::verify_or_arm(&destination.root, &substitute),
+                Err(crate::Error::SubjectKeyMismatch { .. })
+            ),
+            "a restored tree armed under a second key would file a second pseudonym for every \
+             subject in it"
+        );
+        crate::arming::verify_or_arm(&destination.root, &armed)
+            .expect("and the key that armed the tree still opens the copy");
+    }
+
+    /// The drill, and the half of it that is easy to get wrong: a restored store has to *answer*.
     /// The drill, and the half of it that is easy to get wrong: a restored store has to *answer*.
     ///
     /// Files existing is not the property. A tree restored beside an index nothing rebuilt looks

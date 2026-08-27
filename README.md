@@ -577,6 +577,26 @@ service has to be able to do so without changing how a live store fetches it.
 implementation that ships: the key is fetched once, at startup, and a source that cannot answer
 refuses the process rather than minting or defaulting one.
 
+**The store records which key it was armed with.** Nothing about a wrong subject key is visible: the
+derivation is a pure function, so a substituted key file comes up clean, seals bodies, and files a
+second pseudonym for a reference already on record — no drift, no warning, and no repair, because
+there is no re-key, no re-seal and no delete. So a store keeps `subject-key-check.json` under its
+root: `HMAC-SHA256(subject_key, "subject-keychk:1")`, which says *which* key without saying what it
+is. A key that does not derive the recorded value is a refusal at startup naming the file and both
+values; a record that cannot be *read* is a separate refusal, because "cannot tell" and "does not
+match" are not the same finding and not repaired the same way — one is a setting, the other a file.
+The value travels in a backup, as the pseudonyms it accounts for do, and it is not a secret, which is
+what lets it: a restore is where a key is most likely to be re-entered by hand.
+
+**"Armed" is the first open, because nothing else arms a store.** There is no arming command — a
+declaration in the tree and a key handed to a process are what arm one, and both are read afresh at
+every open. So the first open that finds no record writes one, and says in the log that the key was
+*trusted* rather than verified; every open after it is checked. That is trust on first use, and the
+limit is stated rather than implied: a store armed before this existed adopts whichever key its next
+open presents, and a check value replaced together with a key agrees with it. This catches a mistyped
+or substituted key. It does not catch somebody who can write to the tree, and it says nothing about
+whether the records already on file were written under the key it just recorded.
+
 **Both halves or neither.** A declaration with no secret refuses at startup rather than refusing
 records one at a time; a secret with no declaration refuses too, because the alternative is an
 operator who believes bodies are sealed while every one is written in the clear — into the tree, the

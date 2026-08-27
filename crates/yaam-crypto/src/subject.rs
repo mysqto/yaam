@@ -59,6 +59,18 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 /// would also produce. Fixed length, which is what makes the framing below unambiguous.
 const DOMAIN: &[u8; 16] = b"subject-pseudo:1";
 
+/// Domain separator for [`SubjectKey::check_value`], and the whole of its HMAC input.
+///
+/// Its own separator rather than [`DOMAIN`], and the same fixed 16 bytes wide, so a check value can
+/// never be a tag some identifier would also produce: the two inputs differ inside the first
+/// fixed-width field, whatever follows it. Versioned like the other, because a build that took the
+/// check over something else would refuse every store this one armed — so this string changes only
+/// alongside a way to re-record what armed stores already hold.
+const CHECK_DOMAIN: &[u8; 16] = b"subject-keychk:1";
+
+/// Length of a check value in bytes — SHA-256's own output size.
+const CHECK_LEN: usize = 32;
+
 /// A versioned ruleset for reducing an identifier to the form that gets hashed.
 ///
 /// An enum rather than a trait, because the set of live versions is the thing callers need: an
@@ -158,6 +170,63 @@ pub struct Pseudonym {
     pub canon_ver: CanonVer,
 }
 
+/// A non-secret value that says *which* subject key a set of pseudonyms was derived from.
+///
+/// `HMAC-SHA256` of one fixed label — [`CHECK_DOMAIN`] — under the subject key, and nothing else in
+/// the input, so the value is a function of the key alone. That is the property it is for. A store records the check value of the key
+/// it was armed with, and a later process can then tell that key from a substitute — which nothing
+/// else here can do, because the key's only other observable is a pseudonym, and a pseudonym is only
+/// comparable to somebody who has the identifier it was taken over.
+///
+/// Publishable, unlike everything else this key touches, and deliberately so: it is written into the
+/// tree, travels in a backup, and is printed in a startup log so an operator can compare it against
+/// what a store holds. What that costs is worth saying rather than glossing — anyone holding a check
+/// value can test candidate keys against it offline. Against 32 bytes from a CSPRNG that is not a
+/// test at all, and a subject key guessable in an offline search has a worse problem than this value
+/// being readable.
+///
+/// Comparison is ordinary equality. There is no secret on either side of it: the recorded value is
+/// in the tree and the derived one is a one-way function of a key nothing here reveals, so there is
+/// nothing for a timing side channel to leak.
+#[derive(Clone, PartialEq, Eq)]
+pub struct KeyCheck([u8; CHECK_LEN]);
+
+impl KeyCheck {
+    /// Reads a check value back from its hex form.
+    ///
+    /// # Errors
+    /// [`Error::SubjectKeyCheckMalformed`] on anything that is not [`CHECK_LEN`] bytes of hex. A
+    /// value that cannot be read is deliberately not treated as a value that does not match: one
+    /// says the key is wrong, the other says nothing at all, and the caller acts differently on
+    /// each.
+    pub fn parse(text: &str) -> Result<Self> {
+        let bytes = hex::decode(text).map_err(|_| Error::SubjectKeyCheckMalformed)?;
+        let bytes: [u8; CHECK_LEN] = bytes
+            .try_into()
+            .map_err(|_| Error::SubjectKeyCheckMalformed)?;
+        Ok(Self(bytes))
+    }
+}
+
+impl core::fmt::Display for KeyCheck {
+    /// Lowercase hex, untruncated: one spelling per value, so a recorded one and a derived one
+    /// compare as text wherever they meet.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for KeyCheck {
+    /// Shows the value, unlike [`SubjectKey`]'s own `Debug`. A check value in a log line is the
+    /// point of having one.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "KeyCheck({self})")
+    }
+}
+
 /// The keying secret that turns a canonical identifier into a pseudonym.
 ///
 /// Held as hard to print as it is easy to use, because a leak is retroactive across every copy of
@@ -205,6 +274,20 @@ impl SubjectKey {
         out
     }
 
+    /// The value that says which key this is, without saying what it is.
+    ///
+    /// Derived rather than stored, and cheap, so the caller that checks a store's record against it
+    /// need hold nothing between fetching the key and asking. See [`KeyCheck`] for why a value
+    /// derived from an unrotatable secret is nevertheless one to publish.
+    #[must_use]
+    pub fn check_value(&self) -> KeyCheck {
+        let mut mac = self.mac();
+        mac.update(CHECK_DOMAIN);
+        let mut value = [0u8; CHECK_LEN];
+        value.copy_from_slice(&mac.finalize().into_bytes());
+        KeyCheck(value)
+    }
+
     /// Canonicalises under `canon`, then derives the pseudonym.
     ///
     /// The version is read off the ruleset that actually ran and travels with the tag, so a hash
@@ -217,14 +300,23 @@ impl SubjectKey {
         Ok(self.tag(canon.version(), &canonical))
     }
 
+    /// A fresh HMAC keyed with the secret.
+    ///
+    /// The one place the key reaches the construction, so the two values taken under it — a
+    /// pseudonym and a check value — cannot come to disagree about how it is keyed. Private, which
+    /// is also what keeps the length invariant an `expect` here rather than a panic a caller has to
+    /// be warned about: 32 bytes is checked at construction and HMAC accepts any length anyway.
+    fn mac(&self) -> Hmac<Sha256> {
+        <Hmac<Sha256>>::new_from_slice(&self.key).expect("HMAC-SHA256 accepts a key of any length")
+    }
+
     /// HMAC-SHA256 over the domain, the version and the canonical identifier.
     ///
     /// Framed by fixed width rather than by a separator: the first 16 bytes are the domain, the next
     /// 4 are the version big-endian, the rest is the identifier. A separator byte would have to be
     /// one no identifier can contain, and nothing about the identifier space is settled.
     fn tag(&self, ver: CanonVer, canonical: &str) -> Pseudonym {
-        let mut mac = <Hmac<Sha256>>::new_from_slice(&self.key)
-            .expect("HMAC-SHA256 accepts a key of any length");
+        let mut mac = self.mac();
         mac.update(DOMAIN);
         mac.update(&ver.0.to_be_bytes());
         mac.update(canonical.as_bytes());
@@ -374,6 +466,77 @@ mod tests {
                 .as_str(),
             "s_a3d76dc902b38605bdde755c1b13e0a8215a82a003e74d3d815b98376b09ead0"
         );
+    }
+
+    /// Known answers for the check value, held to the same standard as the pseudonym vectors above
+    /// and for the same reason: a store records one of these and refuses a key that does not
+    /// reproduce it, so a build that computed them differently would refuse every store armed by
+    /// this one — with the operator's obvious remedy being to delete the record that was protecting
+    /// them.
+    #[test]
+    fn the_check_value_is_the_one_an_armed_store_already_recorded() {
+        let key = SubjectKey::from_hex(&"5a".repeat(SUBJECT_KEY_LEN)).expect("hex key");
+        assert_eq!(
+            key.check_value().to_string(),
+            "927ac81cde7a2d453ee3bb93e10cc4722245b8d3d91095be54b8953257794010"
+        );
+
+        let stepped = SubjectKey::from_hex(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .expect("hex key");
+        assert_eq!(
+            stepped.check_value().to_string(),
+            "62005efe8e233ca87b258c310eff06b6364dd8a933c9e062b774eea178b5bc51"
+        );
+    }
+
+    /// The property the whole mechanism rests on: a key that is not this store's own does not
+    /// reproduce this store's check value.
+    #[test]
+    fn two_keys_disagree_about_their_check_value() {
+        let other = SubjectKey::from_bytes(&[0x5b; SUBJECT_KEY_LEN]).expect("32 bytes");
+        assert_ne!(key().check_value(), other.check_value());
+        assert_eq!(
+            key().check_value(),
+            key().check_value(),
+            "one key has one check value, however often it is asked"
+        );
+    }
+
+    /// A check value and a pseudonym are taken under separate domains, so neither can be mistaken
+    /// for the other: a value recorded in the tree can never be a subject's tag, and no tag a
+    /// caller can steer the store into deriving is the value that would pass the check.
+    #[test]
+    fn a_check_value_is_not_a_pseudonym_of_anything() {
+        let key = key();
+        let check = key.check_value().to_string();
+        for identifier in ["", " ", "subject-keychk:1", "order_ref:abcd1234"] {
+            if let Ok(derived) = key.derive(Canon::CURRENT, identifier) {
+                assert_ne!(derived.hash.as_str(), format!("s_{check}"), "{identifier}");
+            }
+        }
+    }
+
+    /// Unlike the key, a check value is meant to be read: it reaches a startup log and a file in the
+    /// tree, and an operator compares it by eye.
+    #[test]
+    fn a_check_value_reads_back_from_its_own_text() {
+        let check = key().check_value();
+        let text = check.to_string();
+        assert_eq!(text.len(), 64);
+        assert_eq!(KeyCheck::parse(&text).expect("parsed"), check);
+        assert_eq!(format!("{check:?}"), format!("KeyCheck({text})"));
+    }
+
+    #[test]
+    fn a_recorded_value_that_is_not_a_check_value_is_refused_rather_than_guessed() {
+        for text in ["", "not hex", "5a5a", &"5a".repeat(33)] {
+            assert!(
+                matches!(KeyCheck::parse(text), Err(Error::SubjectKeyCheckMalformed)),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

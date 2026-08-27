@@ -23,7 +23,10 @@
 //! where it is fetched from is its own seam: [`custody::SubjectKeySource`], with
 //! [`custody::SubjectKeyFile`] the implementation that ships. A keychain or key service replaces the
 //! fetch and nothing else, which is only a refactor while it is done before the first record is
-//! sealed.
+//! sealed. *Which* key a store's pseudonyms came from is a different question from where it was
+//! fetched, and [`subject::KeyCheck`] is what makes that one answerable: a non-secret function of the
+//! key alone, recorded by the store the key armed, so a substitute is a refusal at startup rather
+//! than a second pseudonym for every subject already on record.
 //!
 //! Every seal and unseal needs a [`keystore::KeyStore`] to wrap and unwrap the shares, and takes
 //! one as an argument. There is deliberately no ambient store: the consumers are async, so a store
@@ -45,4 +48,4 @@ pub mod wrapper;
 pub use custody::{SubjectKeyFile, SubjectKeySource};
 pub use error::{Error, Result};
 pub use seal::{BareShare, Dek, Epoch, Nonce, SealedBody, WrappedShare};
-pub use subject::{Canon, Pseudonym, SUBJECT_KEY_LEN, SubjectKey};
+pub use subject::{Canon, KeyCheck, Pseudonym, SUBJECT_KEY_LEN, SubjectKey};

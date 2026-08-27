@@ -17,6 +17,7 @@
 //! audit/subjects/<id>.md       which records name which subjects
 //! cold/*.jsonl                 manifests of archived records, still indexable
 //! keystore/                    per-subject keys and their tombstones
+//! subject-key-check.json      which subject key the pseudonyms above were derived from
 //! index.sqlite                 the derived index; deleting it is recoverable
 //! tombstones.jsonl             append-only erasure log, replayed on every rebuild
 //! .staging/<id>.md             write-ahead copies, before publish
@@ -34,6 +35,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arming;
 pub mod backup;
 pub mod bundle;
 #[cfg(feature = "crash-points")]

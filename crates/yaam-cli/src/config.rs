@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use yaam_core::Paths;
+use yaam_core::arming::Arming;
 use yaam_core::resolve::{ReferenceSubjects, SubjectKinds};
 use yaam_crypto::custody::{SubjectKeyFile, SubjectKeySource};
 use yaam_crypto::subject::SubjectKey;
@@ -305,8 +306,9 @@ impl StoreSettings {
                 // the pipeline takes the key. Fetching an unrotatable key is not a thing to be
                 // changing once a store has sealed records under it.
                 let source = SubjectKeyFile::at(path);
-                let key =
-                    Self::subject_key(&source, &format!("--subject-key-file {}", path.display()))?;
+                let setting = format!("--subject-key-file {}", path.display());
+                let key = Self::subject_key(&source, &setting)?;
+                Self::armed(&self.paths.root, &key, &setting)?;
                 tracing::info!(
                     kinds = kinds.kinds().join(", "),
                     custody = source.custody(),
@@ -332,6 +334,52 @@ impl StoreSettings {
         source
             .fetch()
             .map_err(|error| config(format!("{setting} does not hold a subject key: {error}")))
+    }
+
+    /// Holds the fetched key to the one this store's pseudonyms were already derived from.
+    ///
+    /// The check itself is `yaam_core::arming`'s, along with the argument for why a store records
+    /// which key armed it and what that does and does not prove. What is decided here is what an
+    /// operator is told and what it costs them, which is this layer's to decide for the reason
+    /// [`StoreSettings::subject_key`] is: a source names its custody and a flag names itself.
+    ///
+    /// Three states, three log lines, because "the key was checked" and "the key was trusted" must
+    /// not read alike. A store armed before any of this existed records nothing, adopts the key it
+    /// is opened with, and comes up — the alternative would take exactly the deployments this
+    /// protects down at the upgrade that introduced it.
+    ///
+    /// Two refusals, and their exit codes differ because the remedies do: a key that does not match
+    /// is a setting to change ([`Exit::Config`](crate::exit::Exit::Config)), while a record that
+    /// cannot be read is a file to restore, which no edit to a command line fixes.
+    fn armed(root: &Path, key: &SubjectKey, setting: &str) -> Result<()> {
+        let check = key.check_value();
+        match yaam_core::arming::verify_or_arm(root, key) {
+            Ok(Arming::Verified) => tracing::info!(
+                check = %check,
+                "the subject key is the one this store was armed with"
+            ),
+            Ok(Arming::Adopted) => tracing::warn!(
+                check = %check,
+                "this store recorded no subject key and now records this one: it was trusted at \
+                 this open rather than verified, so compare the check value against the key you \
+                 mean to keep"
+            ),
+            Ok(Arming::Unrecorded(why)) => tracing::warn!(
+                check = %check,
+                why = %why,
+                "the subject key could not be recorded, so a later open cannot tell it from a \
+                 substitute"
+            ),
+            Err(error) => {
+                return Err(match &error {
+                    yaam_core::Error::SubjectKeyMismatch { .. } => {
+                        config(format!("{setting}: {error}"))
+                    }
+                    _ => failed("checking the subject key against the store", &error),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The wrapper the configured passphrase describes.
@@ -842,6 +890,98 @@ mod tests {
         settings.open().expect("opened");
     }
 
+    /// The file a store records its subject key in. Held to the spelling
+    /// `yaam_core::backup::MANIFEST` publishes, so a rename there fails here rather than leaving
+    /// these tests asserting about a file nothing writes.
+    const CHECK_FILE: &str = "subject-key-check.json";
+
+    /// The state the live deployments are in: armed, with no record of which key armed them. It has
+    /// to open — an upgrade that refused here would take down exactly the stores this protects — and
+    /// it has to leave the record behind, or the next open is as blind as this one.
+    #[test]
+    fn a_store_armed_before_the_check_existed_opens_and_records_the_key() {
+        assert_eq!(
+            yaam_core::backup::disposition_of(CHECK_FILE),
+            Some(yaam_core::backup::Disposition::Included),
+            "the check value has to travel in a backup, and by this name"
+        );
+
+        let (dir, key) = keyed_tree();
+        let recorded = dir.path().join(CHECK_FILE);
+        assert!(!recorded.exists(), "nothing records the key yet");
+
+        let settings = StoreSettings::resolve(&subject_key_args(dir.path(), &key), &Env::default())
+            .expect("resolved");
+        settings
+            .open()
+            .expect("a store armed before this still opens");
+        assert!(recorded.exists(), "and now records which key armed it");
+    }
+
+    /// The defect, at the layer an operator meets it. A substituted key file used to come up clean
+    /// and file a second pseudonym for a reference already on record; now it is a refusal that names
+    /// the setting, the file and what running anyway would do — and the store's own key still opens.
+    #[test]
+    fn a_substituted_subject_key_is_refused_and_the_store_s_own_still_opens() {
+        let (dir, key) = keyed_tree();
+        let settings = StoreSettings::resolve(&subject_key_args(dir.path(), &key), &Env::default())
+            .expect("resolved");
+        settings.open().expect("armed at the first open");
+        settings.open().expect("and checked at the next");
+
+        std::fs::write(&key, format!("{}\n", "5b".repeat(32))).expect("a substituted key file");
+        let err = settings
+            .open()
+            .expect_err("a key this store was not armed with");
+        assert_eq!(
+            err.exit(),
+            Exit::Config,
+            "a wrong key is a setting to change: {err}"
+        );
+        let said = err.to_string();
+        for expected in [
+            "--subject-key-file",
+            CHECK_FILE,
+            "not the one this store was armed with",
+            "second, unrelatable pseudonym",
+        ] {
+            assert!(said.contains(expected), "{expected} missing from: {said}");
+        }
+
+        std::fs::write(&key, format!("{}\n", "5a".repeat(32))).expect("the store's own key");
+        settings
+            .open()
+            .expect("the key the store was armed with still opens it");
+    }
+
+    /// A record that cannot be read is a different finding with a different remedy, and the exit
+    /// code says so: nothing an operator types into a command line repairs a file.
+    #[test]
+    fn a_record_that_cannot_be_read_stops_the_store_and_names_the_file() {
+        let (dir, key) = keyed_tree();
+        let settings = StoreSettings::resolve(&subject_key_args(dir.path(), &key), &Env::default())
+            .expect("resolved");
+        settings.open().expect("armed");
+
+        std::fs::write(dir.path().join(CHECK_FILE), "not a check value at all").expect("written");
+        let err = settings
+            .open()
+            .expect_err("nothing can be said about the key");
+        assert_eq!(
+            err.exit(),
+            Exit::Failed,
+            "an unreadable record is not a setting to change: {err}"
+        );
+        let said = err.to_string();
+        assert!(
+            said.contains("checking the subject key against the store"),
+            "{said}"
+        );
+        assert!(said.contains(CHECK_FILE), "{said}");
+        assert!(said.contains("A backup carries it"), "{said}");
+    }
+
+    /// Store args naming a passphrase file.
     /// Store args naming a passphrase file.
     fn passphrase_args(root: &Path, file: &Path) -> StoreArgs {
         StoreArgs {
