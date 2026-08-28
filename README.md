@@ -415,17 +415,25 @@ and an inferred link presented as a discovery is indistinguishable from a fact. 
 references become edges; they still never become corridors, because hop two would otherwise quietly
 launder what hop one was only willing to show with a confidence attached.
 
-`--depth` and the window are both required, and depth is 1 to 3. Past three it is the service's
-frontier cap rather than the graph that decides the answer, and an answer decided by its own bound is
-not a fact about the store.
+`--depth` and the window are both required, and depth is **1 to 2**. `0` is what `history` already
+answers. `3` is refused, and the refusal gives the reason below rather than a range — an answer
+decided by its own bound is not a fact about the store.
 
-**The frontier is the sharp edge, and it is worth knowing before you ask for three hops.** The
-recursion stops at 200 edges whatever `--limit` says, and it fills breadth-first — so the cap is spent
-on near hops before far ones. Measured over 200,000 records, three hops from the busiest identifier
-over 30 days comes back as 115 hop-1 edges, 85 hop-2 edges and *no hop-3 edges at all*; unbounded it
-would have been 347, and over the whole two years 35,845. A deep question over a busy seed should
-narrow its window rather than raise its page. Over a quiet seed the whole neighbourhood fits and none
-of this bites: two hops from a long-tail identifier across two years is 17 edges in 0.7 ms.
+**The frontier is the sharp edge, and it is why the depth stops at two.** The recursion stops at 200
+edges whatever `--limit` says, and it fills breadth-first — so the cap is spent on near hops before
+far ones. Measured over 200,000 records, three hops from the busiest identifier over 30 days comes
+back as 115 hop-1 edges, 85 hop-2 edges and *no hop-3 edges at all*; unbounded it would have been
+347, and over the whole two years 35,845. A request for three hops answered entirely out of the first
+two is a defect in the shape of the answer, and nothing in the answer admits to it — so the third hop
+is refused instead. **A limit that refuses is better than one that substitutes a different answer.**
+The fix is a per-hop budget, which is not expressible as a `LIMIT` on the compound select this read
+is; when one is written the cap moves, and until then this measurement is why it sits where it does.
+
+The measurement stays here rather than leaving with the third hop, because it also describes the
+second: over a busy enough seed, two hops is a page of hop-1 edges and a few hop-2 ones, which is a
+ceiling on recall and not a claim that nothing further is connected. A deep question over a busy seed
+should narrow its window rather than raise its page. Over a quiet seed the whole neighbourhood fits
+and none of this bites: two hops from a long-tail identifier across two years is 17 edges in 0.7 ms.
 
 #### Naming the entities a caller does not know it has
 

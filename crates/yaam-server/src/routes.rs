@@ -594,15 +594,31 @@ impl LinkedQuery {
                 ));
             }
         };
-        // Zero is `GET /entities/{kind}/{id}` with more ceremony, and past `MAX_DEPTH` it is the
-        // frontier rather than the graph that decides the answer. Refused rather than clamped: a
-        // depth quietly reduced is a caller believing it saw a hop it did not.
-        if self.depth == 0 || self.depth > query::MAX_DEPTH {
+        // Two refusals rather than one range check: the ends are refused for different reasons, and
+        // a caller can only act on the one it hit. Neither is clamped — a depth quietly reduced is a
+        // caller believing it saw a hop it did not.
+        if self.depth == 0 {
+            return Err(Error::Unprocessable(
+                "`depth` is 0, which is `GET /entities/{kind}/{id}` with more ceremony: a traversal \
+                 starts at one hop"
+                    .to_owned(),
+            ));
+        }
+        // The deep end names the measurement rather than the range. "Out of range" would read as a
+        // bound a caller might argue with; this is a fact about what the answer would have been. See
+        // [`query::MAX_DEPTH`], which is where the number moved and why.
+        if self.depth > query::MAX_DEPTH {
             return Err(Error::Unprocessable(format!(
-                "`depth` is {} and this service traverses 1 to {} hops: past that it is the \
-                 frontier cap rather than the graph that decides the answer, and depth 0 is \
-                 `GET /entities/{{kind}}/{{id}}`",
+                "`depth` is {} and this service traverses 1 to {} hops: the recursion fills its \
+                 {}-edge frontier breadth-first, so the frontier is spent on near hops before far \
+                 ones — measured, a 30-day depth-3 traversal comes back as 115 hop-1 edges, 85 \
+                 hop-2 edges and no hop-3 edges at all. Refused rather than answered out of the \
+                 first two hops under a third hop's name: ask for {} and narrow the window rather \
+                 than raising the page. A per-hop budget is what would lift this, and there is not \
+                 one yet.",
                 self.depth,
+                query::MAX_DEPTH,
+                query::MAX_FRONTIER,
                 query::MAX_DEPTH
             )));
         }
@@ -1562,11 +1578,14 @@ mod tests {
 
     /// A depth this service will not run is refused rather than clamped to one it will.
     ///
-    /// Clamped, a caller asking for four hops would be handed three and told nothing, and would
-    /// report the absence of a fourth-hop connection as a fact about the store.
+    /// Clamped, a caller asking for three hops would be handed two and told nothing, and would
+    /// report the absence of a third-hop connection as a fact about the store. `3` is in the list
+    /// because it is the depth this endpoint used to answer: the frontier fills breadth-first and
+    /// spent all 200 edges on hops 1 and 2, so what came back was a two-hop answer wearing a
+    /// three-hop label. That is what the refusal below replaced.
     #[tokio::test]
     async fn a_depth_outside_what_the_frontier_can_answer_is_refused_rather_than_clamped() {
-        for depth in ["0", "4", "99"] {
+        for depth in ["0", "3", "4", "99"] {
             let fake = Arc::new(Fake::new());
             let target = format!("/linked/ticket/PROJ-42?depth={depth}&from_ms=1&to_ms=2");
             let (status, body) = serve(&fake, get(&target, Some(READER))).await;
@@ -1578,6 +1597,42 @@ mod tests {
             );
             assert!(fake.calls().is_empty(), "{target} reached the index");
         }
+        // The deep end says *why*, and the reason is the one thing a caller can act on: it tells
+        // them the answer they would have got was composed out of the hops they did not ask about.
+        // Asserted on the words rather than only the code, because a refusal that had drifted back
+        // to "out of range" would still be a `422`.
+        let fake = Arc::new(Fake::new());
+        let (status, body) = serve(
+            &fake,
+            get(
+                "/linked/ticket/PROJ-42?depth=3&from_ms=1&to_ms=2",
+                Some(READER),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let refusal = body["error"].as_str().unwrap_or_default();
+        for phrase in ["breadth-first", "no hop-3 edges at all", "per-hop budget"] {
+            assert!(
+                refusal.contains(phrase),
+                "the refusal has to say why a third hop would misrepresent itself: {refusal}"
+            );
+        }
+        // Depth 0 is refused for its own reason and must not be handed the frontier's.
+        let fake = Arc::new(Fake::new());
+        let (_, body) = serve(
+            &fake,
+            get(
+                "/linked/ticket/PROJ-42?depth=0&from_ms=1&to_ms=2",
+                Some(READER),
+            ),
+        )
+        .await;
+        let refusal = body["error"].as_str().unwrap_or_default();
+        assert!(
+            refusal.contains("/entities/") && !refusal.contains("breadth-first"),
+            "depth 0 is a different refusal from the frontier's: {refusal}"
+        );
         // A depth that is not a number at all is refused before a handler runs, like any query
         // string that will not parse.
         let fake = Arc::new(Fake::new());

@@ -538,13 +538,24 @@ fn linked_cases() -> Vec<Case> {
         ),
         case("GET", template, uri, None, "", Mode::Stored),
         // Permanent, and each for its own reason: a seed this deployment cannot canonicalise, half a
-        // window, a depth past what the frontier can honestly answer, a depth of zero, and a corridor
-        // cap above the service's own — which may be lowered and not raised.
+        // window, the first depth past what the frontier can honestly answer, a depth far past it, a
+        // depth of zero, and a corridor cap above the service's own — which may be lowered and not
+        // raised.
         case("GET", template, uri, Some(READER), "", Mode::Unaskable),
         case(
             "GET",
             template,
             "/linked/order_ref/ord10014733?depth=2&from_ms=10",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        // `3` on its own line because it is the boundary that moved: the document published it as
+        // answerable once, and the router has to refuse it for the document to still be true.
+        case(
+            "GET",
+            template,
+            "/linked/order_ref/ord10014733?depth=3&from_ms=10&to_ms=20",
             Some(READER),
             "",
             Mode::Stored,

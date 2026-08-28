@@ -9,13 +9,16 @@
 //! it was told about.
 //!
 //! The set is a table rather than a test per question, so adding a case is a row rather than a
-//! function — the difference between a set that grows and one that rots. Two rules make the rows
+//! function — the difference between a set that grows and one that rots. Three rules make the rows
 //! carry their weight:
 //!
 //! * Every row states the *exact* set it must return, so each positive case is also a check against
 //!   false positives. A query matching everything finds the record too.
 //! * Several rows must return nothing at all. That half matters as much as the other: "returns the
 //!   record" is trivially satisfiable, and only the empty rows say the predicate discriminates.
+//! * A question this service *refuses* is a row too, stating the refusal and the words it must
+//!   carry. A refusal is an answer an operator acts on, and a question that stopped being refused
+//!   would otherwise start being answered with nothing red.
 //!
 //! Answers are asserted against *structure*. A read hands back a record's frontmatter and never its
 //! prose, so each case names the fields its question was about, and the runner additionally checks
@@ -27,7 +30,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Method, Request, header};
+use axum::http::{Method, Request, StatusCode, header};
 use serde_json::Value;
 use tower::ServiceExt;
 use yaam_contract::{
@@ -401,6 +404,19 @@ enum Ask {
     /// went red is legible without opening the fixtures — and a join that stopped being directional
     /// would answer with pairs no row spells.
     Correlated(&'static str),
+    /// A signed read this service refuses, and the phrases the refusal must carry.
+    ///
+    /// The status *and* the words, because a refusal is an answer: the code is what a client
+    /// branches on, and the sentence is what an operator acts on. A bound stated as a range is one a
+    /// caller argues with; a bound stated as what the answer would have been made of is one they can
+    /// work around. A row here asserts both, so a refusal that drifted back to "out of range" fails
+    /// while still returning `422`.
+    Refused {
+        /// The request target, with `{from}` and `{to}` filled in as for any other row.
+        uri: &'static str,
+        /// Fragments the refusal must contain, in any order.
+        saying: &'static [&'static str],
+    },
 }
 
 /// What the answer must carry for the question to have been answered.
@@ -871,26 +887,39 @@ const GOLDEN: &[Case] = &[
         finds: &["h1 order_ref:ord10014733>ticket:PROJ-42 via transact_declined_on_ticket"],
         needs: &[Needs::Entity("ticket:PROJ-42")],
     },
-    // Three hops, which is the deepest this service will run. Two things are worth reading here.
-    // The third hop returns to `ticket:PROJ-42` by three different records -- an entity reached at
-    // hop 1 is reached again at hop 3, on other evidence, and each edge is its own fact rather than
-    // a duplicate. And the only node it does *not* return to is the seed, which is excluded by name:
-    // an edge whose far end is the entity the caller asked about reads as a discovery and is not one.
+    // Three hops, which this service answered when the endpoint shipped and refuses now. The row is
+    // the same row, and that is the point of it.
+    //
+    // What it used to state was seven edges, and the seven were real *here*: this fixture set is
+    // small enough that a whole three-hop neighbourhood fits inside the 200-edge frontier, so the
+    // row passed. The defect it could not see is that the frontier is filled breadth-first -- over a
+    // seed busy enough to fill it, the same request comes back as hops 1 and 2 and nothing else,
+    // wearing a three-hop label, and no fixture set an operator can read in one screen reproduces
+    // that. So the row stops asserting the seven edges, which were never the claim under test, and
+    // asserts the refusal: the status, and the sentence that says what the answer would have been
+    // composed of.
+    //
+    // Deleted instead of rewritten, this would have been a claim nobody makes. The third hop is one
+    // line in a range check away from coming back, and it would come back with nothing red.
     Case {
-        question: "the same seed at the deepest this service traverses",
-        ask: Ask::Linked("/linked/order_ref/ord10014733?depth=3&from_ms={from}&to_ms={to}"),
+        question: "three hops, which the frontier cannot fill honestly",
+        ask: Ask::Refused {
+            uri: "/linked/order_ref/ord10014733?depth=3&from_ms={from}&to_ms={to}",
+            // The reason, not the range. Each phrase is a thing the caller could not work out from
+            // a bare bound: the shape of the frontier, what a third hop would have been made of,
+            // and the fix that does not exist yet.
+            saying: &[
+                "1 to 2 hops",
+                "breadth-first",
+                "no hop-3 edges at all",
+                "under a third hop's name",
+                "per-hop budget",
+            ],
+        },
         window: Some(RECENTLY),
         agent: "ops_bot",
-        finds: &[
-            "h1 order_ref:ord10014733>ticket:PROJ-42 via transact_declined_on_ticket",
-            "h2 ticket:PROJ-42>deploy:api/production#1042 via deploy_failed",
-            "h2 ticket:PROJ-42>deploy:api/staging#1041 via deploy_ok",
-            "h2 ticket:PROJ-42>chat_channel:release-room via reply_release_room",
-            "h3 deploy:api/production#1042>ticket:PROJ-42 via deploy_failed",
-            "h3 deploy:api/staging#1041>ticket:PROJ-42 via deploy_ok",
-            "h3 chat_channel:release-room>ticket:PROJ-42 via reply_release_room",
-        ],
-        needs: &[Needs::Entity("ticket:PROJ-42")],
+        finds: &[],
+        needs: &[],
     },
     // The corridor rule, fired. `ticket:PROJ-42` carries four references inside this window, so a cap
     // of three makes it a hub: it is still *reached*, and nothing is reached *through* it. This is
@@ -1158,8 +1187,27 @@ fn attr_value(attr: Attr) -> attrs::Value {
     }
 }
 
-/// Signs and sends one request, asserting only that it was answered.
+/// Signs and sends one request, asserting only that it was answered successfully.
 async fn send(app: &axum::Router, method: Method, uri: &str, agent: &str, body: &[u8]) -> String {
+    let (status, text) = send_raw(app, method.clone(), uri, agent, body).await;
+    assert!(
+        status.is_success(),
+        "{method} {uri} as {agent} answered {status}: {text}"
+    );
+    text
+}
+
+/// Signs and sends one request, and hands back whatever came of it.
+///
+/// Split out of [`send`] for the rows that assert a *refusal*: the status is the thing under test
+/// there, so it cannot also be the harness's precondition.
+async fn send_raw(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    agent: &str,
+    body: &[u8],
+) -> (StatusCode, String) {
     let request = Request::builder()
         .method(method.clone())
         .uri(uri)
@@ -1178,11 +1226,7 @@ async fn send(app: &axum::Router, method: Method, uri: &str, agent: &str, body: 
         .await
         .expect("a body");
     let text = String::from_utf8(bytes.to_vec()).expect("a JSON answer");
-    assert!(
-        status.is_success(),
-        "{method} {uri} as {agent} answered {status}: {text}"
-    );
-    text
+    (status, text)
 }
 
 /// Writes every fixture through `POST /records`, and returns each label's record.
@@ -1373,9 +1417,11 @@ fn parse_links(raw: String) -> Answer {
 /// so nothing here can assert about rows a request did not return.
 async fn ask(case: &Case, app: &axum::Router) -> Answer {
     let uri = match case.ask {
-        Ask::Ordered(uri) | Ask::Unordered(uri) | Ask::Correlated(uri) | Ask::Linked(uri) => {
-            target(case, uri)
-        }
+        Ask::Ordered(uri)
+        | Ask::Unordered(uri)
+        | Ask::Correlated(uri)
+        | Ask::Linked(uri)
+        | Ask::Refused { uri, .. } => target(case, uri),
         Ask::Search(needle) => {
             // Full text takes no window, so a row that named one would have it quietly dropped.
             assert!(
@@ -1386,11 +1432,45 @@ async fn ask(case: &Case, app: &axum::Router) -> Answer {
             format!("/search?q={needle}&limit={SEARCH_LIMIT}")
         }
     };
+    if let Ask::Refused { saying, .. } = case.ask {
+        return refusal(app, &uri, case, saying).await;
+    }
     let raw = send(app, Method::GET, &uri, case.agent, b"").await;
     match case.ask {
         Ask::Correlated(_) => parse_pairs(raw),
         Ask::Linked(_) => parse_links(raw),
         _ => parse_answer(raw),
+    }
+}
+
+/// Asks a question this service refuses, and checks the refusal is one an operator can act on.
+///
+/// The status and the words, for the reason [`Ask::Refused`] gives: a bound restated as a range
+/// still returns `422`, and a caller reading it goes on believing the bound is arbitrary rather than
+/// measured. The empty [`Answer`] it hands back is the truthful one — a refusal returns no records,
+/// and the runner's own checks about cost and prose then hold of it unchanged.
+async fn refusal(app: &axum::Router, uri: &str, case: &Case, saying: &[&str]) -> Answer {
+    let question = case.question;
+    let (status, raw) = send_raw(app, Method::GET, uri, case.agent, b"").await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "`{question}` was answered {status} rather than refused: {raw}"
+    );
+    for phrase in saying {
+        assert!(
+            raw.contains(phrase),
+            "`{question}` was refused without saying `{phrase}`, which is the part a caller acts \
+             on: {raw}"
+        );
+    }
+    Answer {
+        records: Vec::new(),
+        pairs: Vec::new(),
+        edges: Vec::new(),
+        hubs: Vec::new(),
+        raw,
+        token_estimate: 0,
     }
 }
 
@@ -1570,6 +1650,14 @@ async fn every_golden_query_finds_exactly_the_records_its_question_needs() {
                 link_labels(&answer, &written),
                 case.finds,
                 "`{question}` (nearest hop first, newest evidence first within a hop)"
+            ),
+            // A refusal was already asserted where it was asked, words and all. What is left for
+            // the table is that the row does not also claim an answer: `finds` on a refused row
+            // would be a set nothing could ever return, which reads as a failing query rather than
+            // as a row that means the wrong thing.
+            Ask::Refused { .. } => assert!(
+                case.finds.is_empty(),
+                "`{question}` is refused and cannot also find records"
             ),
             Ask::Unordered(_) | Ask::Search(_) => {
                 let mut sorted = found.clone();

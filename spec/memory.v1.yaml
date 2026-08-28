@@ -675,10 +675,18 @@ paths:
         parse — and a half window is `422`, the same split `GET /correlate` makes for `within_ms`
         against `left.from_ms`. Both are permanent.
 
-        `depth` is `1` to `3`. `0` is `GET /entities/{kind}/{id}` with more ceremony; past `3` it is the
-        frontier cap rather than the graph that decides the answer, and an answer decided by its own
-        bound is not a fact about the store. Refused rather than clamped, so a caller cannot believe
-        it saw a hop it did not.
+        `depth` is `1` to `2`, and the two ends are refused for different reasons. `0` is
+        `GET /entities/{kind}/{id}` with more ceremony. `3` is refused because of the frontier below:
+        the recursion fills its `200` edges breadth-first, so a third hop is answered out of whatever
+        hops one and two left — nothing, over a busy seed — and the answer says nothing about having
+        been composed that way. An answer decided by its own bound is not a fact about the store, so
+        it is refused rather than given: a limit that refuses is better than one that substitutes a
+        different answer. Neither end is clamped, so a caller cannot believe it saw a hop it did not.
+
+        This was `1` to `3` in the version that introduced the endpoint, and depth `3` answered.
+        A client that was asking for three hops is not losing an answer it had; it is losing an
+        answer composed out of the first two. A per-hop budget is what would restore the third hop,
+        and is not expressible as a `LIMIT` on the compound select this read is.
 
         The window bounds every hop, and it is required for `GET /correlate`'s reason doubled: the
         seed's history is as long as the seed is busy, and a traversal reads a history per node on the
@@ -692,9 +700,13 @@ paths:
         It is a ceiling on recall, and the cost is sharper than the full-text candidate ceiling on
         `GET /search`. The frontier is filled breadth-first, so it is spent on near hops before far
         ones: that 30-day depth-3 traversal comes back with 115 hop-1 edges, 85 hop-2 edges and **no
-        hop-3 edges at all** — a request for three hops answered entirely out of the first two. A
-        deep question over a busy seed should narrow its window rather than raise its page. A deep
-        question over a quiet one is unaffected, because its whole neighbourhood fits.
+        hop-3 edges at all** — a request for three hops answered entirely out of the first two. That
+        measurement is why `depth` stops at `2` above, and it is recorded here rather than deleted
+        with the third hop, because it is also the shape of the second: over a busy enough seed a
+        two-hop answer is a page of hop-1 edges and a few hop-2 ones, which is a ceiling on recall
+        and not a claim that nothing further is connected. A deep question over a busy seed should
+        narrow its window rather than raise its page. A deep question over a quiet one is unaffected,
+        because its whole neighbourhood fits.
 
         `limit` caps **edges**, and absent means `100`. One record making three edges is returned
         three times, its structure repeated, and `token_estimate` counts it each time — because that is
@@ -732,18 +744,26 @@ paths:
         '422':
           description: |
             Permanent. `kind` is not configured by this deployment or `id` cannot be canonicalised;
-            or one of `from_ms` and `to_ms` is missing; or `depth` is `0` or above `3`; or
+            or one of `from_ms` and `to_ms` is missing; or `depth` is `0` or above `2`; or
             `max_degree` is above the service cap of `32`, which may be lowered and not raised. Fix
             the request; the same parameters will never answer.
+
+            The two `depth` refusals carry different messages, because a caller can only act on the
+            one it hit: `0` is told which endpoint answers it, and anything above `2` is told what
+            the answer it asked for would have been made of.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
               example:
                 error: >-
-                  unprocessable: `depth` is 5 and this service traverses 1 to 3 hops: past that it is
-                  the frontier cap rather than the graph that decides the answer, and depth 0 is `GET
-                  /entities/{kind}/{id}`
+                  unprocessable: `depth` is 3 and this service traverses 1 to 2 hops: the recursion
+                  fills its 200-edge frontier breadth-first, so the frontier is spent on near hops
+                  before far ones — measured, a 30-day depth-3 traversal comes back as 115 hop-1
+                  edges, 85 hop-2 edges and no hop-3 edges at all. Refused rather than answered out
+                  of the first two hops under a third hop's name: ask for 2 and narrow the window
+                  rather than raising the page. A per-hop budget is what would lift this, and there
+                  is not one yet.
         '500':
           $ref: '#/components/responses/Internal'
         '503':
@@ -1164,14 +1184,19 @@ components:
         the seed. `2` is co-mention of a co-mention, which is the point of the endpoint: it reaches
         entities the seed's own records never named.
 
-        Required, and 1 to 3. Its absence is `400` — the query string is rejected before a handler
+        Required, and 1 to 2. Its absence is `400` — the query string is rejected before a handler
         runs, as for any missing required parameter — while a half window is `422`. Both are
-        permanent. `0` and anything above `3` are `422` and not clamped; see the endpoint description.
+        permanent. `0` and anything above `2` are `422` and not clamped; see the endpoint description.
+
+        `3` is inside the range this endpoint published when it shipped and outside the one it
+        enforces now. It was withdrawn rather than deprecated: the frontier is filled breadth-first,
+        so what a depth-3 request came back with was hops one and two under a three-hop label, and a
+        client cannot tell that from the answer. Ask for `2`.
       schema:
         type: integer
         format: int32
         minimum: 1
-        maximum: 3
+        maximum: 2
       example: 2
     traverse_from_ms:
       name: from_ms

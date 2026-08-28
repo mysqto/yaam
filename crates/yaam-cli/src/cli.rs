@@ -561,10 +561,13 @@ pub enum ReadQuery {
         /// The entity to start from, as `kind:id`. Percent-encoding is this command's business.
         #[arg(long, value_name = "KIND:ID")]
         entity: String,
-        /// How many records deep to go. Required, and 1 to 3.
+        /// How many records deep to go. Required, and 1 to 2.
         ///
-        /// `0` is what `history` already answers; past 3 it is the service's frontier cap rather
-        /// than the graph that decides the answer.
+        /// `0` is what `history` already answers. `3` is refused rather than answered: the
+        /// service's recursion fills its 200-edge frontier breadth-first, so it spends the frontier
+        /// on near hops before far ones — a 30-day depth-3 traversal comes back as 115 hop-1 edges,
+        /// 85 hop-2 edges and no hop-3 edges at all, which is a two-hop answer under a three-hop
+        /// label. Ask for 2 and narrow the window; a per-hop budget is what would lift the cap.
         #[arg(long, value_name = "N")]
         depth: u32,
         /// Inclusive start of the window every hop is taken inside, in milliseconds. Required.

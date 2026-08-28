@@ -76,9 +76,10 @@ pub const DEFAULT_LINK_LIMIT: u32 = 100;
 /// hops before far ones: the 30-day depth-3 traversal above returns 115 hop-1 edges, 85 hop-2 edges
 /// and **no hop-3 edges at all** — a request for three hops answered entirely out of the first two.
 /// A per-hop budget would be the better shape and is not expressible as a `LIMIT` on the compound
-/// select, so it is not what this does. Until it is, a deep question over a busy seed should narrow
-/// its window rather than raise its page; a deep question over a quiet one is unaffected, because
-/// its whole neighbourhood fits.
+/// select, so it is not what this does. This measurement is why [`MAX_DEPTH`] is two rather than
+/// three: what could not be answered honestly is refused instead. A deep question over a busy seed
+/// should still narrow its window rather than raise its page; a deep question over a quiet one is
+/// unaffected, because its whole neighbourhood fits.
 pub const MAX_FRONTIER: u32 = 200;
 
 /// A traversal must not promise a page its own frontier cannot fill. Checked at compile time.
@@ -108,11 +109,20 @@ pub const CORRIDOR_DEGREE: u32 = 32;
 
 /// Deepest traversal this index will run.
 ///
-/// Three, not because the fourth hop is expensive — the frontier bounds it — but because past the
-/// third it is [`MAX_FRONTIER`] rather than the graph that decides the answer, and an answer decided
-/// by its own bound is not a fact about the store. Refused at the endpoint rather than clamped: a
-/// depth silently reduced is a caller believing it saw four hops.
-pub const MAX_DEPTH: u32 = 3;
+/// The rule is unchanged and the number moved: past some hop it is [`MAX_FRONTIER`] rather than the
+/// graph that decides the answer, and an answer decided by its own bound is not a fact about the
+/// store. Three was where that argument put the line; the measurement recorded in [`MAX_FRONTIER`]
+/// puts it a hop earlier. SQLite fills the recursive queue breadth-first, so the frontier is spent
+/// on near hops before far ones: a depth-3 request over a busy seed comes back as 115 hop-1 edges,
+/// 85 hop-2 edges and **no hop-3 edges at all** — three hops asked for, two hops answered, and
+/// nothing in the answer saying so.
+///
+/// So two, until a per-hop budget exists. That is the fix, it is not expressible as a `LIMIT` on the
+/// compound select, and until it is written the third hop is refused rather than composed out of the
+/// first two: a limit that refuses is better than one that substitutes a different answer. Refused
+/// at the endpoint rather than clamped, for the same reason — a depth silently reduced is a caller
+/// believing it saw a hop it did not.
+pub const MAX_DEPTH: u32 = 2;
 
 /// What each further hop is worth, relative to the one before it.
 ///
@@ -826,6 +836,9 @@ pub struct Traversal {
 /// Read [`MAX_FRONTIER`] before promising a caller a deep traversal: the queue is filled
 /// breadth-first, so a frontier spent on hop 1 leaves nothing for hop 3, and a wide depth-3 request
 /// can come back with no hop-3 edges in it at all. Narrow the window rather than raising the page.
+/// This function runs whatever depth it is handed, which is why [`MAX_DEPTH`] is enforced by
+/// whoever answers a request: a measurement wants the third hop, and a caller cannot tell a third
+/// hop that found nothing from a third hop that was never reached.
 ///
 /// Measured over the same 200,000-record store the other reads in this module are measured against,
 /// as a scoped caller: one hop from the busiest identifier over 7 days is 24 edges at 0.78 ms p50,

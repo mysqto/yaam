@@ -646,8 +646,14 @@ fn traversal_reads(
         },
         Row {
             tag: "9b",
-            what: "as 9a, three hops over a 30-day window — the widest this service will run"
-                .to_owned(),
+            // The depth `GET /linked/{kind}/{id}` refuses, measured at the layer below it. This is
+            // the row the refusal rests on: the frontier fills breadth-first and this request spends
+            // all 200 edges on hops 1 and 2, so the endpoint declines to serve it as a three-hop
+            // answer. Kept, and kept running, because whoever writes the per-hop budget needs the
+            // before number — and because a measurement deleted is a measurement nobody can check.
+            what:
+                "as 9a, three hops over a 30-day window — the depth the endpoint refuses, and why"
+                    .to_owned(),
             estimate: "—",
             timings: measure(index, (iterations / 5).max(5), |store| {
                 query::linked(store, &traversal("order_ref", hot_id, 3, queries.month))
