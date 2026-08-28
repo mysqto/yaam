@@ -1058,6 +1058,26 @@ fn the_documented_traversal_bounds_are_the_ones_the_index_applies() {
         .as_integer(),
         Some(i64::from(yaam_store::query::MAX_DEPTH)),
     );
+    // And the *answer's* bound, which is the same number in the other direction and was left behind
+    // once already: lowering `MAX_DEPTH` left `LinkedEdge.hop` documented as reaching `3`, which is a
+    // hop this service can no longer return and a generated client would go on validating against.
+    // The parameter and the field move together or the document contradicts itself.
+    assert_eq!(
+        node(
+            &spec,
+            &[
+                "components",
+                "schemas",
+                "LinkedEdge",
+                "properties",
+                "hop",
+                "maximum"
+            ]
+        )
+        .as_integer(),
+        Some(i64::from(yaam_store::query::MAX_DEPTH)),
+        "the documented hop ceiling is not the depth the service will run"
+    );
     assert_eq!(
         node(
             &spec,

@@ -2121,8 +2121,11 @@ components:
         hop:
           type: integer
           minimum: 1
-          maximum: 3
-          description: How many records deep this edge sits.
+          maximum: 2
+          description: |
+            How many records deep this edge sits. Bounded by `depth`, so it moves with it — a
+            generated client validating against `3` would be validating against a hop this service
+            cannot return.
           example: 2
         score:
           type: number
