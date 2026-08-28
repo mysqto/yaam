@@ -12,7 +12,7 @@ use yaam_contract::{
 use yaam_core::bundle::{self, Bundle};
 use yaam_core::erase::EraseReport;
 use yaam_core::pipeline::Accepted;
-use yaam_store::query::{Filter, Window};
+use yaam_store::query::{EntityKey, Filter, Link, Traversal, Window};
 
 use crate::auth::Caller;
 use crate::service::Service;
@@ -187,6 +187,34 @@ impl Service for Fake {
             .records
             .iter()
             .map(|record| (record.clone(), record.clone()))
+            .collect())
+    }
+
+    fn linked(&self, caller: &Caller, traversal: &Traversal) -> Result<Vec<Link<RecordStructure>>> {
+        // The whole traversal is in the recorded call for the reason the entity window is: a
+        // parameter absent from here is one the route could drop without a test noticing, and this
+        // read has six of them.
+        self.called(format!("linked {} {traversal:?}", caller.agent))?;
+        // One edge per held record, reaching a second hop and carrying a degree past the corridor
+        // cap: the smallest answer that still exercises every field a route test asserts on, and it
+        // cannot pass on an empty page.
+        Ok(self
+            .records
+            .iter()
+            .map(|record| Link {
+                from: EntityKey {
+                    kind: traversal.kind.clone(),
+                    id: traversal.id.clone(),
+                },
+                to: EntityKey {
+                    kind: "ticket".to_owned(),
+                    id: "PROJ-42".to_owned(),
+                },
+                hop: 1,
+                confidence: 1.0,
+                degree: traversal.max_degree + 1,
+                via: record.clone(),
+            })
             .collect())
     }
 

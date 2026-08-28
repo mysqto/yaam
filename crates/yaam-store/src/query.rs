@@ -51,6 +51,85 @@ pub const DEFAULT_PAIR_LIMIT: u32 = 100;
 /// reason above: the two numbers only mean anything relative to each other.
 const _: () = assert!(DEFAULT_PAIR_LIMIT < DEFAULT_STRUCTURE_LIMIT);
 
+/// Edges a traversal returns when the caller names no page size.
+///
+/// An edge row is one record's structure plus the two entity keys it links, so it costs a little
+/// more than a single-structure row and far less than a pair. It is under [`MAX_FRONTIER`] on
+/// purpose: the frontier is the ceiling on what the recursion will find, and a default page above it
+/// would promise rows the traversal never materialises.
+pub const DEFAULT_LINK_LIMIT: u32 = 100;
+
+/// Most edges one traversal will materialise, whatever page size it was asked for.
+///
+/// A bound on the recursion rather than on the answer, which is what makes it a bound at all: the
+/// work of a hop is the fan-out of the frontier, so capping the returned rows alone would let a wide
+/// third hop cost the whole window and then throw most of it away. Measured over a 200,000-record
+/// store, from its busiest identifier at depth 3: 347 edges over a 30-day window, and **35,845 edges
+/// in 504 ms** over the whole two years. The corridor rule is what keeps that a five-figure number
+/// rather than a six-figure one; this is what keeps it a page.
+///
+/// Two hundred, because it is also the largest page this read will serve — so the recursion does as
+/// much work as the answer can carry and no more.
+///
+/// It is a ceiling on recall, and the cost is worse than [`search`]'s candidate ceiling rather than
+/// merely analogous to it. SQLite fills a recursive queue breadth-first, so the cap is spent on near
+/// hops before far ones: the 30-day depth-3 traversal above returns 115 hop-1 edges, 85 hop-2 edges
+/// and **no hop-3 edges at all** — a request for three hops answered entirely out of the first two.
+/// A per-hop budget would be the better shape and is not expressible as a `LIMIT` on the compound
+/// select, so it is not what this does. Until it is, a deep question over a busy seed should narrow
+/// its window rather than raise its page; a deep question over a quiet one is unaffected, because
+/// its whole neighbourhood fits.
+pub const MAX_FRONTIER: u32 = 200;
+
+/// A traversal must not promise a page its own frontier cannot fill. Checked at compile time.
+const _: () = assert!(DEFAULT_LINK_LIMIT <= MAX_FRONTIER);
+
+/// Most references an entity may carry inside a traversal's window and still be a corridor.
+///
+/// The one number in this module that is a judgement rather than a measurement, so here is the
+/// judgement. Below it sits a busy work item — a ticket touched a few dozen times over the day of an
+/// incident — which is exactly the node a traversal has to be able to walk through, because "what
+/// else was going on around this" is a question about that ticket's neighbourhood. Above it sits a
+/// shared context object — a channel, a service, a deployment target — where the neighbourhood is
+/// the corpus and the answer to any two-hop question through it is "everything".
+///
+/// It is not a percentile of the corpus, and that was a real choice. A percentile adapts, which
+/// sounds better and is worse in three ways: it is a global aggregate over `entities`, so it is
+/// either computed per query or materialised as derived state with a rebuild invariant — the remedy
+/// the plan's §7.6 already rejected once for the correlation join; it moves, so the same traversal
+/// answers differently tomorrow because an unrelated entity got busy, and a rule that cannot be
+/// reproduced cannot be tested; and it always excludes its top percent, so a store where nothing is
+/// a hub still loses its busiest entity as a corridor.
+///
+/// A caller may lower it and may not raise it. Lowering is how an operator tightens a traversal that
+/// came back noisy; raising would be a way to buy back the incident this rule exists to prevent,
+/// which is not a thing a request should be able to ask for.
+pub const CORRIDOR_DEGREE: u32 = 32;
+
+/// Deepest traversal this index will run.
+///
+/// Three, not because the fourth hop is expensive — the frontier bounds it — but because past the
+/// third it is [`MAX_FRONTIER`] rather than the graph that decides the answer, and an answer decided
+/// by its own bound is not a fact about the store. Refused at the endpoint rather than clamped: a
+/// depth silently reduced is a caller believing it saw four hops.
+pub const MAX_DEPTH: u32 = 3;
+
+/// What each further hop is worth, relative to the one before it.
+///
+/// A hop-2 edge is a claim about a record the seed never named, so it is weaker evidence than a
+/// hop-1 edge by construction, and a caller ranking these against anything else needs the exchange
+/// rate stated rather than invented. Half per hop is the same attenuation the traversal this rule
+/// was copied from uses; nothing here has measured a better one, and saying so is more useful than a
+/// number with a false provenance.
+pub const HOP_ATTENUATION: f32 = 0.5;
+
+/// The confidence a reference read out of a structured field carries.
+///
+/// Spelled once, because three separate rules test against it: what a bundle will admit, what a
+/// traversal defaults its floor to, and what a traversal requires of a reference before it will walk
+/// *through* it.
+pub const FULL_CONFIDENCE: f32 = 1.0;
+
 /// How many full-text matches [`search`] may examine per row it returns.
 ///
 /// The scope test runs after the match, so the candidate set has to be wider than the page or a
@@ -573,6 +652,425 @@ fn correlate_sql(
     (sql, binds)
 }
 
+/// One entity, as a traversal names it. Kind and identifier, and nothing else.
+///
+/// Not an [`EntityRef`]: a reference carries a role and a confidence because it is a *record's*
+/// claim about an entity, and the endpoints of a link are not claims — the claim is the [`Link`]
+/// itself, and it carries the confidence of the weaker of the two references behind it. Reusing the
+/// reference type here would have put a `role` on each end that belongs to whichever record was read
+/// last.
+///
+/// [`EntityRef`]: yaam_contract::entity::EntityRef
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityKey {
+    /// Kind the deployment configures.
+    pub kind: String,
+    /// Canonical identifier within the kind.
+    pub id: String,
+}
+
+/// One edge of the graph `entity_refs` implies: two entities, and the record that names both.
+///
+/// The record is the whole point. A traversal that answered with entity identifiers would say *that*
+/// two things are connected and never *why*, and the caller's only recourse would be a second read
+/// per edge — which is the read where the scope predicate gets forgotten, times the number of edges.
+/// So the evidence travels with the claim, and `R` is either the record's identifier or its whole
+/// stored structure depending on which projection was asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Link<R> {
+    /// The entity this edge was reached *from*: the seed at hop 1, a hop-1 neighbour at hop 2.
+    pub from: EntityKey,
+    /// The entity this edge reaches.
+    pub to: EntityKey,
+    /// How many records deep this edge sits: `1` for one the seed's own records made.
+    pub hop: u32,
+    /// The weaker of the two references the record makes, so an edge is never stronger than the
+    /// worse half of its own evidence.
+    pub confidence: f32,
+    /// How many records inside the window reference [`Link::to`], counted no further than
+    /// `max_degree + 1` — see [`Traversal::max_degree`]. Above the cap, this entity was reached and
+    /// not traversed through.
+    pub degree: u32,
+    /// The record naming both ends.
+    pub via: R,
+}
+
+impl<R> Link<R> {
+    /// What this edge is worth relative to a hop-1 one, at [`HOP_ATTENUATION`] per hop.
+    ///
+    /// A method rather than a stored column because it is a pure function of [`Link::hop`], and a
+    /// second copy of a derived number is a second thing to keep in step. It is contract all the
+    /// same: a caller merging these edges with another signal needs to know how much a further hop
+    /// costs, and one that had to guess would invent its own attenuation.
+    #[must_use]
+    pub fn score(&self) -> f32 {
+        HOP_ATTENUATION.powi(i32::try_from(self.hop).unwrap_or(i32::MAX))
+    }
+
+    /// Whether the corridor rule stopped the traversal here rather than the requested depth.
+    ///
+    /// The distinction a caller cannot make from an edge list alone, and the same distinction a
+    /// bundle's `omitted` exists for: an answer that stops because this entity is a hub and one that
+    /// stops because nothing else is connected look identical, and they call for opposite next
+    /// moves.
+    #[must_use]
+    pub fn hub(&self, traversal: &Traversal) -> bool {
+        self.degree > traversal.max_degree && self.hop < traversal.depth
+    }
+}
+
+/// What a traversal asks: a seed, how far, over which window, and what it will believe.
+///
+/// No [`Default`], deliberately, and `window` is a [`Window`] rather than an `Option<Window>`. The
+/// two fields a traversal cannot be asked without are the two a defaulted request would silently
+/// invent: a depth, because the work is exponential in it, and a window, because the seed's history
+/// is as long as the seed is busy. `correlate` learned the second one the expensive way — measured
+/// at 4.2 s unwindowed — and a traversal is that read at every hop.
+#[derive(Debug, Clone)]
+pub struct Traversal {
+    /// Kind of the entity to start from.
+    pub kind: String,
+    /// Canonical identifier of the entity to start from.
+    pub id: String,
+    /// How many records deep to go: `1` is co-mention, `2` is co-mention of a co-mention.
+    ///
+    /// Held to [`MAX_DEPTH`] by whoever answers a request, not here. This module runs the traversal
+    /// it is handed — a sweep or a test may reasonably go deeper than an endpoint will — and the
+    /// refusal belongs where the caller is, so it can be reported as the caller's rather than
+    /// silently reduced.
+    pub depth: u32,
+    /// Half-open span of server-stamped time every hop is taken inside.
+    pub window: Window,
+    /// Floor every reference on every hop must meet to be an edge at all.
+    ///
+    /// Below [`FULL_CONFIDENCE`] this admits references inferred from prose. It does not make them
+    /// corridors: see [`linked`].
+    pub min_confidence: f32,
+    /// Most references an entity may have inside the window and still be traversed *through*.
+    ///
+    /// The corridor rule. See [`CORRIDOR_DEGREE`] for what the number is and why, and note that the
+    /// direction it may be moved in is enforced where the request is — a caller of this module can
+    /// name any cap, and an endpoint refuses one above the constant.
+    pub max_degree: u32,
+    /// Most edges to return. `None` means [`DEFAULT_LINK_LIMIT`], never unbounded.
+    pub limit: Option<u32>,
+    /// What the reader is entitled to see, tested on the mediating record of *every* hop.
+    pub scope: Scope,
+}
+
+/// What else is connected to one entity, and by which records.
+///
+/// The read that turns `entity_refs` from a bipartite index into a graph. Two entities are linked
+/// because one record references both; a second hop is the same join taken again from a hop-1
+/// neighbour, and the record that made each edge comes back with it.
+///
+/// # The corridor rule
+///
+/// An entity may be *reached* however busy it is. What it may not do, above `max_degree` references
+/// inside the window, is carry the traversal onward. Without that rule the second hop of any
+/// question that passes near a shared identifier answers "everything that identifier ever touched",
+/// and the answer is technically correct and useless. The rule is here from the first commit rather
+/// than after the incident that teaches it, because the incident is documented in somebody else's
+/// system and is not worth reproducing: a verified degree-94 node that made their traversal
+/// unusable.
+///
+/// Degree is counted *inside the traversal's own window*, unscoped, and no further than
+/// `max_degree + 1` rows. Each of those three is load-bearing. In-window, because the traversal is
+/// windowed: an entity that was a hub last year and quiet during the hour under investigation is a
+/// perfectly good corridor for that hour, and the lifetime count in `entities.ref_count` — which is
+/// free to read — would refuse it. Unscoped, because a scoped count cannot be bounded: stopping at
+/// `max_degree + 1` *visible* rows means walking the whole history of a hub to find them, which is
+/// the work the cap exists to avoid, and because a corridor decision that differed per credential
+/// would give an operator asking "why did this stop here" one answer per caller. Bounded, because
+/// the count is the only unbounded thing in the query otherwise. The stated cost of the second one
+/// is a leak of exactly one bit — that an entity the caller already reached through a record it may
+/// read is busy — and the degree is returned, so the refusal is legible rather than silent.
+///
+/// The *seed* is not degree-capped, and that is deliberate rather than an omission. The caller named
+/// it, so asking about a busy identifier directly is a legitimate question — it is what
+/// [`by_entity`] answers — and refusing it would make the read unusable for exactly the entity an
+/// incident is usually about. What the rule governs is passing *through* a node nobody asked for.
+/// The cost is that hop 1 from a hub is as wide as the hub, which the window and [`MAX_FRONTIER`]
+/// bound and nothing else does.
+///
+/// # Confidence, in two tiers
+///
+/// `min_confidence` is the floor every reference on every hop must meet to be an edge. It defaults —
+/// at the endpoint above, since this struct has no default — to [`FULL_CONFIDENCE`], which is
+/// `bundle`'s bar rather than `by_entity`'s `0.0`. The difference is who named the far end:
+/// `by_entity` answers about an entity the caller wrote down, so an inferred reference there is one
+/// row the caller can see the confidence of, while a traversal *invents* the far end. An inferred
+/// link presented at hop 2 is indistinguishable from a fact for the same reason a guess in a bundle
+/// is.
+///
+/// A caller may still lower it, and then the second tier holds: **an inferred reference may end a
+/// path and may not extend one.** Expanding from a node requires the reference that discovered it
+/// and the reference that leaves it to be at full confidence, whatever the floor says. So lowering
+/// the floor widens what is *reported* and never what is *routed through* — the same shape as the
+/// corridor rule, applied to the other way a hop can be wrong. Without it, hop 2 would quietly
+/// launder what hop 1 was only willing to show with a confidence beside it.
+///
+/// # Scope
+///
+/// The predicate is on the mediating record of every hop, inside the recursive query. A traversal is
+/// `correlate`'s problem raised to a power: each hop joins records whose visibility was decided
+/// separately, and a scope test applied once — at the seed, or to the finished edge list — would let
+/// a caller learn that A and C are connected through a record no read admits them to. There is no
+/// second read here for the same reason there is none in `correlate_structures`: the structure comes
+/// out of the statement that filtered the rows.
+///
+/// # What bounds it
+///
+/// The window bounds every hop. `max_degree` bounds the fan-out of each node. [`MAX_FRONTIER`]
+/// bounds the recursion itself, in edges, and it is the ceiling on the answer whatever `limit` says.
+/// Read [`MAX_FRONTIER`] before promising a caller a deep traversal: the queue is filled
+/// breadth-first, so a frontier spent on hop 1 leaves nothing for hop 3, and a wide depth-3 request
+/// can come back with no hop-3 edges in it at all. Narrow the window rather than raising the page.
+///
+/// Measured over the same 200,000-record store the other reads in this module are measured against,
+/// as a scoped caller: one hop from the busiest identifier over 7 days is 24 edges at 0.78 ms p50,
+/// two hops 59 edges at 1.10 ms, the same two hops as structure 2.10 ms, and three hops over 30 days
+/// 3.09 ms — at which point the frontier and not the graph is deciding the answer. Two hops from a
+/// long-tail identifier across the whole two years is 17 edges at 0.68 ms.
+pub fn linked(store: &crate::Store, traversal: &Traversal) -> crate::Result<Vec<Link<RecordId>>> {
+    let (sql, binds) = linked_sql(traversal, Select::Id);
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds), |row| {
+        Ok((edge_of(row)?, row.get::<_, String>(7)?))
+    })?;
+    let mut links = Vec::new();
+    for row in rows {
+        let (edge, id) = row?;
+        links.push(edge.with(crate::stored_record_id(id)?));
+    }
+    Ok(links)
+}
+
+/// The traversal, with each edge's record as *structure* rather than its identifier.
+///
+/// [`linked`] with the wider select list, and the projection a request actually wants: an identifier
+/// beside two entity keys is a third name the caller cannot resolve, and the whole point of carrying
+/// the record is that "why are these two connected" is answered without a second read. Every rule on
+/// [`linked`] holds unchanged.
+pub fn linked_structures(
+    store: &crate::Store,
+    traversal: &Traversal,
+) -> crate::Result<Vec<Link<RecordStructure>>> {
+    let (sql, binds) = linked_sql(traversal, Select::Structure);
+    let lease = store.lease()?;
+    let mut stmt = lease.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(binds), |row| {
+        Ok((
+            edge_of(row)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+    let mut links = Vec::new();
+    for row in rows {
+        let (edge, id, frontmatter) = row?;
+        links.push(edge.with(crate::stored_structure(id, &frontmatter)?));
+    }
+    Ok(links)
+}
+
+/// An edge's columns, read by position, with the record still to come.
+///
+/// Split out because both projections read the same seven leading columns and only differ in what
+/// follows them: two readers spelling those seven twice is two places for a transposition to enter,
+/// and a transposed `from` and `to` is an answer that reads perfectly and points backwards.
+struct Edge {
+    from: EntityKey,
+    to: EntityKey,
+    hop: u32,
+    confidence: f32,
+    degree: u32,
+}
+
+impl Edge {
+    /// The link this edge becomes once its evidence is attached.
+    fn with<R>(self, via: R) -> Link<R> {
+        Link {
+            from: self.from,
+            to: self.to,
+            hop: self.hop,
+            confidence: self.confidence,
+            degree: self.degree,
+            via,
+        }
+    }
+}
+
+/// Reads the seven columns every traversal row leads with.
+fn edge_of(row: &Row<'_>) -> rusqlite::Result<Edge> {
+    Ok(Edge {
+        hop: row.get::<_, i64>(0)?.try_into().unwrap_or(u32::MAX),
+        from: EntityKey {
+            kind: row.get(1)?,
+            id: row.get(2)?,
+        },
+        to: EntityKey {
+            kind: row.get(3)?,
+            id: row.get(4)?,
+        },
+        confidence: row.get(5)?,
+        degree: row.get::<_, i64>(6)?.try_into().unwrap_or(u32::MAX),
+    })
+}
+
+/// Builds the traversal and its bindings.
+///
+/// Separate from running it for the reason every builder here is: whether each hop is an index seek
+/// is a property of the plan, and the plan can only be asked of the statement text. This is the one
+/// query in the module where that matters most — a hop that fell back to a scan would scan
+/// `entity_refs` once per node on the frontier.
+fn linked_sql(traversal: &Traversal, select: Select) -> (String, Vec<SqlValue>) {
+    let mut binds: Vec<SqlValue> = Vec::new();
+    let mut sql = String::from(
+        "WITH RECURSIVE reached(
+             hop, from_kind, from_id, to_kind, to_id, confidence, degree, record_pk
+         ) AS (
+             SELECT 1, ?, ?, b.kind, b.entity_id, min(a.confidence, b.confidence), ",
+    );
+    // The seed's own kind and id, as the `from` of every hop-1 edge. Bound rather than read back out
+    // of `a`, so the answer names the entity the caller asked about even when the reference row
+    // spells it identically.
+    binds.push(traversal.kind.clone().into());
+    binds.push(traversal.id.clone().into());
+    push_degree(&mut sql, &mut binds, traversal);
+    sql.push_str(
+        ", a.record_pk
+             FROM entity_refs AS a
+             JOIN entity_refs AS b ON b.record_pk = a.record_pk
+             JOIN records AS rec ON rec.id = a.record_pk
+             WHERE a.kind = ? AND a.entity_id = ?",
+    );
+    binds.push(traversal.kind.clone().into());
+    binds.push(traversal.id.clone().into());
+    push_hop_window(&mut sql, &mut binds, traversal);
+    // The floor on both references at hop 1. The seed is a thing the caller named, so the reference
+    // *to* it is held to the floor rather than to full confidence; what that buys is an edge that
+    // reports a confidence below 1.0 and, by the rule in the recursive term, goes no further.
+    sql.push_str(" AND a.confidence >= ? AND b.confidence >= ?");
+    binds.push(f64::from(traversal.min_confidence).into());
+    binds.push(f64::from(traversal.min_confidence).into());
+    sql.push_str(" AND (b.kind <> a.kind OR b.entity_id <> a.entity_id)");
+    push_scope(&mut sql, &mut binds, &traversal.scope);
+
+    sql.push_str(
+        " UNION
+             SELECT h.hop + 1, h.to_kind, h.to_id, b.kind, b.entity_id,
+                    min(a.confidence, b.confidence), ",
+    );
+    push_degree(&mut sql, &mut binds, traversal);
+    sql.push_str(
+        ", a.record_pk
+             FROM reached AS h
+             JOIN entity_refs AS a ON a.kind = h.to_kind AND a.entity_id = h.to_id
+             JOIN entity_refs AS b ON b.record_pk = a.record_pk
+             JOIN records AS rec ON rec.id = a.record_pk
+             WHERE h.hop < ?",
+    );
+    binds.push(i64::from(traversal.depth).into());
+    // The corridor rule, as one comparison against a number this row already carries. Counting the
+    // degree when the node was discovered rather than when it is expanded is what keeps it out of a
+    // subquery correlated to the recursive table — and it is what lets the answer report the degree
+    // that stopped it.
+    sql.push_str(" AND h.degree <= ?");
+    binds.push(i64::from(traversal.max_degree).into());
+    // The second confidence tier: a path that arrived on anything short of a stated reference ends
+    // here, whatever floor the caller set.
+    sql.push_str(" AND h.confidence >= ?");
+    binds.push(f64::from(FULL_CONFIDENCE).into());
+    push_hop_window(&mut sql, &mut binds, traversal);
+    // `a` is the reference that carries the traversal onward and is held to full confidence for the
+    // reason above; `b` only has to clear the floor, because it ends a path rather than extending
+    // one.
+    sql.push_str(" AND a.confidence >= ? AND b.confidence >= ?");
+    binds.push(f64::from(FULL_CONFIDENCE).into());
+    binds.push(f64::from(traversal.min_confidence).into());
+    sql.push_str(" AND (b.kind <> h.to_kind OR b.entity_id <> h.to_id)");
+    // Back to the seed is not news. Excluded rather than returned and ignored, because an edge whose
+    // far end is the entity the caller named reads as a discovery and is not one.
+    sql.push_str(" AND (b.kind <> ? OR b.entity_id <> ?)");
+    binds.push(traversal.kind.clone().into());
+    binds.push(traversal.id.clone().into());
+    push_scope(&mut sql, &mut binds, &traversal.scope);
+    // On the recursion itself, which is what makes it terminate on work rather than only on depth.
+    sql.push_str(" LIMIT ?");
+    binds.push(i64::from(MAX_FRONTIER).into());
+
+    sql.push_str(
+        " )
+         SELECT reached.hop, reached.from_kind, reached.from_id,
+                reached.to_kind, reached.to_id, reached.confidence, reached.degree, ",
+    );
+    sql.push_str(select.columns());
+    sql.push_str(
+        " FROM reached
+          JOIN records AS rec ON rec.id = reached.record_pk",
+    );
+    // Nearest hops first, then the newest evidence, then the primary key — every term of an order
+    // this module ends at the primary key for the same reason: hop and timestamp both tie readily,
+    // and a page taken from a partial order is arbitrary. The endpoints break the last tie, because
+    // one record can make several edges and they are otherwise indistinguishable.
+    sql.push_str(
+        " ORDER BY reached.hop ASC, rec.received_ms DESC, rec.id DESC,
+                   reached.to_kind ASC, reached.to_id ASC,
+                   reached.from_kind ASC, reached.from_id ASC
+          LIMIT ?",
+    );
+    binds.push(i64::from(traversal.limit.unwrap_or(DEFAULT_LINK_LIMIT)).into());
+    (sql, binds)
+}
+
+/// Appends the bounded degree count for the entity `b` names, and its bindings.
+///
+/// A counted subquery with its own `LIMIT`, so a hub costs `max_degree + 1` index entries rather
+/// than its whole history. An unbounded `count(*)` here would make the corridor rule cost exactly
+/// what the corridor rule exists to avoid paying.
+///
+/// References and not distinct records, and not filtered by the caller's confidence floor. One
+/// record naming an entity under two roles therefore counts twice, and a reference the floor would
+/// have excluded still counts — both err toward refusing a corridor, which is the direction to err
+/// in, and both keep the count a property of the entity rather than of the request that asked.
+fn push_degree(sql: &mut String, binds: &mut Vec<SqlValue>, traversal: &Traversal) {
+    sql.push_str(
+        "(SELECT count(*) FROM (
+              SELECT 1 FROM entity_refs AS d
+              WHERE d.kind = b.kind AND d.entity_id = b.entity_id
+                AND d.received_ms >= ? AND d.received_ms < ?
+              LIMIT ?))",
+    );
+    binds.push(traversal.window.from_ms.into());
+    binds.push(traversal.window.to_ms.into());
+    binds.push(i64::from(traversal.max_degree.saturating_add(1)).into());
+}
+
+/// Appends one hop's window over the reference's own copy of the time, and its bindings.
+///
+/// On `a.received_ms` rather than on the record's, for the reason every window in this module is:
+/// it is the column `entity_refs_recent` carries, so the window narrows the seek instead of
+/// filtering rows the seek already walked — which at two hops is the difference between reading a
+/// window and reading a history per node on the frontier.
+fn push_hop_window(sql: &mut String, binds: &mut Vec<SqlValue>, traversal: &Traversal) {
+    sql.push_str(" AND a.received_ms >= ? AND a.received_ms < ?");
+    binds.push(traversal.window.from_ms.into());
+    binds.push(traversal.window.to_ms.into());
+}
+
+/// Appends the scope test over the mediating record of one hop, and its bindings.
+///
+/// Called once per term of the recursion and nowhere else, so "the predicate holds on every hop" is
+/// a property of there being no other way to write a hop rather than of somebody having remembered.
+fn push_scope(sql: &mut String, binds: &mut Vec<SqlValue>, scope: &Scope) {
+    if let Some(predicate) = scope_predicate(scope, "rec", binds) {
+        sql.push_str(" AND ");
+        sql.push_str(&predicate);
+    }
+}
+
 /// Full-text search over plaintext bodies only, best match first.
 ///
 /// `needle` is an FTS5 query expression, so prefix and phrase syntax reach the caller; a malformed
@@ -832,7 +1330,8 @@ fn collect(rows: impl Iterator<Item = rusqlite::Result<String>>) -> crate::Resul
 #[cfg(feature = "explain")]
 pub mod explain {
     use super::{
-        Extent, Filter, Scope, Select, Window, by_entity_sql, correlate_sql, filter_sql, search_sql,
+        Extent, Filter, Scope, Select, Traversal, Window, by_entity_sql, correlate_sql, filter_sql,
+        linked_sql, search_sql,
     };
 
     /// How [`super::by_entity`] would run.
@@ -921,6 +1420,23 @@ pub mod explain {
         plan(store, &sql, binds)
     }
 
+    /// How [`super::linked`] would run.
+    pub fn linked(store: &crate::Store, traversal: &Traversal) -> crate::Result<String> {
+        let (sql, binds) = linked_sql(traversal, Select::Id);
+        plan(store, &sql, binds)
+    }
+
+    /// How [`super::linked_structures`] would run.
+    ///
+    /// Its own helper for the reason [`by_entity_structures`] has one, and with more at stake: the
+    /// traversal is the only read here whose join runs once per node on the frontier, so a hop that
+    /// stopped seeking would scan `entity_refs` a frontier's worth of times, and nothing but the plan
+    /// says whether it still seeks with the frontmatter in the select list.
+    pub fn linked_structures(store: &crate::Store, traversal: &Traversal) -> crate::Result<String> {
+        let (sql, binds) = linked_sql(traversal, Select::Structure);
+        plan(store, &sql, binds)
+    }
+
     /// How [`super::search`] would run.
     pub fn search(
         store: &crate::Store,
@@ -987,10 +1503,186 @@ mod tests {
     use yaam_contract::Visibility;
 
     use super::{
-        DEFAULT_LIMIT, DEFAULT_PAIR_LIMIT, DEFAULT_STRUCTURE_LIMIT, Extent, Filter, MAX_CANDIDATES,
-        SCOPE_HEADROOM, Scope, Select, SqlValue, Window, by_entity_sql, candidate_ceiling,
-        correlate_sql, filter_sql, scope_predicate, search_sql,
+        CORRIDOR_DEGREE, DEFAULT_LIMIT, DEFAULT_LINK_LIMIT, DEFAULT_PAIR_LIMIT,
+        DEFAULT_STRUCTURE_LIMIT, Extent, FULL_CONFIDENCE, Filter, HOP_ATTENUATION, Link,
+        MAX_CANDIDATES, MAX_FRONTIER, SCOPE_HEADROOM, Scope, Select, SqlValue, Traversal, Window,
+        by_entity_sql, candidate_ceiling, correlate_sql, filter_sql, linked_sql, scope_predicate,
+        search_sql,
     };
+
+    /// The traversal the plan tests explain: two hops over a day, at the shipped corridor cap.
+    fn traversal() -> Traversal {
+        Traversal {
+            kind: "ticket".to_owned(),
+            id: "PROJ-42".to_owned(),
+            depth: 2,
+            window: Window {
+                from_ms: 1_000,
+                to_ms: 90_000,
+            },
+            min_confidence: FULL_CONFIDENCE,
+            max_degree: CORRIDOR_DEGREE,
+            limit: None,
+            scope: reader(),
+        }
+    }
+
+    #[test]
+    fn every_hop_of_a_traversal_seeks_the_reference_index() {
+        // The read whose cost is a product rather than a sum: the second hop's join runs once per
+        // node the first hop found, so a hop that fell back to a scan would scan `entity_refs` a
+        // frontier's worth of times. Only the plan tells a seek from a scan.
+        for select in [Select::Id, Select::Structure] {
+            let (sql, binds) = linked_sql(&traversal(), select);
+            let plan = plan(&sql, binds);
+            assert_eq!(
+                plan.matches("entity_refs_recent").count(),
+                4,
+                "each of the two hops seeks the reference index for its own side and for the \
+                 degree it counts:\n{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN entity_refs") && !plan.contains("SCAN records"),
+                "a traversal that scans a base table scans it once per node on the frontier:\n\
+                 {plan}"
+            );
+            assert!(
+                plan.contains("RECURSIVE STEP"),
+                "the second hop must be the recursion rather than a second copy of the first:\n\
+                 {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scope_predicate_is_on_the_mediating_record_of_every_hop() {
+        // The failure this prevents is precise: scoped once, a caller learns that A and C are
+        // connected through a record no read admits it to. Counted rather than merely found,
+        // because one occurrence is what a traversal scoped at the seed alone would also show.
+        let (sql, _) = linked_sql(&traversal(), Select::Structure);
+        assert_eq!(
+            sql.matches("rec.visibility = ?").count(),
+            6,
+            "three visibility levels on each of two hops: {sql}"
+        );
+        assert_eq!(sql.matches("rec.team IN").count(), 2, "{sql}");
+        assert_eq!(sql.matches("rec.agent = ?").count(), 2, "{sql}");
+
+        // And the default scope reaches both hops too, so a traversal nobody scoped returns nothing
+        // rather than everything past hop one.
+        let (unscoped, _) = linked_sql(
+            &Traversal {
+                scope: Scope::default(),
+                ..traversal()
+            },
+            Select::Structure,
+        );
+        assert_eq!(unscoped.matches("1 = 0").count(), 2, "{unscoped}");
+    }
+
+    #[test]
+    fn a_traversal_binds_its_window_its_corridor_cap_and_its_frontier() {
+        let (sql, binds) = linked_sql(&traversal(), Select::Id);
+        // The window is bound six times: once per hop for the reference the hop is taken on, and
+        // once per hop for the bounded degree count. A degree counted outside the window would
+        // refuse a corridor that was quiet during the hour under investigation.
+        assert_eq!(
+            binds
+                .iter()
+                .filter(|bind| **bind == SqlValue::from(90_000i64))
+                .count(),
+            4,
+            "{binds:?}"
+        );
+        // The count stops one row past the cap, so a hub costs the cap and not its history.
+        assert!(
+            binds.contains(&SqlValue::from(i64::from(CORRIDOR_DEGREE) + 1)),
+            "{binds:?}"
+        );
+        assert!(
+            sql.contains("LIMIT ?))"),
+            "the degree count carries its own cap: {sql}"
+        );
+        // The frontier bounds the recursion, and the page bounds the answer. Both, and they are not
+        // the same number.
+        assert!(
+            binds.contains(&SqlValue::from(i64::from(MAX_FRONTIER))),
+            "{binds:?}"
+        );
+        assert!(
+            binds.contains(&SqlValue::from(i64::from(DEFAULT_LINK_LIMIT))),
+            "a traversal that named no page size is still bounded: {binds:?}"
+        );
+    }
+
+    #[test]
+    fn an_inferred_reference_may_end_a_path_and_may_not_extend_one() {
+        // The second confidence tier, as the query text. Lowering the floor widens what is reported
+        // and never what is routed through: hop two would otherwise present, as a discovery, a
+        // neighbourhood reached by walking through a guess.
+        let (sql, binds) = linked_sql(
+            &Traversal {
+                min_confidence: 0.7,
+                ..traversal()
+            },
+            Select::Id,
+        );
+        assert!(
+            sql.contains("h.confidence >= ?"),
+            "a path that arrived on a guess ends there: {sql}"
+        );
+        let floor = SqlValue::from(f64::from(0.7f32));
+        let full = SqlValue::from(f64::from(FULL_CONFIDENCE));
+        assert_eq!(
+            binds.iter().filter(|bind| **bind == floor).count(),
+            3,
+            "both references at hop one, and the discovering reference at hop two: {binds:?}"
+        );
+        assert_eq!(
+            binds.iter().filter(|bind| **bind == full).count(),
+            2,
+            "the arriving path and the reference that carries it onward: {binds:?}"
+        );
+    }
+
+    #[test]
+    fn a_further_hop_is_worth_less_and_says_by_how_much() {
+        let edge = |hop| Link {
+            from: super::EntityKey {
+                kind: "ticket".to_owned(),
+                id: "PROJ-42".to_owned(),
+            },
+            to: super::EntityKey {
+                kind: "deploy".to_owned(),
+                id: "api/staging#1041".to_owned(),
+            },
+            hop,
+            confidence: FULL_CONFIDENCE,
+            degree: 3,
+            via: (),
+        };
+        assert!((edge(1).score() - HOP_ATTENUATION).abs() < f32::EPSILON);
+        assert!((edge(2).score() - HOP_ATTENUATION * HOP_ATTENUATION).abs() < f32::EPSILON);
+        // Reached and not traversed through is a property of the edge and the request together: at
+        // the requested depth nothing was going to be expanded, so nothing there is a hub.
+        let asked = traversal();
+        assert!(!edge(1).hub(&asked), "under the cap");
+        assert!(
+            Link {
+                degree: CORRIDOR_DEGREE + 1,
+                ..edge(1)
+            }
+            .hub(&asked)
+        );
+        assert!(
+            !Link {
+                degree: CORRIDOR_DEGREE + 1,
+                ..edge(2)
+            }
+            .hub(&asked),
+            "the last hop stopped because the depth ran out, not because of the corridor rule"
+        );
+    }
 
     /// What a reader on one team is entitled to.
     fn reader() -> Scope {
@@ -1414,6 +2106,13 @@ mod tests {
                 .expect("a plan")
                 .contains("records_fts")
         );
+        for traversed in [
+            super::explain::linked(&store, &traversal()).expect("a plan"),
+            super::explain::linked_structures(&store, &traversal()).expect("a plan"),
+        ] {
+            assert!(traversed.contains("RECURSIVE STEP"), "{traversed}");
+            assert!(traversed.contains("entity_refs_recent"), "{traversed}");
+        }
         for join in [
             super::explain::correlate(&store, &filter, &filter, 1_000).expect("a plan"),
             super::explain::correlate_structures(&store, &filter, &filter, 1_000).expect("a plan"),
@@ -1433,7 +2132,8 @@ mod tests {
         let (pairs, _) =
             correlate_sql(&Filter::default(), &Filter::default(), 1, Select::Structure);
         let (filtered, _) = filter_sql(&Filter::default(), Select::Id);
-        for sql in [correlation, pairs, filtered] {
+        let (traversed, _) = linked_sql(&traversal(), Select::Structure);
+        for sql in [correlation, pairs, filtered, traversed] {
             assert!(!sql.contains("unixepoch"), "clock read in: {sql}");
             assert!(!sql.contains("'now'"), "clock read in: {sql}");
         }

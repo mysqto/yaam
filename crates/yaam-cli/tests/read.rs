@@ -137,6 +137,8 @@ fn every_read_is_answered_through_a_socket_the_caller_holds_no_key_for() {
     assert_eq!(bundle["records"][0]["record_id"], id, "{bundle}");
     assert_eq!(bundle["degraded"], false, "{bundle}");
 
+    a_traversal_reaches_what_no_record_named(&socket, &env, &records);
+
     // Last, because it needs a second record and every read above asserts on the newest one.
     // A join cannot pair a record with itself, so a correlation over one record could only ever
     // answer an empty page — which would not prove the read reaches the index at all.
@@ -195,6 +197,92 @@ fn every_read_is_answered_through_a_socket_the_caller_holds_no_key_for() {
 
     terminate(&mut agent, "yaam-agent");
     service.stop();
+}
+
+/// The graph read, end to end: two records that share an entity, and a hop past both of them.
+///
+/// Its own function rather than more of the read above, because it needs a fixture the other reads
+/// do not — a traversal is the one read whose answer is about something no record the caller named
+/// contains, so a store of one record could only ever answer it an empty page.
+fn a_traversal_reaches_what_no_record_named(
+    socket: &std::path::Path,
+    env: &[(&str, &str)],
+    records: &serde_json::Value,
+) {
+    // The graph read, which needs two records that share an entity: it is the only read here whose
+    // answer is about something no record the caller named contains, so a fixture of one record
+    // could only ever answer an empty page.
+    let bridge = emit(
+        socket,
+        &[
+            "--summary",
+            "linking the staging deploy to the ticket",
+            "--entity",
+            "deploy:api/staging#1146",
+            "--entity",
+            "ticket:PROJ-90",
+        ],
+    );
+    let onward = emit(
+        socket,
+        &[
+            "--summary",
+            "linking the ticket to the order reference",
+            "--entity",
+            "ticket:PROJ-90",
+            "--entity",
+            "order_ref:ord10014733",
+        ],
+    );
+    let stamp = records["records"][0]["received_at"]
+        .as_str()
+        .expect("a read reports the server-stamped time");
+    let now = yaam_contract::timestamp::parse_ms(stamp).expect("a contract timestamp");
+    let hop = 24 * 60 * 60 * 1000;
+    let linked = answered(
+        &[
+            "linked",
+            "--entity",
+            "deploy:api/staging#1146",
+            "--depth",
+            "2",
+            "--from-ms",
+            &(now - hop).to_string(),
+            "--to-ms",
+            &(now + hop).to_string(),
+        ],
+        env,
+    );
+    // Edges and hubs, not records: the shape is the answer, and a graph flattened into a list would
+    // leave the caller re-joining it.
+    assert!(linked.get("records").is_none(), "{linked}");
+    let edges = linked["edges"].as_array().expect("edges");
+    assert_eq!(edges.len(), 2, "{linked}");
+    assert_eq!(edges[0]["hop"], 1, "{linked}");
+    assert_eq!(edges[0]["to"]["id"], "PROJ-90", "{linked}");
+    assert_eq!(edges[0]["via"]["record_id"], bridge, "{linked}");
+    // The second hop reaches an order reference the deploy's own record never named — which is the
+    // capability, and it arrives with the record that justifies it.
+    assert_eq!(edges[1]["hop"], 2, "{linked}");
+    assert_eq!(edges[1]["to"]["id"], "ord10014733", "{linked}");
+    assert_eq!(edges[1]["via"]["record_id"], onward, "{linked}");
+    assert!(edges[1]["via"].get("summary").is_none(), "{linked}");
+    assert!(
+        linked["hubs"].as_array().expect("hubs").is_empty(),
+        "{linked}"
+    );
+
+    // The window is the one thing this read will not guess at either, and the refusal names the flag.
+    let refused = yaam_read(
+        &["linked", "--entity", "ticket:PROJ-90", "--depth", "2"],
+        env,
+    );
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--from-ms"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
 }
 
 /// The rules the workspace ships, as a caller names them.

@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use yaam_contract::Visibility;
 use yaam_core::bundle;
 use yaam_store::Store;
-use yaam_store::query::{self, Filter, Scope, Window, explain};
+use yaam_store::query::{self, Filter, Scope, Traversal, Window, explain};
 
 /// Name of the derived index under the memory root.
 ///
@@ -304,6 +304,10 @@ struct Queries {
     week: Window,
     /// Last thirty days of the anchor window.
     month: Window,
+    /// The whole generated span. What a traversal from a long-tail entity has to use: an entity
+    /// carrying four records over two years has none inside a seven-day window, and a measurement
+    /// of an empty answer is not a measurement of this read.
+    span: Window,
     /// The full-text expression measurement 6 issues.
     phrase: String,
     /// A typical bundle request.
@@ -337,6 +341,24 @@ fn ticket_updates() -> Filter {
         action: Some("ticket_update".to_owned()),
         scope: reader(),
         ..Filter::default()
+    }
+}
+
+/// A traversal from one entity, over one window, at the shipped corridor cap.
+///
+/// The seed and the window are the two parameters that decide the cost, so they are what the
+/// measurements below vary. Everything else is what the endpoint defaults to, because a benchmark of
+/// a tuned traversal measures the tuning.
+fn traversal(kind: &str, id: &str, depth: u32, window: Window) -> Traversal {
+    Traversal {
+        kind: kind.to_owned(),
+        id: id.to_owned(),
+        depth,
+        window,
+        min_confidence: query::FULL_CONFIDENCE,
+        max_degree: query::CORRIDOR_DEGREE,
+        limit: None,
+        scope: reader(),
     }
 }
 
@@ -375,6 +397,7 @@ impl Queries {
         Self {
             week: window(7),
             month: window(30),
+            span: window(synth::SPAN_DAYS),
             phrase: format!("\"{}\"", synth::PHRASE),
             hot_bundle: bundle::Request {
                 entities: vec![("order_ref".to_owned(), targets.hot.0.clone())],
@@ -395,6 +418,7 @@ fn read_measurements(
     let mut rows = single_table_reads(index, iterations, targets, queries);
     rows.extend(join_reads(index, iterations, queries));
     rows.extend(composed_reads(index, iterations, targets, queries));
+    rows.extend(traversal_reads(index, iterations, targets, queries));
     rows
 }
 
@@ -572,6 +596,81 @@ fn join_reads(index: &Path, iterations: usize, queries: &Queries) -> Vec<Row> {
     ]
 }
 
+/// The graph read: measurement 9 and the variants that bound it differently.
+///
+/// Four rows because the cost of a traversal is a product and each factor deserves its own line: the
+/// depth, the busyness of the seed, and the width of the window. The first is the one with no
+/// estimate on record — this read did not exist when §7.6 was written.
+fn traversal_reads(
+    index: &Path,
+    iterations: usize,
+    targets: &Targets,
+    queries: &Queries,
+) -> Vec<Row> {
+    let (hot_id, hot_count) = (&targets.hot.0, targets.hot.1);
+    let (tail_kind, tail_id, tail_count) =
+        (&targets.tail[0].0, &targets.tail[0].1, targets.tail[0].2);
+
+    vec![
+        Row {
+            tag: "9",
+            what: format!(
+                "one hop from the busiest `order_ref` ({hot_count} records), 7-day window"
+            ),
+            estimate: "—",
+            timings: measure(index, iterations, |store| {
+                query::linked(store, &traversal("order_ref", hot_id, 1, queries.week))
+                    .expect("linked")
+                    .len()
+            }),
+        },
+        Row {
+            tag: "9a",
+            what: "as 9, two hops — the capability that did not exist".to_owned(),
+            estimate: "—",
+            timings: measure(index, iterations, |store| {
+                query::linked(store, &traversal("order_ref", hot_id, 2, queries.week))
+                    .expect("linked")
+                    .len()
+            }),
+        },
+        Row {
+            tag: "9s",
+            what: "as 9a, returning each edge's record as structure rather than its id".to_owned(),
+            estimate: "—",
+            timings: measure(index, iterations, |store| {
+                query::linked_structures(store, &traversal("order_ref", hot_id, 2, queries.week))
+                    .expect("linked")
+                    .len()
+            }),
+        },
+        Row {
+            tag: "9b",
+            what: "as 9a, three hops over a 30-day window — the widest this service will run"
+                .to_owned(),
+            estimate: "—",
+            timings: measure(index, (iterations / 5).max(5), |store| {
+                query::linked(store, &traversal("order_ref", hot_id, 3, queries.month))
+                    .expect("linked")
+                    .len()
+            }),
+        },
+        Row {
+            tag: "9c",
+            what: format!(
+                "two hops from a tail `order_ref` ({tail_count} records) over the whole two years \
+                 — the seed is quiet and every corridor is judged on its lifetime traffic"
+            ),
+            estimate: "—",
+            timings: measure(index, iterations, |store| {
+                query::linked(store, &traversal(tail_kind, tail_id, 2, queries.span))
+                    .expect("linked")
+                    .len()
+            }),
+        },
+    ]
+}
+
 /// Full-text search and bundle composition: measurements 6 and 7.
 fn composed_reads(
     index: &Path,
@@ -708,6 +807,23 @@ fn plans(index: &Path, targets: &Targets, queries: &Queries) -> String {
         (
             "6a",
             explain::search(&store, synth::COMMON_WORD, 10, &reader()),
+        ),
+        // The traversal, at both projections. It is the only read here whose join runs once per node
+        // on the frontier, so whether each hop still seeks is the difference between a bounded read
+        // and one that scans `entity_refs` a frontier's worth of times.
+        (
+            "9a",
+            explain::linked(
+                &store,
+                &traversal("order_ref", &targets.hot.0, 2, queries.week),
+            ),
+        ),
+        (
+            "9s",
+            explain::linked_structures(
+                &store,
+                &traversal("order_ref", &targets.hot.0, 2, queries.week),
+            ),
         ),
     ];
     let mut out = String::new();

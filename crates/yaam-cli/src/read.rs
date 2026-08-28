@@ -170,6 +170,7 @@ fn target(query: &ReadQuery) -> Result<String> {
             )
         }
         ReadQuery::Correlate { .. } => correlation_target(query)?,
+        ReadQuery::Linked { .. } => traversal_target(query)?,
         ReadQuery::Search { query, limit } => {
             params.add("q", query);
             params.optional("limit", *limit);
@@ -268,6 +269,60 @@ fn correlation_target(query: &ReadQuery) -> Result<String> {
     params.add("within_ms", &within_ms.to_string());
     params.optional("limit", *limit);
     Ok(format!("/correlate{}", params.query()))
+}
+
+/// The request target one traversal asks for.
+///
+/// Its own function rather than a sixth arm of [`target`], for the reason [`correlation_target`] is
+/// one: the arm carried a refusal and seven parameters, and a reader looking for what a *records*
+/// query sends had to scroll past all of it.
+fn traversal_target(query: &ReadQuery) -> Result<String> {
+    let ReadQuery::Linked {
+        entity,
+        depth,
+        from_ms,
+        to_ms,
+        min_confidence,
+        max_degree,
+        limit,
+    } = query
+    else {
+        // Unreachable through [`target`], which matches the variant before calling this. Refused
+        // rather than panicked, as the correlation's builder is: a future read that reached the
+        // wrong builder should say so.
+        return Err(Error::Usage(
+            "this is the traversal's target builder and the read is not one".to_owned(),
+        ));
+    };
+    // The service requires the whole window rather than tolerating half of it or none, as it does
+    // for a correlation. Refused here for the same reason: the caller left out a flag, and hearing
+    // which one is worth more than a round trip that names a query parameter nobody typed.
+    if from_ms.is_none() || to_ms.is_none() {
+        return Err(Error::Usage(
+            "a traversal needs both --from-ms and --to-ms; every hop is taken inside the window, \
+             and there is deliberately no implicit `recent` — the seed's history is as long as the \
+             seed is busy"
+                .to_owned(),
+        ));
+    }
+    let (kind, id) = entity_term(entity)?;
+    let mut params = Params::default();
+    // Not optional, and not defaulted here either: the depth is the whole of what the caller meant
+    // by "connected".
+    params.add("depth", &depth.to_string());
+    params.optional("from_ms", *from_ms);
+    params.optional("to_ms", *to_ms);
+    params.optional("min_confidence", *min_confidence);
+    params.optional("max_degree", *max_degree);
+    params.optional("limit", *limit);
+    // Both segments encoded, as the entity history does: several configured kinds carry `/`, `#` or
+    // `@` inside an identifier, and those decide where a path segment ends.
+    Ok(format!(
+        "/linked/{}/{}{}",
+        encoded(kind),
+        encoded(id),
+        params.query()
+    ))
 }
 
 /// The bytes one read puts on the socket.
@@ -865,6 +920,72 @@ mod tests {
         assert_eq!(
             asked(&["history", "--entity", "ticket:PROJ-42"]).find('?'),
             None
+        );
+    }
+
+    /// A traversal sends what the caller asked for, and refuses what the service would.
+    #[test]
+    fn a_traversal_carries_its_depth_and_its_whole_window() {
+        assert_eq!(
+            asked(&[
+                "linked",
+                "--entity",
+                "order_ref:ord10014733",
+                "--depth",
+                "2",
+                "--from-ms",
+                "1",
+                "--to-ms",
+                "2"
+            ]),
+            "/linked/order_ref/ord10014733?depth=2&from_ms=1&to_ms=2"
+        );
+        // The corridor cap and the confidence floor are the caller's to tighten and are not sent
+        // unless it did: a default spelled here and a default spelled at the service are two
+        // defaults to keep in step.
+        assert_eq!(
+            asked(&[
+                "linked",
+                "--entity",
+                "deploy:api/staging#1146",
+                "--depth",
+                "1",
+                "--from-ms",
+                "1",
+                "--to-ms",
+                "2",
+                "--max-degree",
+                "8",
+                "--min-confidence",
+                "0.7",
+                "--limit",
+                "5"
+            ]),
+            "/linked/deploy/api%2Fstaging%231146\
+             ?depth=1&from_ms=1&to_ms=2&min_confidence=0.7&max_degree=8&limit=5"
+        );
+    }
+
+    /// Half a window is refused before a socket is opened, naming the flag rather than a query
+    /// parameter the caller never typed.
+    #[test]
+    fn a_traversal_without_its_whole_window_is_refused_by_name() {
+        let error = target(
+            &parsed(&[
+                "linked",
+                "--entity",
+                "ticket:PROJ-42",
+                "--depth",
+                "2",
+                "--from-ms",
+                "1",
+            ])
+            .query,
+        )
+        .expect_err("half a window");
+        assert!(
+            matches!(&error, Error::Usage(message) if message.contains("--to-ms")),
+            "{error:?}"
         );
     }
 
