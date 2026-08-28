@@ -11,12 +11,12 @@ openapi: 3.1.0
 info:
   title: yaam memory service
   version: 1.0.0
-  summary: Signed HTTP surface over an agent memory store — seven endpoints, no rebuild endpoint.
+  summary: Signed HTTP surface over an agent memory store — eight endpoints, no rebuild endpoint.
   license:
     name: MIT
     identifier: MIT
   description: |
-    Seven endpoints. Markdown is the source of truth underneath; the index this service reads is
+    Eight endpoints. Markdown is the source of truth underneath; the index this service reads is
     derived and disposable.
 
     ## Every request is signed, reads included
@@ -153,7 +153,8 @@ info:
 
     ## The schemas below have a generated twin
 
-    `spec/schemas/{action-record,envelope,record-structure,result,records,bundle}.v1.json` are JSON
+    `spec/schemas/{action-record,envelope,record-structure,result,records,bundle,correlations,links}.v1.json`
+    are JSON
     Schema 2020-12 documents
     generated from the implementation's own types, and are the copy to vendor if your tooling reads
     JSON Schema rather than OpenAPI. The schemas *here* are written by hand, and a test compares the
@@ -596,6 +597,178 @@ paths:
           $ref: '#/components/responses/Internal'
         '503':
           $ref: '#/components/responses/Unavailable'
+  /linked/{kind}/{id}:
+    get:
+      tags: [context]
+      operationId: linkedEntities
+      summary: What else is connected to one entity, and by which records
+      description: |
+        The one read whose answer is a graph. Every other read here takes entities the caller can
+        already name and answers with records; this one takes one entity and answers with what it is
+        connected to, an edge at a time.
+
+        **A link is a record.** Two entities are linked because one record references both — there is
+        no edge table, and there is deliberately never going to be one: an edge with no record behind
+        it is a claim this system could not rebuild from its own Markdown tree. A second hop is the
+        same join taken again from a hop-one neighbour. Every edge carries the record that made it,
+        as its stored structure, so *why* two things are connected needs no second read — and a
+        follow-up read is where a scope predicate gets forgotten, which at a graph's worth of edges is
+        a great many chances to forget it.
+
+        **Scoped at every hop, inside the query.** Each hop joins records whose visibility was decided
+        separately. A scope test applied at the seed alone, or to the finished edge list, would tell a
+        caller that A and C are connected on the evidence of a record no read admits it to.
+
+        ## The corridor rule
+
+        An entity may be **reached** however busy it is. What it may not do, above `max_degree`
+        references inside the window, is carry the traversal onward. Without that rule, the second hop
+        of any question passing near a shared identifier answers "everything that identifier ever
+        touched" — technically correct and useless.
+
+        The entities the rule refused come back in `hubs`, with the degree that refused them. That
+        matters as much as the edges: a short answer otherwise has two causes that call for opposite
+        next moves — nothing else is connected, or everything is and this is the node it all runs
+        through.
+
+        Degree is counted **inside this request's own window**, unscoped, and no further than one past
+        the cap. In-window because the traversal is: an entity that carried the world last month and
+        three records during the hour under investigation is exactly the corridor that hour needs, and
+        a lifetime count would refuse it. Unscoped because a scoped count cannot be bounded — finding
+        `max_degree + 1` *visible* rows means walking the whole history of a hub, which is the work the
+        cap exists to avoid — and because a corridor decision that differed per credential would give
+        an operator asking "why did this stop here" one answer per caller. The stated cost is a leak of
+        one bit: that an entity the caller already reached, through a record it may read, is busy.
+
+        The **seed is not degree-capped**. The caller named it, so asking about a busy identifier
+        directly is a legitimate question — it is what `GET /entities/{kind}/{id}` answers — and the
+        rule governs passing *through* a node nobody asked for. The cost is that the first hop from a
+        hub is as wide as the hub, bounded by the window and the frontier and by nothing else.
+
+        `max_degree` may be **lowered and not raised**. Lowering is how an operator tightens a
+        traversal that came back noisy; raising would be a request buying back the problem the rule
+        exists to prevent. Above the service cap of `32` it is `422` rather than clamped, because a
+        clamped value is one the caller goes on believing.
+
+        ## Confidence, in two tiers
+
+        `min_confidence` is the floor every reference on every hop must clear to be an edge, and it
+        defaults to `1.0` — `GET /bundle`'s bar, not `GET /entities/{kind}/{id}`'s `0.0`. The
+        difference is who named the far end. An entity read answers about something the caller wrote
+        down, so an inferred reference there is one row with its confidence beside it; a traversal
+        *invents* the far end, and an inferred link presented as a discovery is indistinguishable from
+        a fact for the same reason a guess in a bundle is.
+
+        Lower it and the second tier holds: **an inferred reference may end a path and may not extend
+        one.** Walking onward from an entity requires both the reference that discovered it and the
+        reference that leaves it to be at full confidence, whatever the floor says. So lowering the
+        floor widens what is *reported* and never what is *routed through* — the same shape as the
+        corridor rule, applied to the other way a hop can be wrong. Without it, hop two would quietly
+        launder what hop one was only willing to show with a confidence attached.
+
+        Each edge reports `confidence`: the weaker of the two references its record makes, so an edge
+        is never stronger than the worse half of its own evidence.
+
+        ## What bounds it, and what is refused
+
+        `depth` and the window are both required. A missing `depth` is `400` — there is nothing to
+        parse — and a half window is `422`, the same split `GET /correlate` makes for `within_ms`
+        against `left.from_ms`. Both are permanent.
+
+        `depth` is `1` to `2`, and the two ends are refused for different reasons. `0` is
+        `GET /entities/{kind}/{id}` with more ceremony. `3` is refused because of the frontier below:
+        the recursion fills its `200` edges breadth-first, so a third hop is answered out of whatever
+        hops one and two left — nothing, over a busy seed — and the answer says nothing about having
+        been composed that way. An answer decided by its own bound is not a fact about the store, so
+        it is refused rather than given: a limit that refuses is better than one that substitutes a
+        different answer. Neither end is clamped, so a caller cannot believe it saw a hop it did not.
+
+        This was `1` to `3` in the version that introduced the endpoint, and depth `3` answered.
+        A client that was asking for three hops is not losing an answer it had; it is losing an
+        answer composed out of the first two. A per-hop budget is what would restore the third hop,
+        and is not expressible as a `LIMIT` on the compound select this read is.
+
+        The window bounds every hop, and it is required for `GET /correlate`'s reason doubled: the
+        seed's history is as long as the seed is busy, and a traversal reads a history per node on the
+        frontier. There is no implicit `recent`.
+
+        The recursion itself stops at `200` edges, whatever `limit` says — which is also the largest
+        page this read serves, so the traversal does as much work as the answer can carry and no
+        more. Without it, measured over a 200,000-record store from its busiest identifier at depth
+        3, the same request materialises 347 edges over a 30-day window and 35,845 over two years.
+
+        It is a ceiling on recall, and the cost is sharper than the full-text candidate ceiling on
+        `GET /search`. The frontier is filled breadth-first, so it is spent on near hops before far
+        ones: that 30-day depth-3 traversal comes back with 115 hop-1 edges, 85 hop-2 edges and **no
+        hop-3 edges at all** — a request for three hops answered entirely out of the first two. That
+        measurement is why `depth` stops at `2` above, and it is recorded here rather than deleted
+        with the third hop, because it is also the shape of the second: over a busy enough seed a
+        two-hop answer is a page of hop-1 edges and a few hop-2 ones, which is a ceiling on recall
+        and not a claim that nothing further is connected. A deep question over a busy seed should
+        narrow its window rather than raise its page. A deep question over a quiet one is unaffected,
+        because its whole neighbourhood fits.
+
+        `limit` caps **edges**, and absent means `100`. One record making three edges is returned
+        three times, its structure repeated, and `token_estimate` counts it each time — because that is
+        what returning it three times costs.
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          description: Configured entity kind of the entity to start from.
+          schema:
+            type: string
+          example: order_ref
+        - name: id
+          in: path
+          required: true
+          description: |
+            Identifier within the kind, canonicalised here before it is matched, exactly as on
+            `GET /entities/{kind}/{id}`. Percent-encode it and sign the encoded target.
+          schema:
+            type: string
+          example: ord10014733
+        - $ref: '#/components/parameters/depth'
+        - $ref: '#/components/parameters/traverse_from_ms'
+        - $ref: '#/components/parameters/traverse_to_ms'
+        - $ref: '#/components/parameters/min_confidence_link'
+        - $ref: '#/components/parameters/max_degree'
+        - $ref: '#/components/parameters/link_limit'
+      responses:
+        '200':
+          $ref: '#/components/responses/Links'
+        '400':
+          $ref: '#/components/responses/BadQuery'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          description: |
+            Permanent. `kind` is not configured by this deployment or `id` cannot be canonicalised;
+            or one of `from_ms` and `to_ms` is missing; or `depth` is `0` or above `2`; or
+            `max_degree` is above the service cap of `32`, which may be lowered and not raised. Fix
+            the request; the same parameters will never answer.
+
+            The two `depth` refusals carry different messages, because a caller can only act on the
+            one it hit: `0` is told which endpoint answers it, and anything above `2` is told what
+            the answer it asked for would have been made of.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: >-
+                  unprocessable: `depth` is 3 and this service traverses 1 to 2 hops: the recursion
+                  fills its 200-edge frontier breadth-first, so the frontier is spent on near hops
+                  before far ones — measured, a 30-day depth-3 traversal comes back as 115 hop-1
+                  edges, 85 hop-2 edges and no hop-3 edges at all. Refused rather than answered out
+                  of the first two hops under a third hop's name: ask for 2 and narrow the window
+                  rather than raising the page. A per-hop budget is what would lift this, and there
+                  is not one yet.
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
   /bundle:
     get:
       tags: [context]
@@ -1002,6 +1175,106 @@ components:
         minimum: 0
       example: 20
 
+    depth:
+      name: depth
+      in: query
+      required: true
+      description: |
+        How many records deep to traverse. `1` is co-mention — entities named by the same record as
+        the seed. `2` is co-mention of a co-mention, which is the point of the endpoint: it reaches
+        entities the seed's own records never named.
+
+        Required, and 1 to 2. Its absence is `400` — the query string is rejected before a handler
+        runs, as for any missing required parameter — while a half window is `422`. Both are
+        permanent. `0` and anything above `2` are `422` and not clamped; see the endpoint description.
+
+        `3` is inside the range this endpoint published when it shipped and outside the one it
+        enforces now. It was withdrawn rather than deprecated: the frontier is filled breadth-first,
+        so what a depth-3 request came back with was hops one and two under a three-hop label, and a
+        client cannot tell that from the answer. Ask for `2`.
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 2
+      example: 2
+    traverse_from_ms:
+      name: from_ms
+      in: query
+      required: true
+      description: |
+        Inclusive start of the window **every hop** is taken inside, in milliseconds of the
+        server-stamped time. Required, together with `to_ms` — unlike the optional window on
+        `GET /records` and `GET /entities/{kind}/{id}`, and for `GET /correlate`'s reason doubled: a
+        traversal reads a history per node on its frontier. Its absence is `422`.
+      schema:
+        type: integer
+        format: int64
+      example: 1755676800000
+    traverse_to_ms:
+      name: to_ms
+      in: query
+      required: true
+      description: Exclusive end of that window, on the same clock. Required, with `from_ms`.
+      schema:
+        type: integer
+        format: int64
+      example: 1755763200000
+    min_confidence_link:
+      name: min_confidence
+      in: query
+      required: false
+      description: |
+        Floor every reference on every hop must clear to be an edge. Defaults to `1.0` — a
+        traversal invents the far end, so its default is what a bundle admits rather than what an
+        entity read admits.
+
+        Lowering it widens what is reported and never what is routed through: an inferred reference
+        may end a path and may not extend one. See the endpoint description.
+      schema:
+        type: number
+        format: float
+        minimum: 0
+        maximum: 1
+      example: 1.0
+    max_degree:
+      name: max_degree
+      in: query
+      required: false
+      description: |
+        Most references an entity may carry inside the window and still be traversed **through**.
+        Defaults to `32`, and may be lowered but not raised — above it is `422`.
+
+        The corridor rule, in one number. An entity above it is still reached and reported; it is
+        named in `hubs` with the degree that refused it, so the answer says why it stopped rather than
+        merely stopping. `32` sits above a busy work item — the node a traversal has to be able to
+        walk through — and below a shared context object, where the neighbourhood is the corpus.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+        maximum: 32
+      example: 8
+    link_limit:
+      name: limit
+      in: query
+      required: false
+      description: |
+        Most **edges** to return. Absent means `100`.
+
+        The recursion stops at `200` edges whatever this says, so a larger value cannot buy more
+        recall; it is a ceiling with the same stated cost as the full-text candidate ceiling on
+        `GET /search`. Narrow the window or the depth instead.
+
+        A record that makes three edges is returned three times, its structure repeated, and
+        `token_estimate` counts it each time.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+        maximum: 200
+      example: 50
+
     q:
       name: q
       in: query
@@ -1190,6 +1463,60 @@ components:
                   fields_masked: []
                   tags: [deploy]
             token_estimate: 316
+    Links:
+      description: |
+        The graph one entity sits in, as edges and the records behind them, plus the entities the
+        corridor rule refused to walk through. Structure and never a body, as on every other read.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LinksResponse'
+          example:
+            edges:
+              - from:
+                  kind: order_ref
+                  id: ord10014733
+                to:
+                  kind: ticket
+                  id: PROJ-42
+                hop: 1
+                score: 0.5
+                confidence: 1.0
+                via:
+                  record_id: 01ARZ3NDEKTSV4RRFFQ69G5FB2
+                  schema_ver: 1
+                  at: '2026-08-20T09:15:00Z'
+                  received_at: '2026-08-20T09:15:00Z'
+                  backfilled: false
+                  agent: ledger_bot
+                  agent_ver: 1.4.0
+                  correlation_id: c-8f21
+                  action: transact
+                  outcome: declined
+                  attrs:
+                    provider: gateway_two
+                    decline_code: do_not_honour
+                  entities:
+                    - kind: order_ref
+                      id: ord10014733
+                      role: primary
+                      confidence: 1.0
+                    - kind: ticket
+                      id: PROJ-42
+                      role: primary
+                      confidence: 1.0
+                  subjects: []
+                  visibility: org
+                  team: null
+                  data_class: internal
+                  redaction_policy: default-v1
+                  fields_masked: []
+                  tags: [transact]
+            hubs:
+              - kind: chat_channel
+                id: ops-room
+                degree: 33
+            token_estimate: 158
     BadQuery:
       description: |
         The query string was not understood — an unknown parameter, or one that would not parse into
@@ -1756,6 +2083,136 @@ components:
             Rough token cost of this answer, measured over both halves of every pair returned.
             Advisory, and not a promise about any tokeniser.
           example: 316
+
+    LinkedEntity:
+      type: object
+      description: |
+        One end of a link. Deliberately not an `EntityRef`: a reference carries a role and a
+        confidence because it is one record's claim about one entity, and the ends of a link are not
+        claims — the claim is the edge, and it carries its own confidence.
+      required: [kind, id]
+      properties:
+        kind:
+          type: string
+          example: ticket
+        id:
+          type: string
+          description: Canonical form for the kind.
+          example: PROJ-42
+
+    LinkedEdge:
+      type: object
+      description: |
+        Two entities, and the record that names both.
+
+        `from` and `to` are directed by *discovery*, not by causation: `from` is where the traversal
+        was standing and `to` is what it reached. A record naming both makes the link symmetric in
+        fact, so a client must not read this as "from caused to".
+      required: [from, to, hop, score, confidence, via]
+      properties:
+        from:
+          allOf:
+            - $ref: '#/components/schemas/LinkedEntity'
+          description: Where the traversal was standing — the seed at hop 1, a neighbour beyond that.
+        to:
+          allOf:
+            - $ref: '#/components/schemas/LinkedEntity'
+          description: What this edge reaches.
+        hop:
+          type: integer
+          minimum: 1
+          maximum: 3
+          description: How many records deep this edge sits.
+          example: 2
+        score:
+          type: number
+          format: float
+          description: |
+            What this edge is worth relative to a hop-1 one: `0.5` per hop, so `0.5` at hop 1 and
+            `0.25` at hop 2. A pure function of `hop`, published because a client merging these with
+            any other signal needs the exchange rate stated rather than invented — one that guessed
+            would disagree with every other client.
+          example: 0.25
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: |
+            The weaker of the two references the record makes, so an edge is never reported as
+            stronger than the worse half of its own evidence. Below `1.0` the reference was inferred
+            from prose, and this edge ended the path it was on — an inferred reference may not be
+            walked through.
+          example: 1.0
+        via:
+          allOf:
+            - $ref: '#/components/schemas/RecordStructure'
+          description: |
+            The record naming both ends. Structure and never a body, as everywhere. It is here rather
+            than reachable by a second read because *why* two things are connected is the answer, and
+            a second read is where the scope predicate gets forgotten.
+
+    Corridor:
+      type: object
+      description: |
+        An entity the traversal reached and refused to walk through, because it carries more than
+        `max_degree` references inside the window.
+      required: [kind, id, degree]
+      properties:
+        kind:
+          type: string
+          example: chat_channel
+        id:
+          type: string
+          example: ops-room
+        degree:
+          type: integer
+          minimum: 0
+          description: |
+            References inside the window, counted no further than one past `max_degree` — a floor on
+            how busy this entity is, not a census. Counting further would cost exactly what the cap
+            exists to avoid paying.
+          example: 33
+
+    LinksResponse:
+      type: object
+      description: |
+        The answer to `GET /linked/{kind}/{id}`, and the one read answer that is a graph.
+
+        Edges rather than nodes, because an edge is the unit that carries its own evidence: a node
+        list would say what was reached and leave "by what record" to a second read per node. An
+        entity reached at two different hops appears on two edges, each with its own record, which is
+        two facts rather than a duplicate.
+      required: [edges, hubs, token_estimate]
+      properties:
+        edges:
+          type: array
+          description: |
+            Nearest hop first; within a hop, newest evidence first. Capped at `limit`, and at the
+            `200`-edge frontier whatever `limit` says.
+          items:
+            $ref: '#/components/schemas/LinkedEdge'
+        hubs:
+          type: array
+          description: |
+            Entities reached and not traversed through. Named rather than silently dropped, because
+            "nothing else is connected" and "everything is, through this node" are the same short
+            answer otherwise, and they call for opposite next moves.
+
+            Derived from the edges actually returned, so a page cut short by `limit` may not name
+            every corridor refused. Edges arrive nearest-hop first and the nodes whose degree can
+            stop a traversal are the near ones, so a truncated page loses far edges before it loses
+            a hub. Narrow the window rather than raising the page.
+          items:
+            $ref: '#/components/schemas/Corridor'
+        token_estimate:
+          type: integer
+          minimum: 0
+          description: |
+            Rough token cost of this answer, measured over the record on every edge. A record that
+            made three edges is counted three times, because that is what returning it three times
+            costs. Advisory, and not a promise about any tokeniser.
+          example: 158
 
     BundleResponse:
       type: object

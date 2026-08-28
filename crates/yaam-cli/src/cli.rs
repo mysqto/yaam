@@ -544,6 +544,55 @@ pub enum ReadQuery {
         #[arg(long, value_name = "N")]
         limit: Option<u32>,
     },
+    /// What else is connected to one entity, and by which records. The graph read.
+    ///
+    /// Every other read here takes entities you can already name and answers with records. This one
+    /// takes one entity and answers with edges: two entities and the record naming both, so *why*
+    /// two things are connected needs no second read.
+    ///
+    /// `--depth 2` is the point of it — it reaches entities the seed's own records never named.
+    /// `--depth`, `--from-ms` and `--to-ms` are all required: the work is exponential in the depth,
+    /// and the seed's history is as long as the seed is busy.
+    ///
+    /// An entity is *reached* however busy it is and is not walked *through* above `--max-degree`
+    /// references inside the window. The ones the rule refused come back under `hubs`, so a short
+    /// answer says whether nothing else is connected or everything is, through one node.
+    Linked {
+        /// The entity to start from, as `kind:id`. Percent-encoding is this command's business.
+        #[arg(long, value_name = "KIND:ID")]
+        entity: String,
+        /// How many records deep to go. Required, and 1 to 2.
+        ///
+        /// `0` is what `history` already answers. `3` is refused rather than answered: the
+        /// service's recursion fills its 200-edge frontier breadth-first, so it spends the frontier
+        /// on near hops before far ones — a 30-day depth-3 traversal comes back as 115 hop-1 edges,
+        /// 85 hop-2 edges and no hop-3 edges at all, which is a two-hop answer under a three-hop
+        /// label. Ask for 2 and narrow the window; a per-hop budget is what would lift the cap.
+        #[arg(long, value_name = "N")]
+        depth: u32,
+        /// Inclusive start of the window every hop is taken inside, in milliseconds. Required.
+        #[arg(long, value_name = "MS")]
+        from_ms: Option<i64>,
+        /// Exclusive end of that window, on the same clock. Required, with `--from-ms`.
+        #[arg(long, value_name = "MS")]
+        to_ms: Option<i64>,
+        /// Floor every reference on every hop must clear. Absent means the service's, which is
+        /// full confidence.
+        ///
+        /// Lowering it widens what is reported and never what is routed through: an inferred
+        /// reference may end a path and may not extend one.
+        #[arg(long, value_name = "FLOOR")]
+        min_confidence: Option<f32>,
+        /// Most references an entity may carry inside the window and still be traversed through.
+        ///
+        /// Absent means the service's own cap. It may be lowered and not raised: raising it would
+        /// be a request buying back the problem the rule exists to prevent.
+        #[arg(long, value_name = "N")]
+        max_degree: Option<u32>,
+        /// Most edges to return. Absent leaves the service's own cap in force.
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
     /// Compose context for a request: history for some entities and an actor, in one capped set.
     ///
     /// Check `degraded` in the answer before acting on it. A bundle whose sources ran out of time is

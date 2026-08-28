@@ -20,7 +20,7 @@ use yaam_core::erase::EraseReport;
 use yaam_core::pipeline::Accepted;
 use yaam_core::sweeper::SweepReport;
 use yaam_store::Store;
-use yaam_store::query::{self, Filter, Window};
+use yaam_store::query::{self, Filter, Link, Traversal, Window};
 
 use crate::auth::Caller;
 use crate::{Error, Result};
@@ -109,6 +109,25 @@ pub trait Service: std::fmt::Debug + Send + Sync + 'static {
         right: &Filter,
         within_ms: i64,
     ) -> Result<Vec<(RecordStructure, RecordStructure)>>;
+
+    /// Answers what else is connected to one entity, and by which records.
+    ///
+    /// The only read here whose answer is a graph. Two entities are linked because one record
+    /// references both; a further hop is that join taken again from a neighbour, and each edge comes
+    /// back with the record that made it — because an edge list of identifiers says *that* two things
+    /// are connected and never *why*, and the read that would say why is one this service does not
+    /// offer a caller.
+    ///
+    /// An implementation must canonicalise the seed as [`Service::entity`] canonicalises its own,
+    /// and must narrow *every hop* to [`Caller::scope`] inside the query. This is `Service::correlate`'s
+    /// hazard raised to a power: each hop joins records whose visibility was decided separately, so a
+    /// scope test applied at the seed alone — or to the finished edge list — would tell a caller that
+    /// A and C are connected on the evidence of a record no read admits it to.
+    ///
+    /// It must not widen the traversal either. The corridor cap and the depth arrive already checked
+    /// against the index's own limits; an implementation that raised one would be handing back the
+    /// hub problem the cap exists to prevent.
+    fn linked(&self, caller: &Caller, traversal: &Traversal) -> Result<Vec<Link<RecordStructure>>>;
 
     /// Composes context for a request.
     ///
@@ -316,6 +335,18 @@ impl Service for CoreService {
             query::correlate_structures(self.store()?, &scoped(left), &scoped(right), within_ms)
                 .map_err(yaam_core::Error::from)?,
         )
+    }
+
+    fn linked(&self, caller: &Caller, traversal: &Traversal) -> Result<Vec<Link<RecordStructure>>> {
+        // The seed, canonicalised once here rather than at each hop: the hops match entity rows
+        // against each other and those are already canonical, so the only spelling a caller can get
+        // wrong is the one it wrote down.
+        let scoped = Traversal {
+            id: self.canonical(&traversal.kind, &traversal.id)?,
+            scope: caller.scope(),
+            ..traversal.clone()
+        };
+        Ok(query::linked_structures(self.store()?, &scoped).map_err(yaam_core::Error::from)?)
     }
 
     fn bundle(&self, caller: &Caller, request: &bundle::Request) -> Result<Bundle> {

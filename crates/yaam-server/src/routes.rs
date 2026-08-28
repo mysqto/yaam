@@ -20,7 +20,7 @@ use yaam_contract::{RecordId, RecordStructure, SubjectHash};
 use yaam_core::bundle;
 use yaam_core::pipeline::Accepted;
 use yaam_crypto::envelope;
-use yaam_store::query::{Filter, Window};
+use yaam_store::query::{self, Filter, Link, Traversal, Window};
 
 use crate::auth::{self, Caller, Keyring, Role};
 use crate::service::Service;
@@ -129,6 +129,7 @@ impl AppState {
 /// | `GET /search` | Which records mention something. Full text over bodies, structure back. |
 /// | `GET /entities/{kind}/{id}` | One page of an entity's history, newest first. |
 /// | `GET /correlate` | Which records of one shape were followed by records of another. |
+/// | `GET /linked/{kind}/{id}` | What else is connected to one entity, and by which records. |
 /// | `GET /bundle` | Compose context for a request. |
 /// | `POST /erase` | Destroy a subject's keys. Operator only, and rebuilds the index. |
 ///
@@ -146,6 +147,7 @@ pub fn router(state: AppState) -> Router {
         .route("/search", get(search_records))
         .route("/entities/{kind}/{id}", get(entity_records))
         .route("/correlate", get(correlate_records))
+        .route("/linked/{kind}/{id}", get(linked_entities))
         .route("/bundle", get(compose_bundle))
         .route("/erase", post(erase_subject))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
@@ -426,6 +428,232 @@ impl CorrelateQuery {
     }
 }
 
+/// One end of a link: the entity, and nothing about the record that named it.
+///
+/// Not an `EntityRef`. A reference carries a role and a confidence because it is one record's claim
+/// about one entity; the ends of a link are not claims, and putting a role here would have attached
+/// whichever record was read last to an entity two records away.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LinkedEntity {
+    /// Entity kind, as the deployment configures it.
+    pub kind: String,
+    /// Canonical identifier within the kind.
+    pub id: String,
+}
+
+/// One edge: two entities, and the record that names both.
+///
+/// The record is why this is an answer rather than a hint. An edge list of bare identifiers would
+/// say *that* two things are connected and never *why*, leaving the caller a read per edge to find
+/// out — and a follow-up read is where the scope predicate gets forgotten, which at a graph's worth
+/// of edges is a great many chances to forget it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LinkedEdge {
+    /// The entity this edge was reached from: the seed at hop 1, a hop-1 neighbour beyond that.
+    pub from: LinkedEntity,
+    /// The entity this edge reaches.
+    pub to: LinkedEntity,
+    /// How many records deep this edge sits. `1` is a record the seed itself is named by.
+    pub hop: u32,
+    /// What this edge is worth relative to a hop-1 one, attenuated per hop.
+    ///
+    /// Stated rather than left to the caller: a client merging these with any other signal needs the
+    /// exchange rate between a near edge and a far one, and one that had to guess would invent its
+    /// own and disagree with every other client.
+    pub score: f32,
+    /// The weaker of the two references the record makes, so an edge is never reported as stronger
+    /// than the worse half of its own evidence.
+    pub confidence: f32,
+    /// The record naming both ends, as its stored structure and never its body.
+    pub via: RecordStructure,
+}
+
+/// An entity the traversal reached and refused to walk through.
+///
+/// Here because a short answer has two causes that call for opposite next moves: nothing else is
+/// connected, or everything is and this is the node it all runs through. The same reason a bundle
+/// names what it omitted instead of quietly returning less.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Corridor {
+    /// Entity kind.
+    pub kind: String,
+    /// Canonical identifier.
+    pub id: String,
+    /// References this entity carries inside the window, counted no further than one past
+    /// `max_degree` — so this is a floor on how busy it is, not a census.
+    pub degree: u32,
+}
+
+/// Answer to a traversal.
+///
+/// Its own shape rather than a [`RecordsResponse`], for the reason a correlation has its own: the
+/// structure of the answer *is* the answer. Flattened into a list of records it would be a set the
+/// caller has to re-join into a graph, which is the work this endpoint exists to stop doing by hand,
+/// and the hop and the corridor refusals would have nowhere to live at all.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LinksResponse {
+    /// Edges, nearest hop first and newest evidence first within a hop.
+    pub edges: Vec<LinkedEdge>,
+    /// Entities reached and not traversed through, because the corridor rule refused them.
+    ///
+    /// Derived from the edges actually returned, so a page cut short by `limit` may not name every
+    /// corridor the traversal refused. That bites less than it reads: edges arrive nearest-hop
+    /// first, and the nodes whose degree can stop a traversal are the near ones, so a truncated page
+    /// loses far edges before it loses a hub. A caller that needs the whole list narrows the window
+    /// rather than raising the page, which is the advice everywhere here.
+    pub hubs: Vec<Corridor>,
+    /// Rough token cost of this answer, advisory only.
+    ///
+    /// Measured over the record on every edge, so a record that made three edges is counted three
+    /// times — which is what returning it three times costs.
+    pub token_estimate: usize,
+}
+
+impl LinksResponse {
+    /// Wraps the edges, names the corridors the rule refused, and measures what it all costs.
+    fn new(links: Vec<Link<RecordStructure>>, asked: &Traversal) -> Self {
+        let token_estimate =
+            yaam_contract::structure::estimate_tokens(links.iter().map(|link| &link.via));
+        // Deduplicated and ordered, because one hub is typically reached by several edges and a list
+        // repeating it would read as several hubs. `BTreeMap` rather than a sort afterwards: the key
+        // is the pair that identifies an entity, and the degree is a property of it.
+        let mut hubs = std::collections::BTreeMap::new();
+        for link in links.iter().filter(|link| link.hub(asked)) {
+            hubs.insert((link.to.kind.clone(), link.to.id.clone()), link.degree);
+        }
+        Self {
+            edges: links
+                .into_iter()
+                .map(|link| LinkedEdge {
+                    score: link.score(),
+                    from: LinkedEntity {
+                        kind: link.from.kind,
+                        id: link.from.id,
+                    },
+                    to: LinkedEntity {
+                        kind: link.to.kind,
+                        id: link.to.id,
+                    },
+                    hop: link.hop,
+                    confidence: link.confidence,
+                    via: link.via,
+                })
+                .collect(),
+            hubs: hubs
+                .into_iter()
+                .map(|((kind, id), degree)| Corridor { kind, id, degree })
+                .collect(),
+            token_estimate,
+        }
+    }
+}
+
+/// How far a traversal goes, and what it will believe on the way.
+///
+/// `depth` carries no default and neither does the window, and the two absences are reported
+/// differently on purpose — the same split `GET /correlate` already makes. A missing `depth` is
+/// `400`, because there is nothing to parse; a half window is `422`, because it parses into a
+/// question this service will not answer. Both are permanent, and a client whose retry policy
+/// branches on the code should read them the same way.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkedQuery {
+    /// How many records deep to go. Required.
+    pub depth: u32,
+    /// Inclusive start of the window every hop is taken inside. Required, with `to_ms`.
+    pub from_ms: Option<i64>,
+    /// Exclusive end of that window. Required, with `from_ms`.
+    pub to_ms: Option<i64>,
+    /// Floor every reference on every hop must clear. Absent means full confidence.
+    pub min_confidence: Option<f32>,
+    /// Most references an entity may carry inside the window and still be traversed through.
+    /// Absent means the service's own cap, and above it is refused.
+    pub max_degree: Option<u32>,
+    /// Most edges to return. Absent means the index's own cap, not every edge.
+    pub limit: Option<u32>,
+}
+
+impl LinkedQuery {
+    /// Turns query parameters into a traversal, refusing what this read will not guess at.
+    ///
+    /// `kind` and `id` arrive from the path and are canonicalised below this, by the service, for the
+    /// reason `GET /entities/{kind}/{id}` canonicalises its own: a spelling good enough to store has
+    /// to be good enough to traverse from, and one this deployment cannot canonicalise is a question
+    /// it cannot be asked rather than an entity with no neighbours.
+    fn into_traversal(self, kind: String, id: String) -> Result<Traversal> {
+        // Required, as on a correlation and for the same reason doubled: the seed's history is as
+        // long as the seed is busy, and a traversal reads a history per node on the frontier. There
+        // is no implicit `recent` here either.
+        let window = match (self.from_ms, self.to_ms) {
+            (Some(from_ms), Some(to_ms)) => Window { from_ms, to_ms },
+            _ => {
+                return Err(Error::Unprocessable(
+                    "a traversal needs both `from_ms` and `to_ms`: every hop is taken inside the \
+                     window, and there is no implicit `recent`"
+                        .to_owned(),
+                ));
+            }
+        };
+        // Two refusals rather than one range check: the ends are refused for different reasons, and
+        // a caller can only act on the one it hit. Neither is clamped — a depth quietly reduced is a
+        // caller believing it saw a hop it did not.
+        if self.depth == 0 {
+            return Err(Error::Unprocessable(
+                "`depth` is 0, which is `GET /entities/{kind}/{id}` with more ceremony: a traversal \
+                 starts at one hop"
+                    .to_owned(),
+            ));
+        }
+        // The deep end names the measurement rather than the range. "Out of range" would read as a
+        // bound a caller might argue with; this is a fact about what the answer would have been. See
+        // [`query::MAX_DEPTH`], which is where the number moved and why.
+        if self.depth > query::MAX_DEPTH {
+            return Err(Error::Unprocessable(format!(
+                "`depth` is {} and this service traverses 1 to {} hops: the recursion fills its \
+                 {}-edge frontier breadth-first, so the frontier is spent on near hops before far \
+                 ones — measured, a 30-day depth-3 traversal comes back as 115 hop-1 edges, 85 \
+                 hop-2 edges and no hop-3 edges at all. Refused rather than answered out of the \
+                 first two hops under a third hop's name: ask for {} and narrow the window rather \
+                 than raising the page. A per-hop budget is what would lift this, and there is not \
+                 one yet.",
+                self.depth,
+                query::MAX_DEPTH,
+                query::MAX_FRONTIER,
+                query::MAX_DEPTH
+            )));
+        }
+        // Lowering the corridor cap is how an operator tightens a noisy traversal. Raising it would
+        // be a request buying back the hub problem the rule exists to prevent, so it is refused
+        // rather than clamped — clamped, a caller would believe the number it sent.
+        let max_degree = self.max_degree.unwrap_or(query::CORRIDOR_DEGREE);
+        if max_degree > query::CORRIDOR_DEGREE {
+            return Err(Error::Unprocessable(format!(
+                "`max_degree` is {max_degree} and this service will not traverse through an entity \
+                 named by more than {} records inside the window: the cap may be lowered and not \
+                 raised",
+                query::CORRIDOR_DEGREE
+            )));
+        }
+        Ok(Traversal {
+            kind,
+            id,
+            depth: self.depth,
+            window,
+            min_confidence: self.min_confidence.unwrap_or(query::FULL_CONFIDENCE),
+            max_degree,
+            limit: self.limit,
+            // As everywhere here: what a caller may see comes from the credential its signature
+            // proved, and is filled in from it below. Spelled as the scope that matches nothing
+            // rather than left to a default, because [`Traversal`] deliberately has none — and an
+            // implementation of [`Service`] that forgot to narrow this would then answer nothing
+            // instead of everything.
+            //
+            // [`Service`]: crate::service::Service
+            scope: query::Scope::Nothing,
+        })
+    }
+}
+
 /// What a full-text read is looking for.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -682,6 +910,28 @@ async fn correlate_records(
     let service = state.service();
     let pairs = blocking(move || service.correlate(&caller, &left, &right, within_ms)).await?;
     Ok(Json(CorrelationsResponse::new(pairs)))
+}
+
+/// Answers what else is connected to one entity, and by which records.
+///
+/// The read this service had no shape for: every other one takes entities the caller can already
+/// name and answers with records. This one answers with the graph those records imply — an edge at a
+/// time, each carrying the record that made it, so *why* two things are connected needs no second
+/// read.
+async fn linked_entities(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path((kind, id)): Path<(String, String)>,
+    Query(params): Query<LinkedQuery>,
+) -> Result<Json<LinksResponse>> {
+    // Before the read: a half window, a depth this service will not run and a corridor cap above its
+    // own are all the caller's mistakes, and each would otherwise answer `200` with a page that
+    // reads as "nothing is connected to this".
+    let asked = params.into_traversal(kind, id)?;
+    let service = state.service();
+    let traversal = asked.clone();
+    let links = blocking(move || service.linked(&caller, &traversal)).await?;
+    Ok(Json(LinksResponse::new(links, &asked)))
 }
 
 /// Composes context for a caller.
@@ -1257,6 +1507,210 @@ mod tests {
         );
         assert!(call.contains("limit: Some(7)"), "{call}");
         assert!(call.ends_with(" 1800000"), "{call}");
+    }
+
+    #[tokio::test]
+    async fn a_traversal_carries_every_bound_it_was_asked_with_and_names_what_it_refused() {
+        let held = [testing::record(WRITER)];
+        let fake = Arc::new(Fake::new().holding(&held));
+        let (status, body) = serve(
+            &fake,
+            get(
+                "/linked/order_ref/ord10014733?depth=2&from_ms=1000&to_ms=2000\
+                 &min_confidence=0.7&max_degree=8&limit=7",
+                Some(READER),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // A graph, not a flat list: a `records` key here would mean the edges were flattened away
+        // on the way out, taking the hop and the endpoints with them.
+        assert!(body["records"].is_null(), "{body}");
+        assert_eq!(body["edges"][0]["from"]["id"], "ord10014733", "{body}");
+        assert_eq!(body["edges"][0]["hop"], 1, "{body}");
+        assert!(
+            (body["edges"][0]["score"].as_f64().unwrap_or_default() - 0.5).abs() < 1e-6,
+            "the attenuation is contract, so it is on the wire: {body}"
+        );
+        assert!(body["edges"][0]["via"]["record_id"].is_string(), "{body}");
+        // The fake answers with a degree one past whatever cap it was given, so this is the shape
+        // that says a refused corridor is named rather than silently dropped.
+        assert_eq!(body["hubs"][0]["degree"], 9, "{body}");
+        assert_eq!(body["hubs"][0]["id"], "PROJ-42", "{body}");
+        assert!(
+            body["token_estimate"].as_u64().is_some_and(|n| n > 0),
+            "{body}"
+        );
+
+        // Every bound reached the index. One absent from here is one the route could drop while the
+        // answer still looked plausible.
+        let call = &fake.calls()[0];
+        assert!(call.contains("depth: 2"), "{call}");
+        assert!(
+            call.contains("Window { from_ms: 1000, to_ms: 2000 }"),
+            "{call}"
+        );
+        assert!(call.contains("min_confidence: 0.7"), "{call}");
+        assert!(call.contains("max_degree: 8"), "{call}");
+        assert!(call.contains("limit: Some(7)"), "{call}");
+    }
+
+    /// A traversal without its whole window is refused, as a correlation is and for more reason.
+    #[tokio::test]
+    async fn a_traversal_without_a_window_is_refused_rather_than_run_over_a_whole_history() {
+        for target in [
+            "/linked/ticket/PROJ-42?depth=1",
+            "/linked/ticket/PROJ-42?depth=1&from_ms=1000",
+            "/linked/ticket/PROJ-42?depth=1&to_ms=2000",
+        ] {
+            let fake = Arc::new(Fake::new());
+            let (status, body) = serve(&fake, get(target, Some(READER))).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{target}: {body}");
+            assert!(
+                body["error"].as_str().unwrap_or_default().contains("hop"),
+                "the refusal has to say that the window binds every hop: {target}: {body}"
+            );
+            assert!(fake.calls().is_empty(), "{target} reached the index");
+        }
+    }
+
+    /// A depth this service will not run is refused rather than clamped to one it will.
+    ///
+    /// Clamped, a caller asking for three hops would be handed two and told nothing, and would
+    /// report the absence of a third-hop connection as a fact about the store. `3` is in the list
+    /// because it is the depth this endpoint used to answer: the frontier fills breadth-first and
+    /// spent all 200 edges on hops 1 and 2, so what came back was a two-hop answer wearing a
+    /// three-hop label. That is what the refusal below replaced.
+    #[tokio::test]
+    async fn a_depth_outside_what_the_frontier_can_answer_is_refused_rather_than_clamped() {
+        for depth in ["0", "3", "4", "99"] {
+            let fake = Arc::new(Fake::new());
+            let target = format!("/linked/ticket/PROJ-42?depth={depth}&from_ms=1&to_ms=2");
+            let (status, body) = serve(&fake, get(&target, Some(READER))).await;
+
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{target}: {body}");
+            assert!(
+                body["error"].as_str().unwrap_or_default().contains("depth"),
+                "{target}: {body}"
+            );
+            assert!(fake.calls().is_empty(), "{target} reached the index");
+        }
+        // The deep end says *why*, and the reason is the one thing a caller can act on: it tells
+        // them the answer they would have got was composed out of the hops they did not ask about.
+        // Asserted on the words rather than only the code, because a refusal that had drifted back
+        // to "out of range" would still be a `422`.
+        let fake = Arc::new(Fake::new());
+        let (status, body) = serve(
+            &fake,
+            get(
+                "/linked/ticket/PROJ-42?depth=3&from_ms=1&to_ms=2",
+                Some(READER),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let refusal = body["error"].as_str().unwrap_or_default();
+        for phrase in ["breadth-first", "no hop-3 edges at all", "per-hop budget"] {
+            assert!(
+                refusal.contains(phrase),
+                "the refusal has to say why a third hop would misrepresent itself: {refusal}"
+            );
+        }
+        // Depth 0 is refused for its own reason and must not be handed the frontier's.
+        let fake = Arc::new(Fake::new());
+        let (_, body) = serve(
+            &fake,
+            get(
+                "/linked/ticket/PROJ-42?depth=0&from_ms=1&to_ms=2",
+                Some(READER),
+            ),
+        )
+        .await;
+        let refusal = body["error"].as_str().unwrap_or_default();
+        assert!(
+            refusal.contains("/entities/") && !refusal.contains("breadth-first"),
+            "depth 0 is a different refusal from the frontier's: {refusal}"
+        );
+        // A depth that is not a number at all is refused before a handler runs, like any query
+        // string that will not parse.
+        let fake = Arc::new(Fake::new());
+        let (status, _) = serve(
+            &fake,
+            get(
+                "/linked/ticket/PROJ-42?depth=deep&from_ms=1&to_ms=2",
+                Some(READER),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The corridor cap may be lowered and not raised, and raising it is refused rather than clamped.
+    ///
+    /// A clamp would leave the caller believing the number it sent, which for a rule whose whole
+    /// purpose is that a request cannot buy its way past it is the one outcome worth refusing.
+    #[tokio::test]
+    async fn the_corridor_cap_may_be_lowered_and_not_raised() {
+        let fake = Arc::new(Fake::new());
+        let target = format!(
+            "/linked/ticket/PROJ-42?depth=1&from_ms=1&to_ms=2&max_degree={}",
+            yaam_store::query::CORRIDOR_DEGREE + 1
+        );
+        let (status, body) = serve(&fake, get(&target, Some(READER))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("lowered and not raised"),
+            "{body}"
+        );
+        assert!(fake.calls().is_empty());
+
+        // Lowering it reaches the index unchanged, which is the half that makes the refusal a rule
+        // rather than a ceiling nobody can move.
+        let fake = Arc::new(Fake::new());
+        let (status, _) = serve(
+            &fake,
+            get(
+                "/linked/ticket/PROJ-42?depth=1&from_ms=1&to_ms=2&max_degree=2",
+                Some(READER),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            fake.calls()[0].contains("max_degree: 2"),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// A traversal that named no floor, cap or page gets the service's own, and says so to the index.
+    #[tokio::test]
+    async fn a_traversal_that_names_no_bounds_still_carries_the_services_own() {
+        let fake = Arc::new(Fake::new());
+        let (status, _) = serve(
+            &fake,
+            get(
+                "/linked/ticket/PROJ-42?depth=1&from_ms=1&to_ms=2",
+                Some(READER),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let call = &fake.calls()[0];
+        assert!(call.contains("min_confidence: 1.0"), "{call}");
+        assert!(
+            call.contains(&format!(
+                "max_degree: {}",
+                yaam_store::query::CORRIDOR_DEGREE
+            )),
+            "{call}"
+        );
+        assert!(call.contains("limit: None"), "{call}");
     }
 
     /// A correlation with no window is refused, and that is a rule `GET /records` does not have.

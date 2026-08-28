@@ -25,6 +25,7 @@ index that makes it queryable in single-digit milliseconds.
 | **One audited way back to a sealed body** | `yaam unseal` publishes an operator-visible record naming who read the body and why, and only then fetches a key. A store that cannot record the read cannot answer it, so there is no path that returns a sealed body without a line saying it did. |
 | **Derived knowledge** | One note per entity under `knowledge/`, rebuilt wholesale from the record tree by `yaam knowledge build`. Every line restates a structured field some record declared and names the records it came from. Nothing is derived from a record whose body is erasable, so a key destruction has no aggregate to chase. |
 | **Correlation is one read** | *Which declines had a deploy near them* is a directional range join over the server-stamped clock, answered as pairs of records by `GET /correlate` — not two reads and an intersection performed by the caller. Its window is required rather than optional: a join whose left side is unbounded is a query whose answer moves with the store, and whose cost moves with the planner. |
+| **Traversal is record-mediated, and never through a hub** | *What else is connected to this, and how* is a recursive join over `entity_refs`, answered by `GET /linked/{kind}/{id}` as edges — two entities and the record naming both, so why they are connected needs no second read. Two entities are linked because a record says so; there is no edge table, because an edge with no record behind it could not be rebuilt from the tree. An entity is **reached** however busy it is and is not walked **through** above a capped number of references inside the window, and the ones the rule refused come back named, because "nothing else is connected" and "everything is, through this one node" are the same short answer otherwise. |
 | **Idempotent** | Every write is keyed. Replays, retries and re-drives are safe. |
 | **Redacted at the source** | The writer masks, the service only checks and refuses what is still unmasked — so a record's `fields_masked` is the writer's own account. `yaam_contract::mask` is the one implementation of masking, reading the same policy file the service checks against. |
 | **Portable** | Any harness that speaks HTTP can participate; a local sidecar handles signing and sealing, for reads as well as writes, so callers hold no keys. |
@@ -102,6 +103,12 @@ yaam-read bundle --entity ticket:PROJ-42 --actor agent_a --limit 5   # context f
 # answered as pairs. The window is required — see below.
 yaam-read correlate --left-action transact --left-outcome declined --right-action deploy \
           --left-from-ms 1787184000000 --left-to-ms 1787270400000 --within-ms 1800000
+
+# Two hops out from an order reference: what is connected to it, and by which records. The
+# depth and the window are required, and an entity too busy to be a corridor comes back named
+# rather than walked through.
+yaam-read linked --entity order_ref:ord10014733 --depth 2 \
+          --from-ms 1787184000000 --to-ms 1787270400000
 
 # …and a bundle for a caller that has a sentence rather than a list of entities.
 yaam-read bundle --infer-entities /srv/memory/spec --limit 5 \
@@ -303,13 +310,14 @@ asking.
 | entity history | `yaam-read history --entity kind:id [--min-confidence --limit]` | `RecordsResponse` |
 | full text | `yaam-read search --query TEXT [--limit]` | `RecordsResponse` |
 | correlation | `yaam-read correlate --within-ms MS --left-from-ms MS --left-to-ms MS [--left-action --left-outcome --left-agent --left-attr --right-action --right-outcome --right-agent --right-attr --limit]` | `CorrelationsResponse` |
+| traversal | `yaam-read linked --entity kind:id --depth N --from-ms MS --to-ms MS [--min-confidence --max-degree --limit]` | `LinksResponse` |
 | context | `yaam-read bundle [--entity kind:id …] [--actor --infer-entities --infer-from --deadline-ms --limit]` | `BundleResponse` |
 
-Five subcommands rather than one flat set of flags, because they are five questions and not five
+Six subcommands rather than one flat set of flags, because they are six questions and not six
 filters on one: `--query` is required for a search and meaningless to a bundle, a window narrows the
-filtered query and is *required* by a correlation, and the service answers a parameter it does not
-know with `400` rather than ignoring it. Flattened together, `--help` would describe a request surface
-that does not exist.
+filtered query and is *required* by a correlation and a traversal, and the service answers a parameter
+it does not know with `400` rather than ignoring it. Flattened together, `--help` would describe a
+request surface that does not exist.
 
 Nothing the caller did not name is sent. Every optional parameter has a documented default at the
 service, and a copy of one here would be a second place for it to be out of date.
@@ -343,8 +351,8 @@ deploys separately and intersecting them by hand leaves the caller doing arithme
 that were capped independently. Reading one entity's history inside a window is nearer, but it answers
 *what touched this ticket* and leaves which of those records happened near which to whoever read it —
 and it can only join records that already share an entity, where a correlation joins on time. Reach
-for `history` when the question is about a thing, and for `correlate` when it is about two events
-being near each other.
+for `history` when the question is about a thing, for `correlate` when it is about two events being
+near each other, and for `linked` — below — when it is about what a thing is connected *to*.
 
 **It is directional, and that is the flag people get backwards.** A pair comes back when the `right`
 record was stamped at or after the `left` one. So *"what was deployed just before this decline"* puts
@@ -365,6 +373,67 @@ right: the right side's window *is* the left side's plus `--within-ms`.
 `--limit` caps **pairs**, and the service's own cap is half its cap on the other reads, because a pair
 row is two records' frontmatter. A left record matching several right records comes back once per
 pair, repeated — narrow `--within-ms` rather than raising the limit.
+
+#### What else is connected to this
+
+`yaam-read linked` is the only read here whose answer is a graph. Every other read takes entities you
+can already name and answers with records; this one takes **one** entity and answers with **edges** —
+two entities, and the record naming both.
+
+```bash
+# Two hops out from an order reference. Hop one is the ticket the decline names; hop two is the
+# deploys that ticket carries, which the order reference itself never mentioned.
+yaam-read linked --entity order_ref:ord10014733 --depth 2 \
+          --from-ms 1787184000000 --to-ms 1787270400000
+```
+
+**A link is a record.** Two entities are linked because one record references both. There is no edge
+table and there is not going to be one: an edge with no record behind it is a claim this system could
+not rebuild from its own Markdown tree, which is the property `yaam reindex` rests on. Each edge
+carries the record that made it, as structure, so *why* two things are connected needs no second read
+— and a second read is where a scope predicate gets forgotten, which at a graph's worth of edges is a
+great many chances to forget it. The predicate is on the mediating record of **every** hop, inside the
+recursive query.
+
+**Never traverse through a hub.** An entity is *reached* however busy it is; above `--max-degree`
+references inside the window it is not walked *through*. Without that rule, the second hop of any
+question passing near a shared identifier answers "everything that identifier ever touched" — correct
+and useless. The entities the rule refused come back under `hubs` with the degree that refused them,
+because "nothing else is connected" and "everything is, through this one node" are the same short
+answer otherwise and call for opposite next moves. The cap may be **lowered and not raised**: raising
+it would be a request buying back the problem the rule exists to prevent.
+
+Degree is counted inside the request's own window and no further than one past the cap. An identifier
+that carried the world last month and three records during the hour under investigation is exactly the
+corridor that hour needs, and a lifetime count would refuse it. The **seed** is not capped: you named
+it, so asking about a busy identifier directly is what `history` is for, and the rule governs passing
+*through* a node nobody asked for.
+
+**Inferred references may end a path and may not extend one.** `--min-confidence` defaults to full
+confidence, which is a bundle's bar rather than an entity read's — a traversal *invents* the far end,
+and an inferred link presented as a discovery is indistinguishable from a fact. Lower it and inferred
+references become edges; they still never become corridors, because hop two would otherwise quietly
+launder what hop one was only willing to show with a confidence attached.
+
+`--depth` and the window are both required, and depth is **1 to 2**. `0` is what `history` already
+answers. `3` is refused, and the refusal gives the reason below rather than a range — an answer
+decided by its own bound is not a fact about the store.
+
+**The frontier is the sharp edge, and it is why the depth stops at two.** The recursion stops at 200
+edges whatever `--limit` says, and it fills breadth-first — so the cap is spent on near hops before
+far ones. Measured over 200,000 records, three hops from the busiest identifier over 30 days comes
+back as 115 hop-1 edges, 85 hop-2 edges and *no hop-3 edges at all*; unbounded it would have been
+347, and over the whole two years 35,845. A request for three hops answered entirely out of the first
+two is a defect in the shape of the answer, and nothing in the answer admits to it — so the third hop
+is refused instead. **A limit that refuses is better than one that substitutes a different answer.**
+The fix is a per-hop budget, which is not expressible as a `LIMIT` on the compound select this read
+is; when one is written the cap moves, and until then this measurement is why it sits where it does.
+
+The measurement stays here rather than leaving with the third hop, because it also describes the
+second: over a busy enough seed, two hops is a page of hop-1 edges and a few hop-2 ones, which is a
+ceiling on recall and not a claim that nothing further is connected. A deep question over a busy seed
+should narrow its window rather than raise its page. Over a quiet seed the whole neighbourhood fits
+and none of this bites: two hops from a long-tail identifier across two years is 17 edges in 0.7 ms.
 
 #### Naming the entities a caller does not know it has
 

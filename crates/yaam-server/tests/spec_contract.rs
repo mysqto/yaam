@@ -27,7 +27,7 @@ use yaam_crypto::envelope;
 use yaam_server::auth::{Caller, Credential, Keyring, Role};
 use yaam_server::routes::{AppState, router};
 use yaam_server::service::Service;
-use yaam_store::query::{Filter, Window};
+use yaam_store::query::{EntityKey, Filter, Link, Traversal, Window};
 
 /// The published contract.
 const SPEC: &str = include_str!("../../../spec/memory.v1.yaml");
@@ -145,6 +145,31 @@ impl Service for Fake {
     ) -> yaam_server::Result<Vec<(RecordStructure, RecordStructure)>> {
         self.gate()?;
         Ok(Vec::new())
+    }
+
+    fn linked(
+        &self,
+        _caller: &Caller,
+        traversal: &Traversal,
+    ) -> yaam_server::Result<Vec<Link<RecordStructure>>> {
+        self.gate()?;
+        // One edge, and one whose degree puts it past the corridor cap: an empty answer would let
+        // the `hubs` half of the documented shape go unchecked, and that half is the whole of what
+        // says a short traversal stopped for a reason.
+        Ok(vec![Link {
+            from: EntityKey {
+                kind: traversal.kind.clone(),
+                id: traversal.id.clone(),
+            },
+            to: EntityKey {
+                kind: "ticket".to_owned(),
+                id: "PROJ-42".to_owned(),
+            },
+            hop: 1,
+            confidence: 1.0,
+            degree: traversal.max_degree + 1,
+            via: RecordStructure::from(&record(WRITER)),
+        }])
     }
 
     fn bundle(&self, _caller: &Caller, _request: &bundle::Request) -> yaam_server::Result<Bundle> {
@@ -274,6 +299,7 @@ fn cases() -> Vec<Case> {
     all.extend(search_cases());
     all.extend(entity_cases());
     all.extend(correlate_cases());
+    all.extend(linked_cases());
     all.extend(bundle_cases());
     all.extend(erase_cases());
     all
@@ -492,6 +518,77 @@ fn correlate_cases() -> Vec<Case> {
         ),
         case("GET", path, uri, Some(READER), "", Mode::Internal),
         case("GET", path, uri, Some(READER), "", Mode::Unavailable),
+    ]
+}
+
+fn linked_cases() -> Vec<Case> {
+    let template = "/linked/{kind}/{id}";
+    // A depth and a whole window: the three this endpoint refuses to guess at, so every case meaning
+    // to reach a handler carries all of them.
+    let uri = "/linked/order_ref/ord10014733?depth=2&from_ms=10&to_ms=20";
+    vec![
+        case("GET", template, uri, Some(READER), "", Mode::Stored),
+        case(
+            "GET",
+            template,
+            format!("{uri}&nonsense=1"),
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case("GET", template, uri, None, "", Mode::Stored),
+        // Permanent, and each for its own reason: a seed this deployment cannot canonicalise, half a
+        // window, the first depth past what the frontier can honestly answer, a depth far past it, a
+        // depth of zero, and a corridor cap above the service's own — which may be lowered and not
+        // raised.
+        case("GET", template, uri, Some(READER), "", Mode::Unaskable),
+        case(
+            "GET",
+            template,
+            "/linked/order_ref/ord10014733?depth=2&from_ms=10",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        // `3` on its own line because it is the boundary that moved: the document published it as
+        // answerable once, and the router has to refuse it for the document to still be true.
+        case(
+            "GET",
+            template,
+            "/linked/order_ref/ord10014733?depth=3&from_ms=10&to_ms=20",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case(
+            "GET",
+            template,
+            "/linked/order_ref/ord10014733?depth=9&from_ms=10&to_ms=20",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case(
+            "GET",
+            template,
+            "/linked/order_ref/ord10014733?depth=0&from_ms=10&to_ms=20",
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case(
+            "GET",
+            template,
+            format!(
+                "/linked/order_ref/ord10014733?depth=1&from_ms=10&to_ms=20&max_degree={}",
+                yaam_store::query::CORRIDOR_DEGREE + 1
+            ),
+            Some(READER),
+            "",
+            Mode::Stored,
+        ),
+        case("GET", template, uri, Some(READER), "", Mode::Internal),
+        case("GET", template, uri, Some(READER), "", Mode::Unavailable),
     ]
 }
 
@@ -841,6 +938,11 @@ async fn the_documented_query_parameters_are_the_ones_each_endpoint_accepts() {
             "/entities/ticket/PROJ-42?nonsense=1",
         ),
         ("/correlate", "get", "/correlate?nonsense=1"),
+        (
+            "/linked/{kind}/{id}",
+            "get",
+            "/linked/order_ref/ord10014733?nonsense=1",
+        ),
         ("/bundle", "get", "/bundle?nonsense=1"),
     ];
     for (template, method, uri) in probes {
@@ -902,6 +1004,91 @@ fn the_documented_pair_cap_is_the_one_the_index_applies() {
     assert!(
         described.contains(&format!("`{}`", yaam_store::query::DEFAULT_STRUCTURE_LIMIT)),
         "the pair cap is only meaningful beside the row cap it halves: {described}"
+    );
+}
+
+#[test]
+fn the_documented_traversal_bounds_are_the_ones_the_index_applies() {
+    // Four numbers a client plans around and cannot discover: how deep it may ask, how many edges
+    // the recursion will ever materialise, the corridor cap it may lower and not raise, and what a
+    // further hop is worth. A drifted one is a client that believes a bound the service does not
+    // have — and for the corridor cap, one that believes it can raise a safety rule.
+    let spec = spec();
+    let described = node(
+        &spec,
+        &["paths", "/linked/{kind}/{id}", "get", "description"],
+    )
+    .as_str()
+    .expect("the endpoint is described");
+    for named in [
+        format!("{}", yaam_store::query::MAX_DEPTH),
+        format!("{}", yaam_store::query::MAX_FRONTIER),
+        format!("{}", yaam_store::query::CORRIDOR_DEGREE),
+        format!("{}", yaam_store::query::DEFAULT_LINK_LIMIT),
+        format!("{:.1}", yaam_store::query::FULL_CONFIDENCE),
+    ] {
+        let literal = format!("`{named}`");
+        assert!(
+            described.contains(&literal),
+            "the traversal description does not name {literal}: {described}"
+        );
+    }
+    // The corridor cap is also the schema's maximum, because that is the half a generated client
+    // enforces — a description saying "may not be raised" and a schema that admits anything is a
+    // rule only the polite clients keep.
+    assert_eq!(
+        node(
+            &spec,
+            &[
+                "components",
+                "parameters",
+                "max_degree",
+                "schema",
+                "maximum"
+            ]
+        )
+        .as_integer(),
+        Some(i64::from(yaam_store::query::CORRIDOR_DEGREE)),
+    );
+    assert_eq!(
+        node(
+            &spec,
+            &["components", "parameters", "depth", "schema", "maximum"]
+        )
+        .as_integer(),
+        Some(i64::from(yaam_store::query::MAX_DEPTH)),
+    );
+    assert_eq!(
+        node(
+            &spec,
+            &[
+                "components",
+                "parameters",
+                "link_limit",
+                "schema",
+                "maximum"
+            ]
+        )
+        .as_integer(),
+        Some(i64::from(yaam_store::query::MAX_FRONTIER)),
+    );
+    // And the attenuation, which a client cannot compute from anything else in the document.
+    let score = node(
+        &spec,
+        &[
+            "components",
+            "schemas",
+            "LinkedEdge",
+            "properties",
+            "score",
+            "description",
+        ],
+    )
+    .as_str()
+    .expect("the score is described");
+    assert!(
+        score.contains(&format!("`{}`", yaam_store::query::HOP_ATTENUATION)),
+        "the score description does not name the attenuation: {score}"
     );
 }
 

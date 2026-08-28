@@ -1920,3 +1920,401 @@ fn a_batch_dropped_without_committing_writes_nothing() {
         "a batch that never committed must leave the index exactly as it was"
     );
 }
+
+/// The whole day the traversal fixtures below are written into.
+///
+/// Every traversal takes a window, so the tests need one that admits everything before they can
+/// narrow it and assert that narrowing bit.
+const WHOLE_DAY: Window = Window {
+    from_ms: 1_787_184_000_000,
+    to_ms: 1_787_270_400_000,
+};
+
+/// A record naming a set of entities at full confidence.
+fn linking(received_at: &str, entities: &[(&str, &str)]) -> ActionRecord {
+    ActionRecord {
+        entities: entities
+            .iter()
+            .map(|(kind, id)| entity_ref(kind, id, 1.0))
+            .collect(),
+        ..record("note", Outcome::Success, received_at)
+    }
+}
+
+/// The traversal every test below varies one field of.
+fn from_seed(kind: &str, id: &str, depth: u32) -> query::Traversal {
+    query::Traversal {
+        kind: kind.to_owned(),
+        id: id.to_owned(),
+        depth,
+        window: WHOLE_DAY,
+        min_confidence: query::FULL_CONFIDENCE,
+        max_degree: query::CORRIDOR_DEGREE,
+        limit: None,
+        scope: ALL,
+    }
+}
+
+/// Each edge as `hop from>to`, which is the whole of what a traversal claims minus its evidence.
+fn edges<R>(links: &[query::Link<R>]) -> Vec<String> {
+    links
+        .iter()
+        .map(|link| {
+            format!(
+                "{} {}:{}>{}:{}",
+                link.hop, link.from.kind, link.from.id, link.to.kind, link.to.id
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_second_hop_reaches_what_the_seed_never_named() {
+    // The capability that did not exist: an entity two records away, and the record that connects
+    // it. Without the hop-two rows this is `by_entity` with extra steps.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    let near = linking(
+        "2026-08-20T09:00:00Z",
+        &[("order_ref", "ord1"), ("ticket", "PROJ-1")],
+    );
+    publish(&mut writer, &near).expect("publish");
+    let far = linking(
+        "2026-08-20T10:00:00Z",
+        &[("ticket", "PROJ-1"), ("deploy", "api/prod#1")],
+    );
+    publish(&mut writer, &far).expect("publish");
+
+    let store = Store::open_read(&path).expect("open read");
+    let one = query::linked(&store, &from_seed("order_ref", "ord1", 1)).expect("linked");
+    assert_eq!(edges(&one), ["1 order_ref:ord1>ticket:PROJ-1"]);
+
+    let two = query::linked(&store, &from_seed("order_ref", "ord1", 2)).expect("linked");
+    assert_eq!(
+        edges(&two),
+        [
+            "1 order_ref:ord1>ticket:PROJ-1",
+            "2 ticket:PROJ-1>deploy:api/prod#1"
+        ],
+        "the deploy is reachable and the order reference never named it"
+    );
+    // The evidence travels with the claim: the record that made the second hop is the one nobody
+    // could have asked for, because its identifier is not in the answer to any read the caller made
+    // first.
+    let structured =
+        query::linked_structures(&store, &from_seed("order_ref", "ord1", 2)).expect("linked");
+    assert_eq!(structured[1].via.record_id.as_str(), far.record_id.as_str());
+    assert_eq!(structured[1].hop, 2);
+}
+
+#[test]
+fn a_hub_is_reached_and_is_not_a_corridor() {
+    // The rule copied outright rather than learned again. A shared identifier that everything names
+    // turns the second hop of every question into "everything that identifier ever touched", and the
+    // answer is correct and useless.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    publish(
+        &mut writer,
+        &linking(
+            "2026-08-20T09:00:00Z",
+            &[("order_ref", "ord1"), ("chat_channel", "everything")],
+        ),
+    )
+    .expect("publish");
+    // Forty records on the channel, each naming a ticket of its own: a degree the shipped cap
+    // refuses, and forty second-hop edges if it does not.
+    for n in 0..40 {
+        publish(
+            &mut writer,
+            &linking(
+                "2026-08-20T10:00:00Z",
+                &[
+                    ("chat_channel", "everything"),
+                    ("ticket", &format!("PROJ-{n}")),
+                ],
+            ),
+        )
+        .expect("publish");
+    }
+
+    let store = Store::open_read(&path).expect("open read");
+    let asked = from_seed("order_ref", "ord1", 2);
+    let links = query::linked(&store, &asked).expect("linked");
+    assert_eq!(
+        edges(&links),
+        ["1 order_ref:ord1>chat_channel:everything"],
+        "the channel is reached; nothing is reached through it"
+    );
+    // Reached and refused, said out loud. Otherwise "this is a hub" and "nothing else is connected"
+    // are the same short answer, and they call for opposite next moves.
+    assert!(links[0].hub(&asked), "{:?}", links[0]);
+    assert_eq!(
+        links[0].degree,
+        query::CORRIDOR_DEGREE + 1,
+        "the degree is counted no further than one past the cap"
+    );
+
+    // Raise the cap past the hub and the second hop opens: the rule is what stopped it, not the
+    // absence of anything to find.
+    let wide = query::Traversal {
+        max_degree: 64,
+        ..asked
+    };
+    assert_eq!(
+        query::linked(&store, &wide).expect("linked").len(),
+        41,
+        "one edge to the hub and forty through it"
+    );
+}
+
+#[test]
+fn a_hub_outside_the_window_is_a_corridor_inside_it() {
+    // Why the degree is counted in the traversal's own window rather than read out of the entity
+    // catalogue, which would have been free. An identifier that carried the world last month and
+    // three records during the hour under investigation is exactly the corridor that hour needs.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    publish(
+        &mut writer,
+        &linking(
+            "2026-08-20T09:00:00Z",
+            &[("order_ref", "ord1"), ("chat_channel", "busy")],
+        ),
+    )
+    .expect("publish");
+    publish(
+        &mut writer,
+        &linking(
+            "2026-08-20T09:30:00Z",
+            &[("chat_channel", "busy"), ("deploy", "api/prod#1")],
+        ),
+    )
+    .expect("publish");
+    for n in 0..40 {
+        publish(
+            &mut writer,
+            &linking(
+                "2026-07-02T10:00:00Z",
+                &[("chat_channel", "busy"), ("ticket", &format!("OLD-{n}"))],
+            ),
+        )
+        .expect("publish");
+    }
+
+    let store = Store::open_read(&path).expect("open read");
+    let inside = query::linked(&store, &from_seed("order_ref", "ord1", 2)).expect("linked");
+    assert_eq!(
+        edges(&inside),
+        [
+            "1 order_ref:ord1>chat_channel:busy",
+            "2 chat_channel:busy>deploy:api/prod#1"
+        ],
+        "a lifetime degree would have refused this hop over records the window excludes"
+    );
+
+    // Widen the window over the old traffic and the same node stops being a corridor.
+    let widened = query::Traversal {
+        window: Window {
+            from_ms: 1_782_950_400_000,
+            to_ms: WHOLE_DAY.to_ms,
+        },
+        ..from_seed("order_ref", "ord1", 2)
+    };
+    assert_eq!(
+        edges(&query::linked(&store, &widened).expect("linked")),
+        ["1 order_ref:ord1>chat_channel:busy"]
+    );
+}
+
+#[test]
+fn an_inferred_reference_ends_a_path_and_does_not_extend_one() {
+    // Two tiers, and the second is the one a floor alone would lose. Lowering the floor is a caller
+    // saying it will look at a guess; it is not a caller asking for a neighbourhood reached by
+    // walking through one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    let guessed = ActionRecord {
+        entities: vec![
+            entity_ref("order_ref", "ord1", 1.0),
+            entity_ref("ticket", "PROJ-1", 0.7),
+        ],
+        ..record("note", Outcome::Success, "2026-08-20T09:00:00Z")
+    };
+    publish(&mut writer, &guessed).expect("publish");
+    publish(
+        &mut writer,
+        &linking(
+            "2026-08-20T10:00:00Z",
+            &[("ticket", "PROJ-1"), ("deploy", "api/prod#1")],
+        ),
+    )
+    .expect("publish");
+
+    let store = Store::open_read(&path).expect("open read");
+    // At the default floor the guess is not even an edge.
+    assert!(
+        query::linked(&store, &from_seed("order_ref", "ord1", 2))
+            .expect("linked")
+            .is_empty()
+    );
+
+    let tolerant = query::Traversal {
+        min_confidence: 0.5,
+        ..from_seed("order_ref", "ord1", 2)
+    };
+    let links = query::linked(&store, &tolerant).expect("linked");
+    assert_eq!(
+        edges(&links),
+        ["1 order_ref:ord1>ticket:PROJ-1"],
+        "the guess is reported and the deploy behind it is not"
+    );
+    assert!(
+        (links[0].confidence - 0.7).abs() < f32::EPSILON,
+        "an edge is no stronger than the weaker of the two references behind it: {:?}",
+        links[0]
+    );
+}
+
+#[test]
+fn every_hop_answers_to_the_scope_the_caller_asked_with() {
+    // The failure a scope test at the seed alone would let through: A and C are connected, said out
+    // loud, on the evidence of a record the caller may not read.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    publish(
+        &mut writer,
+        &linking(
+            "2026-08-20T09:00:00Z",
+            &[("order_ref", "ord1"), ("ticket", "PROJ-1")],
+        ),
+    )
+    .expect("publish");
+    publish(
+        &mut writer,
+        &ActionRecord {
+            visibility: Visibility::Team,
+            team: Some("support".to_owned()),
+            ..linking(
+                "2026-08-20T10:00:00Z",
+                &[("ticket", "PROJ-1"), ("deploy", "api/prod#1")],
+            )
+        },
+    )
+    .expect("publish");
+
+    let store = Store::open_read(&path).expect("open read");
+    let outsider = Scope::Caller {
+        visibility: vec![Visibility::Org, Visibility::Team, Visibility::Owner],
+        agent: "deploy_bot".to_owned(),
+        teams: vec!["platform".to_owned()],
+    };
+    let narrowed = query::Traversal {
+        scope: outsider,
+        ..from_seed("order_ref", "ord1", 2)
+    };
+    assert_eq!(
+        edges(&query::linked(&store, &narrowed).expect("linked")),
+        ["1 order_ref:ord1>ticket:PROJ-1"],
+        "the second hop rests on a record this caller may not read"
+    );
+    // The same question from inside the team reaches it, which is what says the predicate is a scope
+    // test and not an accident of the fixtures.
+    let insider = query::Traversal {
+        scope: Scope::Caller {
+            visibility: vec![Visibility::Org, Visibility::Team, Visibility::Owner],
+            agent: "chat_bot".to_owned(),
+            teams: vec!["support".to_owned()],
+        },
+        ..from_seed("order_ref", "ord1", 2)
+    };
+    assert_eq!(query::linked(&store, &insider).expect("linked").len(), 2);
+}
+
+#[test]
+fn a_traversal_returns_to_neither_the_seed_nor_the_node_it_left() {
+    // Both would read as discoveries and neither is one: the seed is what the caller asked about,
+    // and an edge from a node back to itself is a record naming it twice.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+
+    publish(
+        &mut writer,
+        &linking(
+            "2026-08-20T09:00:00Z",
+            &[("order_ref", "ord1"), ("ticket", "PROJ-1")],
+        ),
+    )
+    .expect("publish");
+    publish(
+        &mut writer,
+        &linking(
+            "2026-08-20T10:00:00Z",
+            &[("ticket", "PROJ-1"), ("order_ref", "ord1")],
+        ),
+    )
+    .expect("publish");
+
+    let store = Store::open_read(&path).expect("open read");
+    let links = query::linked(&store, &from_seed("order_ref", "ord1", 3)).expect("linked");
+    assert_eq!(
+        edges(&links),
+        [
+            "1 order_ref:ord1>ticket:PROJ-1",
+            "1 order_ref:ord1>ticket:PROJ-1"
+        ],
+        "two records name the pair, so there are two edges and no cycle: {links:?}"
+    );
+    assert_ne!(
+        links[0].via.as_str(),
+        links[1].via.as_str(),
+        "one edge per record, not one per pair"
+    );
+}
+
+#[test]
+fn a_traversal_page_is_capped_whether_or_not_the_caller_names_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("index.db");
+    let mut writer = Writer::open(&path).expect("open writer");
+    for n in 0..5 {
+        publish(
+            &mut writer,
+            &linking(
+                "2026-08-20T09:00:00Z",
+                &[("order_ref", "ord1"), ("ticket", &format!("PROJ-{n}"))],
+            ),
+        )
+        .expect("publish");
+    }
+
+    let store = Store::open_read(&path).expect("open read");
+    assert_eq!(
+        query::linked(&store, &from_seed("order_ref", "ord1", 1))
+            .expect("linked")
+            .len(),
+        5
+    );
+    let paged = query::Traversal {
+        limit: Some(2),
+        ..from_seed("order_ref", "ord1", 1)
+    };
+    assert_eq!(query::linked(&store, &paged).expect("linked").len(), 2);
+    // A traversal nobody scoped answers nothing rather than everything, at every hop.
+    let unscoped = query::Traversal {
+        scope: Scope::Nothing,
+        ..from_seed("order_ref", "ord1", 2)
+    };
+    assert!(query::linked(&store, &unscoped).expect("linked").is_empty());
+}

@@ -9,13 +9,16 @@
 //! it was told about.
 //!
 //! The set is a table rather than a test per question, so adding a case is a row rather than a
-//! function — the difference between a set that grows and one that rots. Two rules make the rows
+//! function — the difference between a set that grows and one that rots. Three rules make the rows
 //! carry their weight:
 //!
 //! * Every row states the *exact* set it must return, so each positive case is also a check against
 //!   false positives. A query matching everything finds the record too.
 //! * Several rows must return nothing at all. That half matters as much as the other: "returns the
 //!   record" is trivially satisfiable, and only the empty rows say the predicate discriminates.
+//! * A question this service *refuses* is a row too, stating the refusal and the words it must
+//!   carry. A refusal is an answer an operator acts on, and a question that stopped being refused
+//!   would otherwise start being answered with nothing red.
 //!
 //! Answers are asserted against *structure*. A read hands back a record's frontmatter and never its
 //! prose, so each case names the fields its question was about, and the runner additionally checks
@@ -27,7 +30,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Method, Request, header};
+use axum::http::{Method, Request, StatusCode, header};
 use serde_json::Value;
 use tower::ServiceExt;
 use yaam_contract::{
@@ -291,6 +294,27 @@ const FIXTURES: &[Fixture] = &[
         body: "The reply was refused by the channel and never reached anybody.",
         subject: None,
     },
+    // Team-scoped, and the one record on the traversal path that is. Every other record reachable
+    // from `ord10014733` is org-visible, so without this a traversal's scope test could only be
+    // asserted at the seed — and the hop where a scope predicate is easiest to forget is the second
+    // one. It is stamped before every other record on that path, so it sorts last in the entity
+    // histories it joins rather than reshuffling them.
+    Fixture {
+        label: "reply_release_room",
+        agent: "chat_bot",
+        received_at: "2026-08-20T08:00:00Z",
+        action: "reply",
+        outcome: Outcome::Success,
+        attrs: &[
+            ("channel_kind", Attr::Text("channel")),
+            ("chunks", Attr::Int(1)),
+        ],
+        entities: &[("chat_channel", "release-room"), ("ticket", "PROJ-42")],
+        visibility: Visibility::Team,
+        team: Some("support"),
+        body: "Posted the current status to the release room.",
+        subject: None,
+    },
     // Two passes over one pull request, an hour apart. A single review record could not tell a
     // timeline that is ordered from one that happens to hold a single row, and the verdict is what
     // changes between them: the question "is this still blocked" is answered by the newer one.
@@ -364,6 +388,15 @@ enum Ask {
     /// full-text row is a set like a bundle's. It asserts at the same layer as every row above: the
     /// needle is signed into the request target and the answer is the structure the route returned.
     Search(&'static str),
+    /// A signed traversal at `GET /linked/{kind}/{id}`, whose answer is a graph rather than records.
+    ///
+    /// Ordered: nearest hop first, and within a hop the newest evidence first. A row spells each edge
+    /// as `h<hop> <from>><to> via <label>`, so the hop is *in* the expectation — a traversal that
+    /// leaked past its depth answers with edges no row spells, and the failure names them. After the
+    /// edges a row lists the entities the corridor rule refused, as `hub <kind>:<id> degree <n>`,
+    /// because a short answer with no hubs and a short answer that stopped at one are the same
+    /// length and call for opposite next moves.
+    Linked(&'static str),
     /// A signed correlation at `GET /correlate`, whose answer is pairs rather than records.
     ///
     /// Ordered, and the order carries the direction: newest left record first, and within one left
@@ -371,6 +404,19 @@ enum Ask {
     /// went red is legible without opening the fixtures — and a join that stopped being directional
     /// would answer with pairs no row spells.
     Correlated(&'static str),
+    /// A signed read this service refuses, and the phrases the refusal must carry.
+    ///
+    /// The status *and* the words, because a refusal is an answer: the code is what a client
+    /// branches on, and the sentence is what an operator acts on. A bound stated as a range is one a
+    /// caller argues with; a bound stated as what the answer would have been made of is one they can
+    /// work around. A row here asserts both, so a refusal that drifted back to "out of range" fails
+    /// while still returning `422`.
+    Refused {
+        /// The request target, with `{from}` and `{to}` filled in as for any other row.
+        uri: &'static str,
+        /// Fragments the refusal must contain, in any order.
+        saying: &'static [&'static str],
+    },
 }
 
 /// What the answer must carry for the question to have been answered.
@@ -519,7 +565,12 @@ const GOLDEN: &[Case] = &[
         ask: Ask::Ordered("/entities/ticket/PROJ-42?from_ms={from}&to_ms={to}"),
         window: Some(RECENTLY),
         agent: "ops_bot",
-        finds: &["deploy_failed", "transact_declined_on_ticket", "deploy_ok"],
+        finds: &[
+            "deploy_failed",
+            "transact_declined_on_ticket",
+            "deploy_ok",
+            "reply_release_room",
+        ],
         needs: &[Needs::Entity("ticket:PROJ-42")],
     },
     // What the intersection is *for*: the reference both sides carry. This is the read that makes the
@@ -533,6 +584,7 @@ const GOLDEN: &[Case] = &[
             "deploy_failed",
             "transact_declined_on_ticket",
             "deploy_ok",
+            "reply_release_room",
             "deploy_stale",
         ],
         needs: &[Needs::Entity("ticket:PROJ-42")],
@@ -610,6 +662,7 @@ const GOLDEN: &[Case] = &[
             "deploy_failed",
             "transact_declined_on_ticket",
             "deploy_ok",
+            "reply_release_room",
             "deploy_stale",
         ],
         needs: &[Needs::Entity("ticket:PROJ-42")],
@@ -661,6 +714,7 @@ const GOLDEN: &[Case] = &[
             "deploy_failed",
             "deploy_ok",
             "deploy_stale",
+            "reply_release_room",
             "transact_declined_on_ticket",
         ],
         needs: &[Needs::Entity("ticket:PROJ-42")],
@@ -798,6 +852,127 @@ const GOLDEN: &[Case] = &[
         finds: &[],
         needs: &[],
     },
+    // ---- entity to entity: what else is connected to this, and how ----
+    //
+    // The capability that did not exist. Every row above takes entities somebody can already name;
+    // these take one and answer with the graph the records imply. The seed is the order reference
+    // the decline carries, and nothing it is named by mentions a deploy at all -- so every hop-2
+    // edge below is a fact no other read here can produce.
+    Case {
+        question: "what else is connected to this order reference, two hops out",
+        ask: Ask::Linked("/linked/order_ref/ord10014733?depth=2&from_ms={from}&to_ms={to}"),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        // One hop-1 edge -- the ticket the decline names -- and three hop-2 edges through it, each
+        // carrying the record that made it. `deploy_stale` names the same ticket from outside the
+        // window and is absent, which is what says the window binds at the second hop and not only
+        // at the first.
+        finds: &[
+            "h1 order_ref:ord10014733>ticket:PROJ-42 via transact_declined_on_ticket",
+            "h2 ticket:PROJ-42>deploy:api/production#1042 via deploy_failed",
+            "h2 ticket:PROJ-42>deploy:api/staging#1041 via deploy_ok",
+            "h2 ticket:PROJ-42>chat_channel:release-room via reply_release_room",
+        ],
+        // Every returned record names the ticket the traversal walked through, which is the
+        // evidence: an edge is a record naming both ends, and the ticket is one end of all four.
+        needs: &[Needs::Entity("ticket:PROJ-42")],
+    },
+    // One hop, same seed, same window. The tripwire for a hop leaking past its depth: the three
+    // hop-2 edges above are still there to be found, and `depth` is the only thing not finding them.
+    Case {
+        question: "what is connected to this order reference one hop out",
+        ask: Ask::Linked("/linked/order_ref/ord10014733?depth=1&from_ms={from}&to_ms={to}"),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        finds: &["h1 order_ref:ord10014733>ticket:PROJ-42 via transact_declined_on_ticket"],
+        needs: &[Needs::Entity("ticket:PROJ-42")],
+    },
+    // Three hops, which this service answered when the endpoint shipped and refuses now. The row is
+    // the same row, and that is the point of it.
+    //
+    // What it used to state was seven edges, and the seven were real *here*: this fixture set is
+    // small enough that a whole three-hop neighbourhood fits inside the 200-edge frontier, so the
+    // row passed. The defect it could not see is that the frontier is filled breadth-first -- over a
+    // seed busy enough to fill it, the same request comes back as hops 1 and 2 and nothing else,
+    // wearing a three-hop label, and no fixture set an operator can read in one screen reproduces
+    // that. So the row stops asserting the seven edges, which were never the claim under test, and
+    // asserts the refusal: the status, and the sentence that says what the answer would have been
+    // composed of.
+    //
+    // Deleted instead of rewritten, this would have been a claim nobody makes. The third hop is one
+    // line in a range check away from coming back, and it would come back with nothing red.
+    Case {
+        question: "three hops, which the frontier cannot fill honestly",
+        ask: Ask::Refused {
+            uri: "/linked/order_ref/ord10014733?depth=3&from_ms={from}&to_ms={to}",
+            // The reason, not the range. Each phrase is a thing the caller could not work out from
+            // a bare bound: the shape of the frontier, what a third hop would have been made of,
+            // and the fix that does not exist yet.
+            saying: &[
+                "1 to 2 hops",
+                "breadth-first",
+                "no hop-3 edges at all",
+                "under a third hop's name",
+                "per-hop budget",
+            ],
+        },
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        finds: &[],
+        needs: &[],
+    },
+    // The corridor rule, fired. `ticket:PROJ-42` carries four references inside this window, so a cap
+    // of three makes it a hub: it is still *reached*, and nothing is reached *through* it. This is
+    // the row that goes red if the rule stops firing -- it would then answer the four edges of the
+    // first row and name no hub at all.
+    Case {
+        question: "the same two hops, with the corridor cap below what the ticket carries",
+        ask: Ask::Linked(
+            "/linked/order_ref/ord10014733?depth=2&max_degree=3&from_ms={from}&to_ms={to}",
+        ),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        finds: &[
+            "h1 order_ref:ord10014733>ticket:PROJ-42 via transact_declined_on_ticket",
+            "hub ticket:PROJ-42 degree 4",
+        ],
+        needs: &[Needs::Entity("ticket:PROJ-42")],
+    },
+    // Scope, at the second hop. The same question as the first row, asked by a caller in `platform`
+    // and not `support`: the release-room edge rests on a team-scoped record it may not read, and it
+    // is the only one of the four that changes. A traversal scoped at the seed alone -- or scoped
+    // after the join -- would answer this row with all four edges, and would be telling this caller
+    // that the ticket and the release room are connected on evidence no read admits it to.
+    Case {
+        question: "the same two hops, asked by a caller outside the team that holds one record",
+        ask: Ask::Linked("/linked/order_ref/ord10014733?depth=2&from_ms={from}&to_ms={to}"),
+        window: Some(RECENTLY),
+        agent: "deploy_bot",
+        finds: &[
+            "h1 order_ref:ord10014733>ticket:PROJ-42 via transact_declined_on_ticket",
+            "h2 ticket:PROJ-42>deploy:api/production#1042 via deploy_failed",
+            "h2 ticket:PROJ-42>deploy:api/staging#1041 via deploy_ok",
+        ],
+        needs: &[Needs::Entity("ticket:PROJ-42")],
+    },
+    // The window narrowed to the hour the decline happened in. `reply_release_room` is at 08:00 and
+    // drops out of the second hop -- and out of the ticket's degree with it, which is the other half
+    // of "the degree is counted inside the traversal's own window": the same ticket that was a hub at
+    // `max_degree=3` over the whole day carries three references in this hour and is a corridor.
+    Case {
+        question: "the same two hops, narrowed to the hour the decline happened in",
+        ask: Ask::Linked(
+            "/linked/order_ref/ord10014733?depth=2&max_degree=3&from_ms={from}&to_ms={to}",
+        ),
+        window: Some(FIRST_DECLINE_HOUR),
+        agent: "ops_bot",
+        finds: &[
+            "h1 order_ref:ord10014733>ticket:PROJ-42 via transact_declined_on_ticket",
+            "h2 ticket:PROJ-42>deploy:api/production#1042 via deploy_failed",
+            "h2 ticket:PROJ-42>deploy:api/staging#1041 via deploy_ok",
+        ],
+        needs: &[Needs::Entity("ticket:PROJ-42")],
+    },
     // ---- and the rows that must return nothing ----
     Case {
         question: "did any transaction succeed",
@@ -878,6 +1053,33 @@ const GOLDEN: &[Case] = &[
         agent: "ops_bot",
         finds: &[],
         needs: &[],
+    },
+    // An entity nothing was ever recorded under, asked as a graph. A traversal that answered this
+    // with anything would be inventing edges, and "what is this connected to" is the question an
+    // investigation starts from.
+    Case {
+        question: "what is connected to a business reference nobody ever recorded",
+        ask: Ask::Linked("/linked/order_ref/ord99999999?depth=2&from_ms={from}&to_ms={to}"),
+        window: Some(RECENTLY),
+        agent: "ops_bot",
+        finds: &[],
+        needs: &[],
+    },
+    // The same seed and the same window as the flagship traversal, asked by a caller in no team --
+    // whose one visible record on that path is the decline itself. The ticket is still reached,
+    // because the record that names both is org-visible; nothing beyond it is, because the caller
+    // may read none of the three records that would have carried it there.
+    Case {
+        question: "the same two hops, asked by a caller in no team",
+        ask: Ask::Linked("/linked/order_ref/ord10014733?depth=2&from_ms={from}&to_ms={to}"),
+        window: Some(RECENTLY),
+        agent: "audit_reader",
+        finds: &[
+            "h1 order_ref:ord10014733>ticket:PROJ-42 via transact_declined_on_ticket",
+            "h2 ticket:PROJ-42>deploy:api/production#1042 via deploy_failed",
+            "h2 ticket:PROJ-42>deploy:api/staging#1041 via deploy_ok",
+        ],
+        needs: &[Needs::Entity("ticket:PROJ-42")],
     },
     Case {
         question: "does a needle nothing was written with match anything",
@@ -985,8 +1187,27 @@ fn attr_value(attr: Attr) -> attrs::Value {
     }
 }
 
-/// Signs and sends one request, asserting only that it was answered.
+/// Signs and sends one request, asserting only that it was answered successfully.
 async fn send(app: &axum::Router, method: Method, uri: &str, agent: &str, body: &[u8]) -> String {
+    let (status, text) = send_raw(app, method.clone(), uri, agent, body).await;
+    assert!(
+        status.is_success(),
+        "{method} {uri} as {agent} answered {status}: {text}"
+    );
+    text
+}
+
+/// Signs and sends one request, and hands back whatever came of it.
+///
+/// Split out of [`send`] for the rows that assert a *refusal*: the status is the thing under test
+/// there, so it cannot also be the harness's precondition.
+async fn send_raw(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    agent: &str,
+    body: &[u8],
+) -> (StatusCode, String) {
     let request = Request::builder()
         .method(method.clone())
         .uri(uri)
@@ -1005,11 +1226,7 @@ async fn send(app: &axum::Router, method: Method, uri: &str, agent: &str, body: 
         .await
         .expect("a body");
     let text = String::from_utf8(bytes.to_vec()).expect("a JSON answer");
-    assert!(
-        status.is_success(),
-        "{method} {uri} as {agent} answered {status}: {text}"
-    );
-    text
+    (status, text)
 }
 
 /// Writes every fixture through `POST /records`, and returns each label's record.
@@ -1049,6 +1266,12 @@ struct Answer {
     records: Vec<RecordStructure>,
     /// The pairs a correlation answered, empty for every other read.
     pairs: Vec<(RecordStructure, RecordStructure)>,
+    /// The edges a traversal answered, as `hop`, `from`, `to` and the record behind them. Empty for
+    /// every other read.
+    edges: Vec<(u32, String, String, RecordStructure)>,
+    /// The entities a traversal reached and refused to walk through, as `kind:id` and the degree
+    /// that refused them. Empty for every other read.
+    hubs: Vec<(String, u32)>,
     /// The answer as text.
     raw: String,
     /// The cost the answer reported for itself.
@@ -1069,6 +1292,8 @@ fn parse_answer(raw: String) -> Answer {
     Answer {
         records,
         pairs: Vec::new(),
+        edges: Vec::new(),
+        hubs: Vec::new(),
         raw,
         token_estimate,
     }
@@ -1108,6 +1333,79 @@ fn parse_pairs(raw: String) -> Answer {
             .flat_map(|(left, right)| [left.clone(), right.clone()])
             .collect(),
         pairs,
+        edges: Vec::new(),
+        hubs: Vec::new(),
+        raw,
+        token_estimate,
+    }
+}
+
+/// Parses a traversal's answer, which is a graph and not a list of records.
+///
+/// The absence of a `records` key is asserted rather than assumed, as it is for a correlation: an
+/// answer that flattened its edges into one list would satisfy every count below having lost the two
+/// things the read is for — which entity reached which, and through which record.
+fn parse_links(raw: String) -> Answer {
+    let parsed: Value = serde_json::from_str(&raw).expect("a JSON answer");
+    assert!(
+        parsed.get("records").is_none(),
+        "a traversal answers a graph, not records: {raw}"
+    );
+    let edges: Vec<(u32, String, String, RecordStructure)> = parsed["edges"]
+        .as_array()
+        .expect("a traversal answers an array of edges")
+        .iter()
+        .map(|edge| {
+            let end = |side: &str| {
+                format!(
+                    "{}:{}",
+                    edge[side]["kind"].as_str().expect("an entity kind"),
+                    edge[side]["id"].as_str().expect("an entity id")
+                )
+            };
+            let hop = u32::try_from(edge["hop"].as_u64().expect("a hop")).expect("a small hop");
+            // The attenuation is checked here rather than in a row, because it is a property of
+            // every edge and a row that spelled it would be spelling the same constant each time.
+            let score = edge["score"].as_f64().expect("a score");
+            assert!(
+                (score - f64::from(0.5f32).powi(i32::try_from(hop).expect("a small hop"))).abs()
+                    < 1e-6,
+                "hop {hop} scored {score}: {raw}"
+            );
+            (
+                hop,
+                end("from"),
+                end("to"),
+                serde_json::from_value(edge["via"].clone()).expect("the record behind an edge"),
+            )
+        })
+        .collect();
+    let hubs: Vec<(String, u32)> = parsed["hubs"]
+        .as_array()
+        .expect("a traversal names what it refused to walk through")
+        .iter()
+        .map(|hub| {
+            (
+                format!(
+                    "{}:{}",
+                    hub["kind"].as_str().expect("an entity kind"),
+                    hub["id"].as_str().expect("an entity id")
+                ),
+                u32::try_from(hub["degree"].as_u64().expect("a degree")).expect("a small degree"),
+            )
+        })
+        .collect();
+    let token_estimate = usize::try_from(
+        parsed["token_estimate"]
+            .as_u64()
+            .expect("every read reports what it cost"),
+    )
+    .expect("a plausible token estimate");
+    Answer {
+        records: edges.iter().map(|(_, _, _, via)| via.clone()).collect(),
+        pairs: Vec::new(),
+        edges,
+        hubs,
         raw,
         token_estimate,
     }
@@ -1119,7 +1417,11 @@ fn parse_pairs(raw: String) -> Answer {
 /// so nothing here can assert about rows a request did not return.
 async fn ask(case: &Case, app: &axum::Router) -> Answer {
     let uri = match case.ask {
-        Ask::Ordered(uri) | Ask::Unordered(uri) | Ask::Correlated(uri) => target(case, uri),
+        Ask::Ordered(uri)
+        | Ask::Unordered(uri)
+        | Ask::Correlated(uri)
+        | Ask::Linked(uri)
+        | Ask::Refused { uri, .. } => target(case, uri),
         Ask::Search(needle) => {
             // Full text takes no window, so a row that named one would have it quietly dropped.
             assert!(
@@ -1130,10 +1432,45 @@ async fn ask(case: &Case, app: &axum::Router) -> Answer {
             format!("/search?q={needle}&limit={SEARCH_LIMIT}")
         }
     };
+    if let Ask::Refused { saying, .. } = case.ask {
+        return refusal(app, &uri, case, saying).await;
+    }
     let raw = send(app, Method::GET, &uri, case.agent, b"").await;
     match case.ask {
         Ask::Correlated(_) => parse_pairs(raw),
+        Ask::Linked(_) => parse_links(raw),
         _ => parse_answer(raw),
+    }
+}
+
+/// Asks a question this service refuses, and checks the refusal is one an operator can act on.
+///
+/// The status and the words, for the reason [`Ask::Refused`] gives: a bound restated as a range
+/// still returns `422`, and a caller reading it goes on believing the bound is arbitrary rather than
+/// measured. The empty [`Answer`] it hands back is the truthful one — a refusal returns no records,
+/// and the runner's own checks about cost and prose then hold of it unchanged.
+async fn refusal(app: &axum::Router, uri: &str, case: &Case, saying: &[&str]) -> Answer {
+    let question = case.question;
+    let (status, raw) = send_raw(app, Method::GET, uri, case.agent, b"").await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "`{question}` was answered {status} rather than refused: {raw}"
+    );
+    for phrase in saying {
+        assert!(
+            raw.contains(phrase),
+            "`{question}` was refused without saying `{phrase}`, which is the part a caller acts \
+             on: {raw}"
+        );
+    }
+    Answer {
+        records: Vec::new(),
+        pairs: Vec::new(),
+        edges: Vec::new(),
+        hubs: Vec::new(),
+        raw,
+        token_estimate: 0,
     }
 }
 
@@ -1171,6 +1508,32 @@ fn pair_labels(
             format!("{}>{}", named[0], follower[0])
         })
         .collect()
+}
+
+/// A traversal's answer as a golden row spells it: every edge, then every hub it refused.
+///
+/// The hop leads each edge because the hop is the claim under test as much as the endpoints are: a
+/// traversal that ran one hop too far answers with lines no row spells, and the failure prints them
+/// rather than a count.
+fn link_labels(answer: &Answer, written: &BTreeMap<&str, ActionRecord>) -> Vec<String> {
+    let mut lines: Vec<String> = answer
+        .edges
+        .iter()
+        .map(|(hop, from, to, via)| {
+            let label = labels(std::slice::from_ref(via), written);
+            format!("h{hop} {from}>{to} via {}", label[0])
+        })
+        .collect();
+    // Sorted, unlike the edges: the hubs are a set the answer happens to order by entity key, and a
+    // row asserting an order nothing promises would go red for a reason that is not a defect.
+    let mut hubs: Vec<String> = answer
+        .hubs
+        .iter()
+        .map(|(entity, degree)| format!("hub {entity} degree {degree}"))
+        .collect();
+    hubs.sort();
+    lines.extend(hubs);
+    lines
 }
 
 /// The labels a set of structures corresponds to, by matching identifiers against what was written.
@@ -1280,6 +1643,22 @@ async fn every_golden_query_finds_exactly_the_records_its_question_needs() {
                 case.finds,
                 "`{question}` (newest left first, its right records in order)"
             ),
+            // Edges, then the corridors the traversal refused. Ordered, and the hop is in every
+            // line: a traversal that leaked past its depth or lost its corridor rule fails on the
+            // set rather than on a count.
+            Ask::Linked(_) => assert_eq!(
+                link_labels(&answer, &written),
+                case.finds,
+                "`{question}` (nearest hop first, newest evidence first within a hop)"
+            ),
+            // A refusal was already asserted where it was asked, words and all. What is left for
+            // the table is that the row does not also claim an answer: `finds` on a refused row
+            // would be a set nothing could ever return, which reads as a failing query rather than
+            // as a row that means the wrong thing.
+            Ask::Refused { .. } => assert!(
+                case.finds.is_empty(),
+                "`{question}` is refused and cannot also find records"
+            ),
             Ask::Unordered(_) | Ask::Search(_) => {
                 let mut sorted = found.clone();
                 sorted.sort();
@@ -1324,14 +1703,35 @@ async fn every_golden_query_finds_exactly_the_records_its_question_needs() {
 /// Both halves rot silently. An unreferenced fixture is a record nothing asserts about, and a
 /// mistyped label would make a row's expectation unsatisfiable in a way that reads like a bug in the
 /// store rather than a typo in the table.
+/// The fixture labels one row names, whichever spelling its read answers in.
+///
+/// Three spellings, because three reads answer three shapes: a record is its bare label, a
+/// correlation names a pair as `left>right`, and a traversal names an edge as
+/// `h<hop> <from>><to> via <label>` — where the arrow separates two *entities* and only the tail
+/// names a record. Split generically, a traversal row would appear to name fixtures called
+/// `h1 order_ref:ord10014733`, and the check below would fail on a spelling rather than on a typo.
+fn named_fixtures(case: &Case) -> Vec<&'static str> {
+    case.finds
+        .iter()
+        .flat_map(|found| match case.ask {
+            Ask::Correlated(_) => found.split('>').collect(),
+            // A `hub …` line names an entity the traversal refused and no record at all.
+            Ask::Linked(_) => found
+                .rsplit_once(" via ")
+                .map_or_else(Vec::new, |(_, label)| vec![label]),
+            _ => vec![*found],
+        })
+        .collect()
+}
+
 #[test]
 fn the_table_and_the_fixtures_describe_each_other() {
     let known: Vec<&str> = FIXTURES.iter().map(|fixture| fixture.label).collect();
-    // A correlation row names a pair as `left>right`, so both halves are checked — a mistyped label
-    // on either side of the arrow would otherwise be unsatisfiable in a way that reads like a bug in
-    // the store rather than a typo in the table.
+    // Every label a row names, on either side of a correlation's arrow or behind a traversal's
+    // `via` — a mistyped one would otherwise be unsatisfiable in a way that reads like a bug in the
+    // store rather than a typo in the table.
     for case in GOLDEN {
-        for label in case.finds.iter().flat_map(|found| found.split('>')) {
+        for label in named_fixtures(case) {
             assert!(
                 known.contains(&label),
                 "`{}` names `{label}`",
@@ -1341,12 +1741,9 @@ fn the_table_and_the_fixtures_describe_each_other() {
     }
     for label in &known {
         assert!(
-            GOLDEN.iter().any(|case| {
-                case.finds
-                    .iter()
-                    .flat_map(|found| found.split('>'))
-                    .any(|named| named == *label)
-            }),
+            GOLDEN
+                .iter()
+                .any(|case| named_fixtures(case).contains(label)),
             "`{label}` is written and no golden query asks for it"
         );
     }
