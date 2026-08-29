@@ -2285,9 +2285,13 @@ components:
           type: integer
           minimum: 0
           description: |
-            Quarantined records for this subject resolved or discarded as part of the erasure —
-            counted here because a record waiting in quarantine would otherwise outlive the key that
-            was supposed to erase it.
+            Records held in quarantine for this subject that the erasure took out of the hold and
+            published with no body — counted here because a record waiting in quarantine would
+            otherwise outlive the key that was supposed to erase it, sealed under a per-date
+            quarantine key no erasure destroys. Published rather than discarded, and with the same
+            manners as a record that arrives after an erasure: the structure is kept, the body is
+            not, and no key is minted. An erasure is the one condition a hold can never retry its
+            way out of, so the hold ends here.
           example: 1
         tombstone_id:
           type: string

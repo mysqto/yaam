@@ -13,13 +13,20 @@
 //! and one key set: destroying any one subject's key ends that body for all of them, because the
 //! key is derived from every share. And the live tree is rewritten to drop the ciphertext it can no
 //! longer decrypt — belt and braces, not the mechanism; the mechanism is that the key is gone.
+//!
+//! A third, about what an erasure *writes*. The tombstone line it appends carries the records it
+//! reached and the roles the subject held on them, permanently and in the clear. That is deliberate
+//! — it is the account of the erasure, and an account nobody can read afterwards is not one — but
+//! it concentrates a subject-to-record mapping into a file that is never deleted and travels in the
+//! backup. See [`Tombstone::records`] for what that does and does not add to what the store already
+//! keeps.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use yaam_contract::{RecordId, SubjectHash};
+use yaam_contract::{RecordId, Role, SubjectHash};
 use yaam_crypto::keystore::KeyStore as _;
 use yaam_md::{Body, Document};
 
@@ -47,17 +54,37 @@ pub struct EraseReport {
     pub bodies_sealed_off: usize,
     /// Keys destroyed, across all epochs.
     pub keys_destroyed: usize,
-    /// Quarantined records resolved or discarded as part of this request.
+    /// Records taken out of quarantine by this request and published with no body.
+    ///
+    /// Settled rather than held: an erasure is the one condition a quarantined record can never
+    /// retry its way out of, so the hold ends here — structure published, body dropped.
     pub quarantine_settled: usize,
     /// Identifier of the tombstone written: `tomb-` followed by a ULID. Prefixed because the log is
     /// read beside record identifiers, and one that could be mistaken for a record would be.
     pub tombstone_id: String,
 }
 
+/// One record an erasure reached, and the part the erased subject played in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ErasedRecord {
+    /// The record's identifier.
+    pub(crate) record_id: String,
+    /// Every role the erased subject held on that record.
+    ///
+    /// A list rather than one value, because a record may name the same subject more than once —
+    /// one reference per canonicalisation version is the expected case — and an erasure that
+    /// reported one of them would be reporting less than it reached.
+    pub(crate) roles: Vec<Role>,
+}
+
 /// One line of the append-only tombstone log.
 ///
 /// Append-only means completion is a *second* line for the same identifier rather than an edit of
 /// the first: an erasure record that can be rewritten is an erasure record that can be unwritten.
+///
+/// Every field a line has ever carried is optional on the way in. The log is the one file in the
+/// store that is never rewritten, so lines written by older builds are read by newer ones for as
+/// long as the store exists, and a reader that refused them would refuse the oldest erasures first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Tombstone {
     /// Identifier the caller confirms against.
@@ -72,6 +99,32 @@ pub(crate) struct Tombstone {
     pub(crate) at_ms: i64,
     /// Whether the backup window has since passed with no recoverable key found.
     pub(crate) complete: bool,
+    /// Every record this erasure reached, with the roles the subject held on each.
+    ///
+    /// This is the artefact that answers "which records did this erasure reach" without walking the
+    /// tree, and it is the only account of that which survives the tree being restored, rebuilt or
+    /// archived. The roles are here for the same reason: `record_subjects` carries them too, but a
+    /// derived index is not proof of what was erased, and if it ever has to be proved that a
+    /// subject was a principal on one record and merely a party to another, that distinction is
+    /// part of it.
+    ///
+    /// **Read this before deciding the log is a safe place to keep it.** The tombstone log is
+    /// plaintext, is never deleted, and travels in the backup — so this list is a permanent,
+    /// concentrated, greppable subject-to-record mapping in the clear, in the one file no later
+    /// decision can prune. It adds no *fact* the store did not already retain: the same pairings
+    /// survive in each erased record's own frontmatter, in `record_subjects`, and in
+    /// `audit/subjects/`, all three live and all three in the backup. What it changes is shape and
+    /// permanence — a ready-made dossier per erasure instead of a join across surfaces that could
+    /// in principle be narrowed later. That is a widening of the *documented* residue, not of the
+    /// data, and it is a decision for whoever signs the residue off rather than one this code
+    /// should make quietly. Written because the plan requires it in steps 2 and 5 and cites it as
+    /// where the retained graph lives; flagged because the sign-off rests on a document that
+    /// describes this log as holding the pseudonym alone.
+    ///
+    /// Absent from a line an older build wrote, and empty is not "reached nothing" — it is "this
+    /// line does not say". Nothing derives behaviour from it: the replay re-reads the tree.
+    #[serde(default)]
+    pub(crate) records: Vec<ErasedRecord>,
 }
 
 /// What an erasure would reach, without reaching it.
@@ -154,6 +207,11 @@ pub fn preview(pipeline: &Pipeline, subject: &SubjectHash) -> Result<ErasePrevie
 /// their lines are a function of the records, and the fan-out the rebuild re-enqueues writes them
 /// again. Nothing an erasure removes from a record can come back with them — the rebuild reads the
 /// erased tree.
+///
+/// The record list goes into the log line the erasure opens with rather than into a second line
+/// afterwards. It is read from the two surfaces this then rewrites, before either is touched, so a
+/// crash anywhere after the append leaves a tombstone that already names everything this run was
+/// about; the other order leaves one that names nothing and cannot be completed by hand.
 pub fn erase_subject(pipeline: &mut Pipeline, subject: &SubjectHash) -> Result<EraseReport> {
     let tombstone_id = format!("tomb-{}", RecordId::generate().as_str());
     append(
@@ -163,6 +221,7 @@ pub fn erase_subject(pipeline: &mut Pipeline, subject: &SubjectHash) -> Result<E
             subject: subject.as_str().to_owned(),
             at_ms: fsutil::now_ms(),
             complete: false,
+            records: affected(pipeline, subject)?,
         },
     )?;
 
@@ -171,7 +230,7 @@ pub fn erase_subject(pipeline: &mut Pipeline, subject: &SubjectHash) -> Result<E
     pipeline.keys().destroy_subject(subject)?;
 
     let bodies_sealed_off = drop_bodies(pipeline, subject)?;
-    let quarantine_settled = discard_quarantine(pipeline, subject)?;
+    let quarantine_settled = sweep_quarantine(pipeline, subject)?;
 
     // The derived index holds a wrapped share per subject, and there is no way to un-write one row:
     // the index is rebuilt from the erased tree instead. Expensive, and exactly what "the index is
@@ -238,7 +297,7 @@ pub(crate) fn replay_tombstones(pipeline: &Pipeline) -> Result<usize> {
         pipeline.keys().tombstone(&subject)?;
         pipeline.keys().destroy_subject(&subject)?;
         drop_bodies(pipeline, &subject)?;
-        discard_quarantine(pipeline, &subject)?;
+        sweep_quarantine(pipeline, &subject)?;
         replayed += 1;
     }
     Ok(replayed)
@@ -271,11 +330,34 @@ fn drop_bodies(pipeline: &Pipeline, subject: &SubjectHash) -> Result<usize> {
     Ok(dropped)
 }
 
-/// Discards the spooled copies of records held for a subject that has now been erased.
+/// Settles the records held in quarantine for a subject that has now been erased.
 ///
-/// This is what settles a quarantine that can never resolve: the subject's keys are gone, so the
-/// record can never be sealed under them, and the spool copy is the last readable copy of the body.
-fn discard_quarantine(pipeline: &Pipeline, subject: &SubjectHash) -> Result<usize> {
+/// This is the sweep the erasure owes the spool, and what it is *for* decides how it behaves. A
+/// quarantined record for the subject being erased is a body that outlives the erasure it should
+/// have been caught by: the spool copy is sealed under a per-date quarantine key that no erasure
+/// destroys, it is the last readable copy of that body, and it sits in the one directory nothing
+/// queries. Left alone it is also a hold that can never end — resolution can never succeed for a
+/// subject whose keys are gone, so the retry the spool exists for has nothing to come back to.
+///
+/// So the record is *published structure-only*, not deleted. The frontmatter and its subject list
+/// go into the tree like any other record's, the body is dropped, and no key is minted. That is
+/// exactly what [`crate::pipeline::Pipeline::seal_body`] already does for a record that arrives
+/// *after* an erasure, and a quarantined record is the same record reaching the same state from the
+/// other direction: an erasure has landed on it and the body cannot be kept. One condition, one set
+/// of manners. Deleting it instead — which is what this did before — silently dropped an action
+/// record, which is the one loss the write path is built never to take, and it left the erasure
+/// unable to say what it had reached because the evidence went with the body.
+///
+/// The index is not written here. Both callers rebuild it from the tree immediately afterwards —
+/// [`erase_subject`] as its last step, [`replay_tombstones`] because
+/// [`crate::reindex::reindex_all`] runs it before the walk — so the published record and the
+/// retracted `quarantine_pending` row both come out of that rebuild, from the tree, which is the
+/// only version of "derived" that survives a restore.
+///
+/// Idempotent from both ends: a record already in the tree is left as it stands rather than
+/// overwritten with this copy, because a spool file whose record has since published normally holds
+/// the *older* subject set, and a spool file that is gone is a sweep that already ran.
+fn sweep_quarantine(pipeline: &Pipeline, subject: &SubjectHash) -> Result<usize> {
     let mut settled = 0;
     for path in fsutil::walk_files(
         &pipeline.root().join(layout::QUARANTINE_DIR),
@@ -284,12 +366,77 @@ fn discard_quarantine(pipeline: &Pipeline, subject: &SubjectHash) -> Result<usiz
         let Ok(document) = Document::parse(&fs::read_to_string(&path)?) else {
             continue;
         };
-        if names(&document, subject) {
-            fsutil::remove_if_present(&path)?;
-            settled += 1;
+        if !names(&document, subject) {
+            continue;
         }
+        publish_structure_only(pipeline, document)?;
+        fsutil::remove_if_present(&path)?;
+        settled += 1;
     }
     Ok(settled)
+}
+
+/// Publishes a held record into the tree with its body dropped.
+///
+/// Through the same stage-then-rename the write path uses, so the file lands with the mode its
+/// visibility calls for and appears whole or not at all. The spool copy is removed only once this
+/// has returned: the other order loses the record if the publish fails.
+fn publish_structure_only(pipeline: &Pipeline, held: Document) -> Result<()> {
+    let structure = Document {
+        record: held.record,
+        body: Body::Plain(String::new()),
+    };
+    let stamp = layout::stamp_of(&structure.record)?;
+    if pipeline.published_path(&structure.record, &stamp)?.exists() {
+        return Ok(());
+    }
+    let staged = pipeline.stage(&structure)?;
+    pipeline.place(&structure, &staged, &stamp)?;
+    Ok(())
+}
+
+/// Every record an erasure of `subject` reaches, with the roles it holds on each.
+///
+/// Both surfaces the erasure rewrites are read — the live tree and the quarantine spool — because
+/// the tombstone is meant to answer what the erasure reached, and a held record it publishes
+/// structure-only is something it reached. Keyed by record identifier so the two cannot list the
+/// same record twice, and ordered, so two runs over the same store produce the same line.
+fn affected(pipeline: &Pipeline, subject: &SubjectHash) -> Result<Vec<ErasedRecord>> {
+    let mut found: BTreeMap<String, Vec<Role>> = BTreeMap::new();
+    for dir in [layout::RECORDS_DIR, layout::QUARANTINE_DIR] {
+        for path in fsutil::walk_files(&pipeline.root().join(dir), layout::RECORD_EXT)? {
+            let Ok(document) = Document::parse(&fs::read_to_string(&path)?) else {
+                continue;
+            };
+            let roles = roles_of(&document, subject);
+            if roles.is_empty() {
+                continue;
+            }
+            let entry = found
+                .entry(document.record.record_id.as_str().to_owned())
+                .or_default();
+            for role in roles {
+                if !entry.contains(&role) {
+                    entry.push(role);
+                }
+            }
+        }
+    }
+    Ok(found
+        .into_iter()
+        .map(|(record_id, roles)| ErasedRecord { record_id, roles })
+        .collect())
+}
+
+/// The roles a subject holds on one record, in the order the record names them.
+fn roles_of(document: &Document, subject: &SubjectHash) -> Vec<Role> {
+    document
+        .record
+        .subjects
+        .iter()
+        .filter(|named| &named.hash == subject)
+        .map(|named| named.role)
+        .collect()
 }
 
 /// Whether a record names a subject.
@@ -411,13 +558,15 @@ fn unverified(subject: &SubjectHash, detail: &str) -> crate::Error {
 mod tests {
     use std::fs;
 
+    use yaam_contract::{CanonVer, Role, SubjectRef};
     use yaam_crypto::Epoch;
     use yaam_md::{Body, Document};
 
     use super::{
-        KEY_BACKUP_WINDOW_MS, Tombstone, confirm_erasure, count_key_files, erase_subject, preview,
-        read_log, verify_live,
+        ErasedRecord, KEY_BACKUP_WINDOW_MS, Tombstone, confirm_erasure, count_key_files,
+        erase_subject, preview, read_log, verify_live,
     };
+    use crate::fsutil;
     use crate::testkit::{self, BODY, Harness};
 
     /// A server time inside the epoch the fixtures use.
@@ -647,24 +796,27 @@ mod tests {
         verify_live(&harness.pipeline, &subject).expect("still verified");
     }
 
-    /// A record held during a lookup outage is discarded when its subject is later erased.
+    /// A record held during a lookup outage is published structure-only when its subject is erased.
     ///
     /// The spool copy is the last readable copy of that body, sealed under a quarantine key the
-    /// erasure does not destroy, so leaving it would leave the one thing the erasure was for.
+    /// erasure does not destroy, so leaving it would leave the one thing the erasure was for. But
+    /// the record itself is an action record, and dropping one is the loss the write path is built
+    /// never to take — so the hold ends the way it ends for a record that arrives *after* an
+    /// erasure: the structure is published, the body is not.
     #[test]
-    fn a_held_record_is_discarded_by_its_subjects_erasure() {
+    fn a_held_record_is_published_structure_only_by_its_subjects_erasure() {
         let (harness, _, _) = with_sealed_record();
         let subject = testkit::subject('b');
+        let held = testkit::subject_derived("2026-08-24T09:00:00Z", std::slice::from_ref(&subject));
 
         let mut harness = harness.resolving_with(testkit::UnavailableLookup);
         harness
             .pipeline
-            .accept(
-                testkit::subject_derived("2026-08-24T09:00:00Z", std::slice::from_ref(&subject)),
-                BODY,
-            )
+            .accept(held.clone(), BODY)
             .expect("held, not dropped");
         assert_eq!(harness.counts()["quarantine_pending"], 1);
+        let path = harness.path_of(&held);
+        assert!(!path.exists(), "a held record is not in the tree yet");
 
         let mut harness = harness.resolving_with(crate::resolve::DeclaredSubjects);
         let report = erase_subject(&mut harness.pipeline, &subject).expect("erased");
@@ -673,6 +825,147 @@ mod tests {
             "the spooled body cannot be kept"
         );
         assert_eq!(harness.counts()["quarantine_pending"], 0);
+
+        // Published, not discarded: the record is in the tree, its subjects are still on it, and
+        // the body it was held with is gone rather than travelling out of the spool with it.
+        let published = Document::parse(&fs::read_to_string(&path).expect("read")).expect("parses");
+        assert!(matches!(&published.body, Body::Plain(text) if text.is_empty()));
+        assert_eq!(published.record.subjects.len(), 1);
+        assert_eq!(published.record.subjects[0].hash, subject);
+        assert_eq!(published.record.entities.len(), 1);
+        assert!(published.record.summary.is_empty());
+        assert_eq!(
+            harness.counts()["records"],
+            3,
+            "the held record is indexed by the rebuild the erasure ends in"
+        );
+        verify_live(&harness.pipeline, &subject).expect("verified");
+
+        // And it is the same shape a record arriving after the erasure takes, which is the point:
+        // one condition, one set of manners.
+        let late = testkit::subject_derived("2026-08-25T09:00:00Z", std::slice::from_ref(&subject));
+        harness.pipeline.accept(late.clone(), BODY).expect("stored");
+        let after = Document::parse(&fs::read_to_string(harness.path_of(&late)).expect("read"))
+            .expect("parses");
+        assert!(matches!(&after.body, Body::Plain(text) if text.is_empty()));
+    }
+
+    /// The tombstone says which records the erasure reached, and in what role.
+    ///
+    /// Without it the only account of what an erasure covered is a walk of a tree that a restore, a
+    /// rebuild or an archive can change underneath the answer. The roles are part of it because
+    /// "was a principal here, merely a party there" is a distinction the erasure destroyed the
+    /// evidence for everywhere else it is provable.
+    #[test]
+    fn a_tombstone_names_the_records_an_erasure_reached_and_the_roles_on_them() {
+        let (harness, subject, record) = with_sealed_record();
+
+        // A second record naming the same subject as a party rather than as its principal.
+        let mut second = testkit::subject_derived("2026-08-23T10:00:00Z", &[]);
+        second.subjects = vec![
+            SubjectRef {
+                hash: testkit::subject('c'),
+                role: Role::Principal,
+                canon_ver: CanonVer(1),
+            },
+            SubjectRef {
+                hash: subject.clone(),
+                role: Role::Party,
+                canon_ver: CanonVer(1),
+            },
+        ];
+        let mut harness = harness;
+        harness
+            .pipeline
+            .accept(second.clone(), BODY)
+            .expect("accepted");
+
+        // And one held back by an outage, which the erasure reaches by publishing it.
+        let mut harness = harness.resolving_with(testkit::UnavailableLookup);
+        let field =
+            testkit::subject_derived("2026-08-24T09:00:00Z", std::slice::from_ref(&subject));
+        harness.pipeline.accept(field.clone(), BODY).expect("held");
+        let mut harness = harness.resolving_with(crate::resolve::DeclaredSubjects);
+
+        let report = erase_subject(&mut harness.pipeline, &subject).expect("erased");
+        let entry = read_log(&harness.pipeline)
+            .expect("log")
+            .into_iter()
+            .find(|entry| entry.id == report.tombstone_id)
+            .expect("the line this erasure wrote");
+
+        let mut expected = vec![
+            ErasedRecord {
+                record_id: record.record_id.as_str().to_owned(),
+                roles: vec![Role::Principal],
+            },
+            ErasedRecord {
+                record_id: second.record_id.as_str().to_owned(),
+                roles: vec![Role::Party],
+            },
+            ErasedRecord {
+                record_id: field.record_id.as_str().to_owned(),
+                roles: vec![Role::Principal],
+            },
+        ];
+        expected.sort_by(|a, b| a.record_id.cmp(&b.record_id));
+        assert_eq!(
+            entry.records, expected,
+            "the tombstone has to name every record the erasure reached, spool included"
+        );
+        // The unrelated internal record is not one of them, and neither is the other subject's.
+        assert!(
+            !entry
+                .records
+                .iter()
+                .any(|reached| reached.roles.is_empty() || reached.record_id.is_empty())
+        );
+
+        // The completion stamp carries the same list forward, so the finished line is the one an
+        // operator can read the erasure off without the opening line beside it.
+        age_tombstone(&harness, KEY_BACKUP_WINDOW_MS + 60_000);
+        assert!(confirm_erasure(&mut harness.pipeline, &report.tombstone_id).expect("checked"));
+        let stamped = read_log(&harness.pipeline)
+            .expect("log")
+            .into_iter()
+            .rfind(|entry| entry.id == report.tombstone_id)
+            .expect("the completion line");
+        assert!(stamped.complete);
+        assert_eq!(stamped.records, expected);
+    }
+
+    /// A line an older build wrote is still readable, and says so rather than claiming nothing.
+    ///
+    /// The log is the one file in the store that is never rewritten, so every line ever appended to
+    /// it has to keep parsing. A reader that required the record list would refuse the oldest
+    /// erasures — the ones whose completion stamp matters most.
+    #[test]
+    fn a_tombstone_line_without_a_record_list_still_reads() {
+        let (mut harness, subject, _) = with_sealed_record();
+        let long_ago = fsutil::now_ms() - KEY_BACKUP_WINDOW_MS - 60_000;
+        fs::write(
+            harness.root().join("tombstones.jsonl"),
+            format!(
+                "{{\"tombstone_id\":\"tomb-old\",\"subject\":\"{}\",\"at_ms\":{long_ago},\
+                 \"complete\":false}}\n",
+                subject.as_str()
+            ),
+        )
+        .expect("write");
+
+        let log = read_log(&harness.pipeline).expect("log");
+        assert!(
+            log[0].records.is_empty(),
+            "the line does not say, and cannot"
+        );
+        // Readable enough to replay and to complete, which is what the log is for.
+        assert_eq!(
+            crate::reindex::reindex_all(&mut harness.pipeline)
+                .expect("rebuilt")
+                .tombstones_replayed,
+            1
+        );
+        assert!(confirm_erasure(&mut harness.pipeline, "tomb-old").expect("checked"));
     }
 
     #[test]
