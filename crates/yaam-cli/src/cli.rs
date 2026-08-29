@@ -148,6 +148,82 @@ pub struct EmitCli {
     pub args: EmitArgs,
 }
 
+/// File one record about one transaction, on a caller socket.
+///
+/// The same record `yaam-emit` writes, classified `subject_derived` instead of `internal`, so the
+/// store seals its body under a key that can be destroyed. Everything else — the seventeen fields,
+/// the timestamps, the inference flag, the socket protocol, the exit codes — is `yaam-emit`'s,
+/// unchanged, because a second account of any of it would be a second thing to get out of step.
+///
+/// # Why this is a separate binary and not a flag
+///
+/// `yaam-emit` refuses a data-class flag, and the reason it gives is that "a flag inviting one
+/// would let a caller declare a record erasable that this deployment cannot erase". Half of that has
+/// since been answered by the store and half of it has not, and this binary exists because of the
+/// half that has not.
+///
+/// The answered half is *erasability*. A store that declares no erasure units refuses a
+/// subject-derived record before a byte is written, and one that declares them refuses a record
+/// naming none of them; a record this deployment cannot erase is therefore a record that was never
+/// written, which is the only failure in this area that can still be fixed. The refusal is the
+/// store's, made where the answer is knowable, and no caller can talk it out of one.
+///
+/// The unanswered half is *accident*. Most callers here are model-driven, and §10.4's rule is that
+/// `data_class` is "settled by deterministic rules only — never by an LLM's judgement, and never by
+/// a skill". A flag on the binary every agent already runs is exactly an invitation to that
+/// judgement: it would appear in `--help`, it would read as an option, and nothing about the
+/// deployment would have changed to make an agent that set it wrong visible. So the capability is
+/// not a flag anywhere. It is a *different program*, and whether a host can classify a record
+/// erasable is a thing an operator installs rather than a thing a caller chooses.
+///
+/// # The rule, and why it is one argument rather than two
+///
+/// A record is subject-derived if and only if it names the transaction it is about.
+/// `--erasure-unit` is required and there is no flag beside it, so the class and the reference the
+/// store keys erasure on cannot be set apart: nothing here can claim a record erasable without
+/// saying what makes it erasable, and nothing here can name a transaction and leave the body in the
+/// clear. That is the deterministic rule `subject-resolver.md` §6 item 5 asks for, held by the shape
+/// of the command line rather than by discipline.
+///
+/// `subjects` stays empty, exactly as it does for `yaam-emit`, and for the same reason: the secret a
+/// pseudonym is derived under lives with the service, so a subject named on this command line could
+/// only be a value invented on a host that holds no key material. The service's resolver derives it
+/// from the reference this argument states, under the kinds the store's own `spec/subjects.yaml`
+/// declares — and this binary cannot read that file, so a kind it does not declare is refused
+/// upstream rather than guessed at here.
+///
+/// # What stops this binary being enough
+///
+/// Two grants, in two files, neither of which is on this command line. The sidecar refuses to
+/// forward a subject-derived record from a caller its configuration does not list as one that files
+/// them, and the service refuses one from a credential its keyring does not mark the same way.
+/// Installing this binary on a host therefore does nothing on its own: an agent that found it, or
+/// that wrote the same JSON to its own socket by hand, is refused at the sidecar and refused again
+/// at the store. Both refusals are permanent and named, and the record is not written.
+#[derive(Debug, Parser)]
+#[command(name = "yaam-file", version, after_help = exit::HELP)]
+pub struct FileCli {
+    /// The transaction this record is about, as `kind:id`. Required.
+    ///
+    /// Recorded as a stated primary reference, at the same full confidence `--entity` gives one,
+    /// because that is what the store's resolver requires before it will key erasure on it — a
+    /// reference lifted from prose is a guess, and a guess may not decide whether a body is sealed.
+    ///
+    /// The kind must be one the store's `spec/subjects.yaml` names as an erasure unit, and the
+    /// identifier is canonicalised on the way in by the deployment's `spec/entities.yaml`. Neither
+    /// file is readable from here, so both are the store's to check: a kind it does not key erasure
+    /// on is a refusal, not a plaintext record.
+    ///
+    /// Naming the same reference again with `--entity` is not an error. Naming a *different*
+    /// reference of the same kind is, and it is refused here rather than upstream, because the
+    /// resolver refuses it too and this is the cheaper place to find out.
+    #[arg(long, value_name = "KIND:ID")]
+    pub erasure_unit: String,
+    /// Everything the record and the socket need. The same arguments `yaam-emit` takes.
+    #[command(flatten)]
+    pub args: EmitArgs,
+}
+
 /// One record, as a caller describes it.
 #[derive(Debug, Args)]
 pub struct EmitArgs {
@@ -906,7 +982,9 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
 
-    use super::{AgentCli, Command, EmitCli, KnowledgeCommand, OperatorCli, ReadCli, ServerCli};
+    use super::{
+        AgentCli, Command, EmitCli, FileCli, KnowledgeCommand, OperatorCli, ReadCli, ServerCli,
+    };
     use crate::exit::Exit;
 
     /// The codes are only an interface if they are published where a reader looks.
@@ -1074,6 +1152,45 @@ mod tests {
         assert!(!help.contains("--subject"), "{help}");
         assert!(!help.contains("--data-class"), "{help}");
         assert!(help.contains("Subjects stay empty"), "{help}");
+        // And nothing about the other binary leaks into this one's surface. A reader of this help
+        // must not find an argument here that changes what the record is.
+        assert!(!help.contains("--erasure-unit"), "{help}");
+    }
+
+    /// The other half of the pairing: `yaam-file` cannot name a subject either, and cannot decline
+    /// to name a transaction. The class and the reference are one argument, so no invocation of it
+    /// files a record that claims erasability without stating what makes it erasable.
+    #[test]
+    fn the_transaction_writer_names_a_reference_and_never_a_subject() {
+        let help = FileCli::command().render_long_help().to_string();
+        assert!(help.contains("--erasure-unit"), "{help}");
+        assert!(!help.contains("--subject"), "{help}");
+        assert!(!help.contains("--data-class"), "{help}");
+
+        FileCli::try_parse_from([
+            "yaam-file",
+            "--action",
+            "refund",
+            "--outcome",
+            "success",
+            "--summary",
+            "settled it",
+        ])
+        .expect_err("the erasure unit is required, or the class is a flag after all");
+
+        let cli = FileCli::try_parse_from([
+            "yaam-file",
+            "--action",
+            "refund",
+            "--outcome",
+            "success",
+            "--summary",
+            "settled it",
+            "--erasure-unit",
+            "order_ref:abcd1234",
+        ])
+        .expect("parsed");
+        assert_eq!(cli.erasure_unit, "order_ref:abcd1234");
     }
 
     /// The three that only the caller can answer are required, so a record cannot be written without

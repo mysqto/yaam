@@ -17,9 +17,9 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
-use yaam_contract::ActionRecord;
 use yaam_contract::mask::Policy;
 use yaam_contract::request::WriteRequest;
+use yaam_contract::{ActionRecord, DataClass};
 
 use crate::spool::Spool;
 use crate::upstream::Upstream;
@@ -91,8 +91,13 @@ impl Sidecar {
     /// The happy path does not touch the spool at all: with the service reachable, a record that is
     /// posted and accepted needs no durable copy, and one the service refuses should not leave a
     /// file behind for a retry that can only fail again.
-    pub(crate) async fn submit(&self, socket_agent: &str, line: &[u8]) -> crate::Result<()> {
-        let mut record = parse(socket_agent, line)?;
+    pub(crate) async fn submit(
+        &self,
+        socket_agent: &str,
+        files_subject_derived: bool,
+        line: &[u8],
+    ) -> crate::Result<()> {
+        let mut record = parse(socket_agent, files_subject_derived, line)?;
         self.redact(&mut record);
         // Re-serialised from the parsed record, not forwarded verbatim: what the service unseals is
         // then exactly what this sidecar validated, with no unknown fields riding along. The body
@@ -178,13 +183,30 @@ impl Sidecar {
 /// Attribution is checked here rather than upstream because the socket is the evidence: it is
 /// permissioned to one caller, so the agent it belongs to is known without asking, and a record
 /// naming a different agent is a caller trying to write as someone else.
-fn parse(socket_agent: &str, line: &[u8]) -> crate::Result<ActionRecord> {
+fn parse(
+    socket_agent: &str,
+    files_subject_derived: bool,
+    line: &[u8],
+) -> crate::Result<ActionRecord> {
     let record: ActionRecord = serde_json::from_slice(line)
         .map_err(|e| Error::Rejected(format!("malformed record: {e}")))?;
     record
         .validate()
         .map_err(|e| Error::Rejected(e.to_string()))?;
 
+    // Before anything is masked, sealed or spooled, and refused rather than downgraded: a record
+    // silently reclassified would be a plaintext body its writer believes was sealed, which is the
+    // one failure here that nothing downstream can see. What the caller sent is what is judged,
+    // whether it came from `yaam-file` or from a line of JSON somebody wrote by hand.
+    if record.data_class != DataClass::Internal && !files_subject_derived {
+        return Err(Error::Rejected(format!(
+            "`{socket_agent}` may not file `{}` records: this sidecar's configuration does not \
+             list it under `files_subject_derived`. That class seals the body under a key that can \
+             be destroyed and files a subject linkage no later write can correct, so which callers \
+             may claim it is a deployment's decision rather than a record's",
+            record.data_class.as_str()
+        )));
+    }
     if record.agent != socket_agent {
         return Err(Error::Rejected(format!(
             "socket belongs to `{socket_agent}`, record claims `{}`",
@@ -247,7 +269,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use tempfile::TempDir;
-    use yaam_contract::{DataClass, Outcome, RecordId, SchemaVer, Visibility};
+    use yaam_contract::{Outcome, RecordId, SchemaVer, Visibility};
 
     use yaam_contract::request::SigningKeys;
 
@@ -319,7 +341,7 @@ mod tests {
         let (_dir, secret, sidecar) = sidecar(stub.base_url.clone(), 8);
 
         sidecar
-            .submit("writer", &line("writer", "shipped it"))
+            .submit("writer", false, &line("writer", "shipped it"))
             .await
             .unwrap();
 
@@ -333,13 +355,75 @@ mod tests {
         assert_eq!(sidecar.depth().await.unwrap(), 0);
     }
 
+    /// A subject-derived line on a socket that was granted nothing is refused where it arrived.
+    ///
+    /// Before anything is masked, sealed or spooled, and whatever wrote it: this is the case where
+    /// an agent writes the JSON itself and never goes near `yaam-file`.
+    #[tokio::test]
+    async fn a_caller_with_no_grant_cannot_file_a_subject_derived_record() {
+        let stub = Stub::start(201).await;
+        let (_dir, _secret, sidecar) = sidecar(stub.base_url.clone(), 8);
+
+        let mut record: ActionRecord =
+            serde_json::from_slice(&line("writer", "settled the refund")).unwrap();
+        record.data_class = DataClass::SubjectDerived;
+        let err = sidecar
+            .submit("writer", false, &serde_json::to_vec(&record).unwrap())
+            .await
+            .unwrap_err();
+
+        let Error::Rejected(message) = &err else {
+            panic!("a permanent refusal, not {err}");
+        };
+        assert!(message.contains("subject_derived"), "{message}");
+        assert!(message.contains("files_subject_derived"), "{message}");
+        assert!(stub.received().is_empty(), "nothing may reach the service");
+        assert_eq!(sidecar.depth().await.unwrap(), 0, "and nothing is spooled");
+    }
+
+    /// The same line from a caller the deployment did grant goes out, sealed, like any other.
+    #[tokio::test]
+    async fn a_granted_caller_files_one_and_the_service_decides_the_rest() {
+        let stub = Stub::start(201).await;
+        let (_dir, secret, sidecar) = sidecar(stub.base_url.clone(), 8);
+
+        let mut record: ActionRecord =
+            serde_json::from_slice(&line("writer", "settled the refund")).unwrap();
+        record.data_class = DataClass::SubjectDerived;
+        sidecar
+            .submit("writer", true, &serde_json::to_vec(&record).unwrap())
+            .await
+            .unwrap();
+
+        let posted = stub.received();
+        assert_eq!(posted.len(), 1);
+        let seen = opened(&secret, &posted[0]);
+        // Forwarded as the caller classified it. The sidecar decides who may say this and never what
+        // it means: the subjects are the service's to resolve, and they are still empty here.
+        assert_eq!(seen.data_class, DataClass::SubjectDerived);
+        assert!(seen.subjects.is_empty());
+    }
+
+    /// An internal record is nobody's grant to have, which is every caller on an ordinary host.
+    #[tokio::test]
+    async fn an_internal_record_needs_no_grant() {
+        let stub = Stub::start(201).await;
+        let (_dir, _secret, sidecar) = sidecar(stub.base_url.clone(), 8);
+
+        sidecar
+            .submit("writer", false, &line("writer", "shipped it"))
+            .await
+            .expect("the class every caller may file");
+        assert_eq!(stub.received().len(), 1);
+    }
+
     #[tokio::test]
     async fn a_rejected_record_is_never_spooled() {
         let stub = Stub::start(422).await;
         let (_dir, _secret, sidecar) = sidecar(stub.base_url.clone(), 8);
 
         let err = sidecar
-            .submit("writer", &line("writer", "bad"))
+            .submit("writer", false, &line("writer", "bad"))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Rejected(_)), "{err}");
@@ -353,7 +437,7 @@ mod tests {
 
         for n in 0..3 {
             let err = sidecar
-                .submit("writer", &line("writer", &format!("record {n}")))
+                .submit("writer", false, &line("writer", &format!("record {n}")))
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::Spooled), "{err}");
@@ -380,7 +464,7 @@ mod tests {
         let (_dir, secret, sidecar) = sidecar(stub.base_url.clone(), 8);
 
         sidecar
-            .submit("writer", &line("writer", "older"))
+            .submit("writer", false, &line("writer", "older"))
             .await
             .unwrap_err();
         let before_recovery = stub.received().len();
@@ -389,7 +473,7 @@ mod tests {
         // Submitting drains the backlog first, so the older record goes out ahead of the new one
         // even though the new one is the reason anything was sent.
         sidecar
-            .submit("writer", &line("writer", "newer"))
+            .submit("writer", false, &line("writer", "newer"))
             .await
             .unwrap();
         assert_eq!(sidecar.depth().await.unwrap(), 0);
@@ -408,12 +492,12 @@ mod tests {
 
         for _ in 0..2 {
             assert!(matches!(
-                sidecar.submit("writer", &line("writer", "x")).await,
+                sidecar.submit("writer", false, &line("writer", "x")).await,
                 Err(Error::Spooled)
             ));
         }
         let err = sidecar
-            .submit("writer", &line("writer", "x"))
+            .submit("writer", false, &line("writer", "x"))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::SpoolFull), "{err}");
@@ -426,7 +510,7 @@ mod tests {
         let (_dir, _secret, sidecar) = sidecar(stub.base_url.clone(), 8);
 
         let err = sidecar
-            .submit("writer", &line("someone-else", "not mine"))
+            .submit("writer", false, &line("someone-else", "not mine"))
             .await
             .unwrap_err();
         assert!(
@@ -443,7 +527,7 @@ mod tests {
         let (_dir, _secret, sidecar) = sidecar(stub.base_url.clone(), 8);
 
         for line in [&b"not json"[..], b"{}", b"[]"] {
-            let err = sidecar.submit("writer", line).await.unwrap_err();
+            let err = sidecar.submit("writer", false, line).await.unwrap_err();
             assert!(matches!(err, Error::Rejected(_)), "{err}");
         }
         assert!(stub.received().is_empty());
@@ -460,7 +544,7 @@ mod tests {
             serde_json::from_slice(&line("writer", "no action")).unwrap();
         record.action = String::new();
         let err = sidecar
-            .submit("writer", &serde_json::to_vec(&record).unwrap())
+            .submit("writer", false, &serde_json::to_vec(&record).unwrap())
             .await
             .unwrap_err();
         assert!(
@@ -484,7 +568,7 @@ mod tests {
         );
 
         let err = sidecar
-            .submit("writer", &line("writer", "x"))
+            .submit("writer", false, &line("writer", "x"))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Crypto(_)), "{err}");
@@ -529,7 +613,7 @@ mod tests {
     fn an_agent_name_cannot_smuggle_in_a_frame_boundary() {
         let mut record: ActionRecord = serde_json::from_slice(&line("a\nb", "x")).unwrap();
         record.agent = "a\nb".to_owned();
-        let err = parse("a\nb", &serde_json::to_vec(&record).unwrap()).unwrap_err();
+        let err = parse("a\nb", false, &serde_json::to_vec(&record).unwrap()).unwrap_err();
         assert!(matches!(err, Error::Rejected(_)), "{err}");
     }
 }

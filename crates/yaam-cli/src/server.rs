@@ -24,6 +24,7 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use yaam_crypto::keystore::KeyMaterial;
+use yaam_server::auth::Keyring;
 use yaam_server::routes::{self, AppState};
 use yaam_server::service::CoreService;
 
@@ -67,6 +68,14 @@ pub async fn bind(settings: &ServerSettings) -> Result<Bound> {
         .map(keyring::unseal_key)
         .transpose()?;
 
+    // Warned rather than refused, and the asymmetry with the two refusals in `with_subject_resolver`
+    // is deliberate. Those halves disagreeing means bodies written in the clear that an operator
+    // believes are sealed, or a store that cannot key what it says it keys; this one means one
+    // caller's writes are refused, one at a time, with the reason. Refusing to start would make the
+    // order the two files are edited in load-bearing, and take the service down for the safe half of
+    // a mistake.
+    warn_about_ungrounded_grants(&keyring, settings)?;
+
     let pipeline = settings.store.open()?;
     // Read here like every other refusal: a key store whose files cannot be read is a service that
     // would fail sealed writes one request at a time.
@@ -104,6 +113,33 @@ pub async fn bind(settings: &ServerSettings) -> Result<Bound> {
         maintenance: settings.maintenance,
         address,
     })
+}
+
+/// Says so when a caller is granted a class this store cannot resolve.
+///
+/// A keyring that names a subject filer over a store declaring no erasure units is a deployment
+/// where one caller's every record is refused: the grant gets it past the route, and the pipeline
+/// then refuses a subject-derived record that resolves to no subject. That is the safe direction —
+/// nothing is sealed and nothing is written — but it is invisible from this end without the line.
+///
+/// The other way round is not a fault and says nothing: a store may key erasure on something and
+/// have no caller yet permitted to use it. That is the state this deployment has been in since the
+/// resolver was armed, and it is the one to be in while the rest of the runbook is written.
+///
+/// # Errors
+/// A `spec/subjects.yaml` that will not load, which is a refusal rather than a warning.
+fn warn_about_ungrounded_grants(keyring: &Keyring, settings: &ServerSettings) -> Result<()> {
+    let granted = keyring.subject_filers();
+    if granted.is_empty() || settings.store.erasure_units()?.is_some() {
+        return Ok(());
+    }
+    tracing::warn!(
+        agents = granted.join(", "),
+        "the keyring lets these callers file subject_derived records and this store declares no \
+         erasure units, so every such record will be refused: declare the entity kinds in \
+         spec/subjects.yaml, or take the grant out of the keyring"
+    );
+    Ok(())
 }
 
 /// Serves until `shutdown` completes, then finishes what is in flight.
@@ -305,7 +341,9 @@ mod tests {
     use yaam_contract::RecordId;
     use yaam_server::service::CoreService;
 
-    use super::{KeyMaterial, KeyReport, bind, key_warning, serve};
+    use super::{
+        KeyMaterial, KeyReport, bind, key_warning, keyring, serve, warn_about_ungrounded_grants,
+    };
     use crate::cli::{ServerArgs, StoreArgs};
     use crate::config::{DEFAULT_MAINTENANCE_MS, Env, ServerSettings};
     use crate::exit::Exit;
@@ -371,6 +409,33 @@ mod tests {
             bound.maintenance.as_millis(),
             u128::from(DEFAULT_MAINTENANCE_MS)
         );
+    }
+
+    /// A grant over a store that keys erasure on nothing comes up, and says so.
+    ///
+    /// It has to come up: the mismatch refuses one caller's records one at a time, with the reason,
+    /// and refusing to start would make the order two files are edited in load-bearing for the safe
+    /// half of a mistake. What it must not do is come up silently.
+    #[tokio::test]
+    async fn a_grant_over_a_store_with_no_erasure_units_starts_and_is_warned_about() {
+        crate::logging(&Env::default());
+        let deployment = Deployment::new();
+        std::fs::write(
+            deployment.dir.path().join("keyring.json"),
+            r#"{"callers":{"agent_a":{"role":"writer","key":"aabb","files_subject_derived":true}}}"#,
+        )
+        .expect("keyring");
+
+        let settings = deployment.settings("127.0.0.1:0");
+        assert!(
+            settings.store.erasure_units().expect("readable").is_none(),
+            "this fixture tree declares no erasure units"
+        );
+        let keyring = keyring::load(&settings.keyring).expect("loaded");
+        assert_eq!(keyring.subject_filers(), vec!["agent_a"]);
+        warn_about_ungrounded_grants(&keyring, &settings).expect("a warning, not a refusal");
+
+        bind(&settings).await.expect("the service still comes up");
     }
 
     #[tokio::test]
@@ -641,6 +706,7 @@ mod tests {
             agent: record.agent.clone(),
             role: yaam_server::auth::Role::Writer,
             teams: Vec::new(),
+            files_subject_derived: false,
         };
         yaam_server::service::Service::write(service, &caller, record, fixtures::BODY)
             .expect("written");

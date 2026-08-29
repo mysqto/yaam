@@ -68,6 +68,7 @@ async fn sidecar_masking(
     let sockets = vec![CallerSocket {
         agent: agent.to_owned(),
         path: path.clone(),
+        files_subject_derived: false,
     }];
     let state = state.to_path_buf();
     tokio::spawn(async move {
@@ -94,6 +95,7 @@ fn read_socket(agent: &str, record: &Path) -> PathBuf {
     CallerSocket {
         agent: agent.to_owned(),
         path: record.to_path_buf(),
+        files_subject_derived: false,
     }
     .read_path()
 }
@@ -282,6 +284,7 @@ async fn a_sidecar_signing_with_the_wrong_key_is_refused_rather_than_stored() {
     let sockets = vec![CallerSocket {
         agent: "agent_a".to_owned(),
         path: path.clone(),
+        files_subject_derived: false,
     }];
     let dir = state.path().to_path_buf();
     tokio::spawn(async move {

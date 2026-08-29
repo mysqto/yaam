@@ -267,6 +267,18 @@ impl StoreSettings {
         self.with_subject_resolver(pipeline)
     }
 
+    /// The entity kinds this store keys erasure on, or `None` if it keys erasure on nothing.
+    ///
+    /// Read from the tree each time rather than cached on these settings, because that is where the
+    /// declaration lives and a copy of it here would be a second answer to go stale.
+    ///
+    /// # Errors
+    /// A `spec/subjects.yaml` that will not load, in the shape [`SubjectKinds::load`] reports one.
+    pub fn erasure_units(&self) -> Result<Option<SubjectKinds>> {
+        SubjectKinds::load(&self.paths.root)
+            .map_err(|error| failed("reading spec/subjects.yaml", &error))
+    }
+
     /// Fits the resolver this store's `spec/subjects.yaml` asks for, or holds the two halves apart.
     ///
     /// Both halves or neither, refused rather than degraded, because each half alone is a deployment

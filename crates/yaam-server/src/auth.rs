@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use axum::http::HeaderMap;
-use yaam_contract::Visibility;
+use yaam_contract::{DataClass, Visibility};
 use yaam_store::query::Scope;
 
 use crate::{Error, Result};
@@ -33,6 +33,13 @@ pub struct Caller {
     pub role: Role,
     /// Teams whose team-visible records this caller may read.
     pub teams: Vec<String>,
+    /// Whether this caller may file records classified `subject_derived`.
+    ///
+    /// Not a [`Role`], and deliberately not a fourth rung on that ladder. The ladder is ordered --
+    /// an operator covers a writer, which is what makes maintenance possible -- and this must not be
+    /// something a wider badge carries along. It is one narrow permission that most writers do not
+    /// have and that no amount of other authority implies.
+    pub files_subject_derived: bool,
 }
 
 impl Caller {
@@ -101,6 +108,8 @@ pub struct Credential {
     pub keys: SigningKeys,
     /// Teams this agent belongs to. Empty means it reads no team's records.
     pub teams: Vec<String>,
+    /// Whether this agent may file records classified `subject_derived`. Off unless granted.
+    pub files_subject_derived: bool,
 }
 
 impl Credential {
@@ -112,7 +121,19 @@ impl Credential {
             role,
             keys: SigningKeys::new(current_key),
             teams: Vec::new(),
+            files_subject_derived: false,
         }
+    }
+
+    /// Grants this credential the right to file `subject_derived` records.
+    ///
+    /// A builder step rather than a parameter of [`Credential::new`], so every credential in this
+    /// workspace that does not name it is one that cannot seal a body -- and adding the grant is a
+    /// visible edit at the one call site that means it.
+    #[must_use]
+    pub fn filing_subject_derived(mut self) -> Self {
+        self.files_subject_derived = true;
+        self
     }
 
     /// Records the key this credential rolled away from.
@@ -155,6 +176,22 @@ impl Keyring {
     pub fn credential(&self, agent: &str) -> Option<&Credential> {
         self.by_agent.get(agent)
     }
+
+    /// Agents this keyring lets file `subject_derived` records, sorted.
+    ///
+    /// Sorted because the answer is read by a person, in a startup log, once: an order that moved
+    /// between restarts would make two identical configurations look like a change.
+    #[must_use]
+    pub fn subject_filers(&self) -> Vec<&str> {
+        let mut named: Vec<&str> = self
+            .by_agent
+            .values()
+            .filter(|credential| credential.files_subject_derived)
+            .map(|credential| credential.agent.as_str())
+            .collect();
+        named.sort_unstable();
+        named
+    }
 }
 
 /// Verifies a signature over the request and resolves the caller.
@@ -180,6 +217,7 @@ pub fn verify(
             agent: credential.agent.clone(),
             role: credential.role,
             teams: credential.teams.clone(),
+            files_subject_derived: credential.files_subject_derived,
         })
     } else {
         Err(Error::Unauthenticated)
@@ -205,6 +243,38 @@ pub fn authorise_write(caller: &Caller, record_agent: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Rejects a write whose class this caller was not granted.
+///
+/// Separate from [`authorise_write`] because it answers a different question about the same request:
+/// that one asks whose history this record joins, this one asks whether the caller may make a body
+/// unreadable for ever. A caller can be entirely entitled to write and not entitled to this.
+///
+/// Checked at the route, ahead of [`yaam_contract::ActionRecord::validate`], so a caller that may
+/// not file the class is told *that* rather than told what else is wrong with a record it was never
+/// going to be allowed to send. And ahead of the pipeline for the reason the whole check exists: by
+/// the time the resolver has an answer, the question of whether this caller was allowed to ask it
+/// has already been decided by the record.
+///
+/// The mirror of this check lives in the sidecar's configuration, per caller socket. Two statements
+/// of one grant, and this is the one that binds: a sidecar runs on the caller's host, so a host that
+/// edited its own configuration would otherwise be granting itself something the deployment did not.
+///
+/// # Errors
+/// [`Error::Forbidden`] when the record is not `internal` and the credential carries no grant.
+pub fn authorise_class(caller: &Caller, class: DataClass) -> Result<()> {
+    if class == DataClass::Internal || caller.files_subject_derived {
+        return Ok(());
+    }
+    Err(Error::Forbidden(format!(
+        "`{}` may not file `{}` records: its keyring entry carries no such grant. That class seals \
+         the body under a key that can be destroyed and files a subject linkage this store has no \
+         way to correct -- there is no re-key and no delete -- so which callers may claim it is the \
+         deployment's decision and not a field of the record",
+        caller.agent,
+        class.as_str()
+    )))
 }
 
 /// Rejects a caller whose role does not cover `needed`.
@@ -269,6 +339,7 @@ mod tests {
                 agent: "agent-writer".to_owned(),
                 role: Role::Writer,
                 teams: Vec::new(),
+                files_subject_derived: false,
             }
         );
     }
@@ -416,6 +487,7 @@ mod tests {
             agent: "agent-operator".to_owned(),
             role: Role::Operator,
             teams: vec!["platform".to_owned()],
+            files_subject_derived: false,
         };
         let Scope::Caller { visibility, .. } = operator.scope() else {
             panic!("an operator reads under its own scope too");
@@ -429,6 +501,7 @@ mod tests {
             agent: "agent-writer".to_owned(),
             role: Role::Writer,
             teams: Vec::new(),
+            files_subject_derived: false,
         };
         assert!(authorise_write(&writer, "agent-writer").is_ok());
 
@@ -442,11 +515,85 @@ mod tests {
             agent: "agent-reader".to_owned(),
             role: Role::Reader,
             teams: Vec::new(),
+            files_subject_derived: false,
         };
         assert!(matches!(
             authorise_write(&reader, "agent-reader"),
             Err(Error::Forbidden(_))
         ));
+    }
+
+    /// Every caller may file the class this store has always written, granted or not.
+    #[test]
+    fn an_internal_record_needs_no_grant() {
+        let writer = Caller {
+            agent: "agent-writer".to_owned(),
+            role: Role::Writer,
+            teams: Vec::new(),
+            files_subject_derived: false,
+        };
+        authorise_class(&writer, DataClass::Internal).expect("the shipped class");
+    }
+
+    /// The refusal this grant exists to make, and the words an operator has to be able to find.
+    #[test]
+    fn a_caller_without_the_grant_may_not_file_a_subject_derived_record() {
+        let writer = Caller {
+            agent: "agent-writer".to_owned(),
+            role: Role::Writer,
+            teams: Vec::new(),
+            files_subject_derived: false,
+        };
+        let Err(Error::Forbidden(message)) = authorise_class(&writer, DataClass::SubjectDerived)
+        else {
+            panic!("an ungranted caller must not seal a body");
+        };
+        assert!(message.contains("agent-writer"), "{message}");
+        assert!(message.contains("subject_derived"), "{message}");
+    }
+
+    /// And the grant is what lets it through. Nothing else about the credential does.
+    #[test]
+    fn the_grant_is_what_permits_the_class() {
+        let filer = Caller {
+            agent: "agent-filer".to_owned(),
+            role: Role::Writer,
+            teams: Vec::new(),
+            files_subject_derived: true,
+        };
+        authorise_class(&filer, DataClass::SubjectDerived).expect("granted");
+    }
+
+    /// The reason this is not a rung on the role ladder: an operator covers a writer, so a fourth
+    /// rung would hand sealing to every maintenance credential the deployment has.
+    #[test]
+    fn an_operator_does_not_inherit_the_grant() {
+        let operator = Caller {
+            agent: "agent-ops".to_owned(),
+            role: Role::Operator,
+            teams: Vec::new(),
+            files_subject_derived: false,
+        };
+        assert!(matches!(
+            authorise_class(&operator, DataClass::SubjectDerived),
+            Err(Error::Forbidden(_))
+        ));
+    }
+
+    /// A credential carries no grant unless one was asked for, and the keyring can say who has one.
+    #[test]
+    fn the_grant_is_off_until_it_is_built_in() {
+        assert!(!Credential::new("agent-writer", Role::Writer, CURRENT).files_subject_derived);
+        assert!(
+            Credential::new("agent-filer", Role::Writer, CURRENT)
+                .filing_subject_derived()
+                .files_subject_derived
+        );
+
+        let ring = keyring()
+            .with(Credential::new("agent-filer", Role::Writer, CURRENT).filing_subject_derived());
+        assert_eq!(ring.subject_filers(), vec!["agent-filer"]);
+        assert!(keyring().subject_filers().is_empty());
     }
 
     #[test]
@@ -464,6 +611,7 @@ mod tests {
             agent: "agent-writer".to_owned(),
             role: Role::Writer,
             teams: Vec::new(),
+            files_subject_derived: false,
         };
         assert!(require_role(&writer, Role::Writer).is_ok());
         let Err(Error::Forbidden(message)) = require_role(&writer, Role::Operator) else {

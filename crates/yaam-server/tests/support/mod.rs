@@ -85,6 +85,7 @@ pub fn caller(agent: &str, role: Role, teams: &[&str]) -> Caller {
         agent: agent.to_owned(),
         role,
         teams: teams.iter().map(|team| (*team).to_owned()).collect(),
+        files_subject_derived: false,
     }
 }
 

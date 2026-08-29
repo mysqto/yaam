@@ -93,6 +93,12 @@ pub struct CallerSocket {
     pub agent: String,
     /// Filesystem path of the record socket.
     pub path: std::path::PathBuf,
+    /// Whether records arriving here may be classified `subject_derived`.
+    ///
+    /// On the socket rather than looked up per record, because the socket is already the evidence of
+    /// who is writing -- it is what refuses a record claiming another agent -- and a second lookup
+    /// keyed on the name in the record would be a lookup a record could steer.
+    pub files_subject_derived: bool,
 }
 
 impl CallerSocket {
@@ -144,6 +150,22 @@ pub struct Config {
     /// service already did, and why configuring this is worth the trouble.
     #[serde(default)]
     pub redaction_policy_file: Option<PathBuf>,
+    /// Callers whose records may be classified `subject_derived`. Empty by default, which is every
+    /// deployment that has not decided otherwise.
+    ///
+    /// A caller not named here has such a record refused on its own socket, before anything is
+    /// masked, sealed or spooled, whatever wrote it -- `yaam-file`, a hand-built JSON line, or an
+    /// agent that guessed. That refusal is the one this file exists to make: `data_class` decides
+    /// whether a body is sealed and a subject linkage becomes permanent, the store has no re-key and
+    /// no delete, and most callers on a host like this are model-driven.
+    ///
+    /// The same fact is stated again in the service's keyring, per credential, and both are
+    /// checked. Two statements of one credential is how [`crate::upstream::Upstream`]'s signing keys
+    /// already work, and for the reason that applies here twice over: a sidecar is on the caller's
+    /// host and the service is not, so a host whose configuration is edited by whoever runs the
+    /// caller cannot grant itself anything the deployment did not.
+    #[serde(default)]
+    pub files_subject_derived: Vec<String>,
 }
 
 /// The bounds a running sidecar works within.
@@ -351,7 +373,7 @@ where
             tracing::info!(%agent, serves, path = %path.display(), "listening");
             accepting.spawn(accept_loop(
                 listener,
-                socket.agent.clone(),
+                socket.clone(),
                 owner,
                 serving,
                 closed.clone(),
@@ -476,7 +498,7 @@ fn remove_socket(path: &Path) {
 /// socket that is about to be removed.
 async fn accept_loop(
     listener: UnixListener,
-    agent: String,
+    caller: CallerSocket,
     owner: u32,
     serving: Serving,
     mut closed: watch::Receiver<bool>,
@@ -491,12 +513,13 @@ async fn accept_loop(
         };
         match accepted {
             Ok((stream, _)) => {
-                let (agent, closed) = (agent.clone(), closed.clone());
+                let (caller, closed) = (caller.clone(), closed.clone());
                 let serving = serving.clone();
                 connections.spawn(async move {
+                    let agent = caller.agent.clone();
                     let served = match &serving {
                         Serving::Records(sidecar) => {
-                            serve_connection(stream, &agent, owner, sidecar, closed).await
+                            serve_connection(stream, &caller, owner, sidecar, closed).await
                         }
                         Serving::Reads(proxy) => proxy.serve(stream, &agent, owner, closed).await,
                     };
@@ -506,7 +529,7 @@ async fn accept_loop(
                 });
             }
             Err(e) => {
-                tracing::warn!(agent = %agent, error = %e, "accept failed");
+                tracing::warn!(agent = %caller.agent, error = %e, "accept failed");
                 tokio::time::sleep(ACCEPT_BACKOFF).await;
             }
         }
@@ -535,11 +558,12 @@ async fn retry_loop(sidecar: Arc<Sidecar>, interval: Duration) {
 /// Handles one caller connection: verify who it is, then a line at a time.
 async fn serve_connection(
     stream: UnixStream,
-    agent: &str,
+    caller: &CallerSocket,
     owner: u32,
     sidecar: &Sidecar,
     mut closed: watch::Receiver<bool>,
 ) -> crate::Result<()> {
+    let agent = caller.agent.as_str();
     let peer = stream.peer_cred()?;
     if !peer_owns_socket(peer.uid(), owner) {
         tracing::warn!(
@@ -582,7 +606,9 @@ async fn serve_connection(
         if trimmed.is_empty() {
             continue;
         }
-        let outcome = sidecar.submit(agent, trimmed).await;
+        let outcome = sidecar
+            .submit(agent, caller.files_subject_derived, trimmed)
+            .await;
         answer(&mut write, &outcome).await?;
     }
 }
@@ -820,6 +846,7 @@ mod tests {
         let socket = CallerSocket {
             agent: "writer".to_owned(),
             path: path.clone(),
+            files_subject_derived: false,
         };
         let serving = start(vec![socket], dir.path()).await;
 
@@ -854,6 +881,7 @@ mod tests {
             vec![CallerSocket {
                 agent: "writer".to_owned(),
                 path: path.clone(),
+                files_subject_derived: false,
             }],
             dir.path(),
         )
@@ -915,6 +943,7 @@ mod tests {
             vec![CallerSocket {
                 agent: "writer".to_owned(),
                 path: path.clone(),
+                files_subject_derived: false,
             }],
             dir.path(),
         )
@@ -937,6 +966,7 @@ mod tests {
             .map(|agent| CallerSocket {
                 agent: agent.to_owned(),
                 path: dir.path().join(format!("{agent}.sock")),
+                files_subject_derived: false,
             })
             .collect();
         let serving = start(sockets.clone(), dir.path()).await;
@@ -966,6 +996,7 @@ mod tests {
             vec![CallerSocket {
                 agent: "writer".to_owned(),
                 path: path.clone(),
+                files_subject_derived: false,
             }],
             dir.path(),
         )
@@ -999,6 +1030,7 @@ mod tests {
             vec![CallerSocket {
                 agent: "writer".to_owned(),
                 path: path.clone(),
+                files_subject_derived: false,
             }],
             dir.path(),
         )
@@ -1025,6 +1057,7 @@ mod tests {
             vec![CallerSocket {
                 agent: "writer".to_owned(),
                 path: path.clone(),
+                files_subject_derived: false,
             }],
             dir.path(),
         )
@@ -1054,6 +1087,7 @@ mod tests {
         let socket = CallerSocket {
             agent: "writer".to_owned(),
             path: path.clone(),
+            files_subject_derived: false,
         };
         let serving = start(vec![socket], dir.path()).await;
         assert_eq!(
@@ -1074,6 +1108,7 @@ mod tests {
         let socket = CallerSocket {
             agent: "writer".to_owned(),
             path: path.clone(),
+            files_subject_derived: false,
         };
         let serving = start(vec![socket.clone()], dir.path()).await;
 
@@ -1099,6 +1134,7 @@ mod tests {
         let sockets = vec![CallerSocket {
             agent: "writer".to_owned(),
             path: path.clone(),
+            files_subject_derived: false,
         }];
 
         let (stop, serving) = start_until(&sockets, dir.path());
@@ -1147,6 +1183,7 @@ mod tests {
         let sockets = vec![CallerSocket {
             agent: "writer".to_owned(),
             path: path.clone(),
+            files_subject_derived: false,
         }];
 
         let (stop, serving) = start_until(&sockets, dir.path());
@@ -1190,6 +1227,7 @@ mod tests {
             &[CallerSocket {
                 agent: "writer".to_owned(),
                 path,
+                files_subject_derived: false,
             }],
             dir.path(),
             &config.upstream().unwrap(),
@@ -1210,6 +1248,7 @@ mod tests {
             &[CallerSocket {
                 agent: "stranger".to_owned(),
                 path: path.clone(),
+                files_subject_derived: false,
             }],
             dir.path(),
             &config.upstream().unwrap(),
@@ -1228,6 +1267,7 @@ mod tests {
         let socket = CallerSocket {
             agent: "writer".to_owned(),
             path: dir.path().join("sockets/writer.sock"),
+            files_subject_derived: false,
         };
         let reads = socket.read_path();
         assert_eq!(reads, dir.path().join("sockets/writer.read.sock"));
@@ -1274,6 +1314,7 @@ mod tests {
         let socket = CallerSocket {
             agent: "writer".to_owned(),
             path: dir.path().join("sockets/writer.sock"),
+            files_subject_derived: false,
         };
         let reads = socket.read_path();
         let serving = start(vec![socket], dir.path()).await;
@@ -1304,6 +1345,7 @@ mod tests {
             CallerSocket {
                 agent: "writer".to_owned(),
                 path: std::path::PathBuf::from(path),
+                files_subject_derived: false,
             }
             .read_path()
         };
@@ -1369,6 +1411,7 @@ mod tests {
             retry_interval_ms: 1,
             spool_capacity: 1,
             redaction_policy_file: None,
+            files_subject_derived: Vec::new(),
         };
         assert!(config.upstream().is_err(), "a key that is not hex");
 
@@ -1411,6 +1454,7 @@ mod tests {
             retry_interval_ms: 1,
             spool_capacity: 1,
             redaction_policy_file: None,
+            files_subject_derived: Vec::new(),
         };
         assert!(short.upstream().is_err());
 

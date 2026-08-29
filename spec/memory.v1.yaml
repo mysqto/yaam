@@ -194,6 +194,15 @@ paths:
         the trail — a caller able to write as another agent can also write the record that explains
         away what it did — so a mismatch is `403` and never reaches the store.
 
+        `data_class: subject_derived` is a separate permission, granted per credential and carried by
+        no role. It is what makes the body sealed under a key that can be destroyed, and what files a
+        subject linkage the store has no way to correct — there is no re-key and no delete — so a
+        caller the deployment has not granted it is `403` and nothing is written, however entitled to
+        write it otherwise is. A caller that has the grant still does not choose the record's
+        subjects: it names the transaction as an ordinary entity reference at `confidence: 1.0`, and
+        the service's own resolver derives the pseudonyms from the entity kinds the deployment
+        declares as erasure units. A record naming none of them is refused.
+
         Bodies are capped at 1 MiB. The signature covers the whole body, so the body must be held in
         memory before anything about it can be trusted; the cap is what stops that being a
         memory-exhaustion lever. Oversize is `422`, because resending the same bytes cannot help.
@@ -286,14 +295,25 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '403':
           description: |
-            The caller may read but not write, or tried to attribute the record to another agent.
-            Nothing was stored.
+            The caller may read but not write, tried to attribute the record to another agent, or
+            classified the record `subject_derived` without the grant that permits it. Nothing was
+            stored. All three are decided before the record is validated, so a `403` says nothing
+            about whether the record was otherwise well formed.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-              example:
-                error: 'forbidden: `agent_b` may not attribute a record to `agent_a`'
+              examples:
+                attribution:
+                  summary: Filing under another agent's name
+                  value:
+                    error: 'forbidden: `agent_b` may not attribute a record to `agent_a`'
+                data_class:
+                  summary: Claiming a class the credential was not granted
+                  value:
+                    error: >-
+                      forbidden: `agent_a` may not file `subject_derived` records: its keyring entry
+                      carries no such grant.
         '422':
           description: |
             Permanent. The body is not JSON, is larger than 1 MiB, carries a field no schema in it

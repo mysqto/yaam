@@ -70,6 +70,23 @@ pub enum DataClass {
     SubjectDerived,
 }
 
+impl DataClass {
+    /// How this class is spelled on the wire and in every derived copy.
+    ///
+    /// [`Visibility::as_str`]'s reason, and one more: the refusals a caller reads when it may not
+    /// file this class name it, and a message that spelled it any other way would send an operator
+    /// looking for a word their configuration does not use. §10.4 calls the class
+    /// `customer_derived` throughout and the code has always called it `subject_derived`; one
+    /// spelling, in one function, is what keeps a third from appearing in prose.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::SubjectDerived => "subject_derived",
+        }
+    }
+}
+
 /// The part a subject plays in a record.
 // Renamed for the schema, as `entity::Role` is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

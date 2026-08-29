@@ -1,18 +1,19 @@
-//! The five entry points, and the configuration all of them agree on.
+//! The six entry points, and the configuration all of them agree on.
 //!
 //! Everything lives here rather than in the `main.rs` files for one reason: a binary-only crate
 //! cannot be unit tested, and the interesting parts of a command-line tool — what it accepts, what
 //! it refuses, what it prints and what it exits with — are exactly the parts worth testing. Each
 //! `main` is one statement.
 //!
-//! # The five
+//! # The six
 //!
 //! | Binary | What it is |
 //! |---|---|
 //! | `yaam-server` | The HTTP service, plus the maintenance its store needs. |
 //! | `yaam-agent` | The local sidecar: two sockets per caller, sealing and signing on their behalf. |
 //! | `yaam` | The operator command line: rebuild, drain, erase, verify, read a sealed body, back up, restore, read health, guard a commit, derive knowledge. |
-//! | `yaam-emit` | One record, built from arguments and written to a caller socket. |
+//! | `yaam-emit` | One record about what an agent did, built from arguments and written to a caller socket. |
+//! | `yaam-file` | The same, about one transaction: `subject_derived`, so the store seals its body. |
 //! | `yaam-read` | One read, sent to a caller read socket; the service's answer, unchanged. |
 //!
 //! One crate, because the first two open the same store and have to agree about where it is. Two
@@ -20,15 +21,24 @@
 //! be a service reading an index that nothing writes — which is a failure with no symptom except
 //! empty answers.
 //!
-//! `yaam-emit` and `yaam-read` are here for the neighbouring reason. Neither opens a store at all,
-//! but both report the same [`exit`] codes, and a crate of their own would be a second copy of that
-//! table. They are binaries rather than `yaam emit` and `yaam read` subcommands because the operator
+//! `yaam-file` is a separate binary from `yaam-emit` and not a flag on it, which is the one place in
+//! this crate where a *binary* carries a permission. `data_class` decides whether a body is sealed
+//! and a subject linkage becomes permanent, this store has no re-key and no delete, and most callers
+//! here are model-driven — so the classification may not be a flag a caller could set by judgement.
+//! Being a different program on a different host is what makes it a thing an operator installs. Two
+//! grants outside this crate stand behind it, at the sidecar and at the service; see
+//! [`cli::FileCli`].
+//!
+//! `yaam-emit`, `yaam-file` and `yaam-read` are here for the neighbouring reason. Neither opens a store at all,
+//! but all report the same [`exit`] codes, and a crate of their own would be a second copy of that
+//! table. They are binaries rather than `yaam emit`, `yaam file` and `yaam read` subcommands because the operator
 //! command line flattens [`cli::StoreArgs`] above its subcommands, so either would offer `--root`
 //! however little it did with one — and a flag inviting a caller to open the memory tree is
 //! precisely what the sidecar exists to make unnecessary.
 //!
-//! The cost is that the sidecar, the emitter and the reader link what the service links. It is worth
-//! naming: all three run on the caller's host, and smaller ones would be better. If that footprint
+//! The cost is that the sidecar, both emitters and the reader link what the service links. It is
+//! worth naming: all of them run on a caller's host, and smaller ones would be better. If that
+//! footprint
 //! ever matters more than the agreement does, the split to make is [`config`] into a leaf crate of
 //! its own — not five copies of it.
 //!
@@ -67,7 +77,7 @@ use std::io::Write;
 
 use clap::Parser;
 
-use crate::cli::{AgentCli, Command, EmitCli, OperatorCli, ReadCli, ServerCli};
+use crate::cli::{AgentCli, Command, EmitCli, FileCli, OperatorCli, ReadCli, ServerCli};
 use crate::config::{
     AgentSettings, EmitSettings, Env, ReadSettings, ServerSettings, StoreSettings,
 };
@@ -118,6 +128,25 @@ where
 {
     match parsed::<EmitCli, _, _>(args) {
         Ok(cli) => report("yaam-emit", run_emitter(&cli, env, out)),
+        Err(code) => code,
+    }
+}
+
+/// Files one record about a transaction to a caller socket, and returns the process exit code.
+///
+/// The emitter with one constant changed, and the constant is the point: [`emit::Filing`] is a
+/// parameter rather than a flag, `emitter` passes [`emit::Filing::Internal`] as a literal, and this
+/// passes [`emit::Filing::Transaction`] built from an argument clap requires. Neither binary parses
+/// anything that reaches the other's constant, so which of the two is installed on a host is the
+/// whole of what that host can classify.
+#[must_use]
+pub fn filer<I, T>(args: I, env: &Env, out: &mut dyn Write) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    match parsed::<FileCli, _, _>(args) {
+        Ok(cli) => report("yaam-file", run_filer(&cli, env, out)),
         Err(code) => code,
     }
 }
@@ -284,7 +313,26 @@ fn run_service(cli: &ServerCli, env: &Env) -> Result<Exit> {
 /// having: one that succeeded where the send would fail would be a rehearsal of a different play.
 fn run_emitter(cli: &EmitCli, env: &Env, out: &mut dyn Write) -> Result<Exit> {
     let settings = EmitSettings::resolve(&cli.args, env)?;
-    emit::emit(&settings, &cli.args, out)
+    // A literal, and the only place `yaam-emit` names a class. Nothing this binary parses reaches
+    // it, which is what keeps its own account of itself true: "the data class stays `internal`, and
+    // both are fixed rather than defaulted".
+    emit::emit(&settings, &cli.args, emit::Filing::Internal, out)
+}
+
+/// One record about a transaction, once its arguments are known.
+///
+/// The erasure unit is clap's to require, so there is no reachable path here that files a record
+/// with no transaction named, and none that files one internal.
+fn run_filer(cli: &FileCli, env: &Env, out: &mut dyn Write) -> Result<Exit> {
+    let settings = EmitSettings::resolve(&cli.args, env)?;
+    emit::emit(
+        &settings,
+        &cli.args,
+        emit::Filing::Transaction {
+            unit: &cli.erasure_unit,
+        },
+        out,
+    )
 }
 
 /// One read, once its arguments are known.

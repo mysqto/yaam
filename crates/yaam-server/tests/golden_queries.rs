@@ -65,15 +65,20 @@ enum Attr {
 /// Entitlements reach a read from the credential the signature proved and from nowhere else, so this
 /// one table is the whole of what makes the scoped rows below assert something: change a caller's
 /// teams here and its answers change.
-const AGENTS: &[(&str, Role, &[&str])] = &[
-    ("deploy_bot", Role::Writer, &["platform"]),
-    ("ledger_bot", Role::Writer, &["platform"]),
-    ("release_bot", Role::Writer, &["platform"]),
-    ("review_bot", Role::Writer, &["platform"]),
-    ("chat_bot", Role::Writer, &["platform", "support"]),
-    ("ops_bot", Role::Operator, &["platform", "support"]),
+///
+/// The fourth column is the grant that lets a caller classify a record `subject_derived`. It is
+/// `ledger_bot`'s alone here, because `ledger_bot` is the only fixture writer that files records
+/// about transactions -- and it is a column rather than a role because no role carries it: an
+/// operator covers a writer, and sealing a body must not be something a wider badge picks up.
+const AGENTS: &[(&str, Role, &[&str], bool)] = &[
+    ("deploy_bot", Role::Writer, &["platform"], false),
+    ("ledger_bot", Role::Writer, &["platform"], true),
+    ("release_bot", Role::Writer, &["platform"], false),
+    ("review_bot", Role::Writer, &["platform"], false),
+    ("chat_bot", Role::Writer, &["platform", "support"], false),
+    ("ops_bot", Role::Operator, &["platform", "support"], false),
     // In no team, which is what makes the team-scoped rows below assert something.
-    ("audit_reader", Role::Reader, &[]),
+    ("audit_reader", Role::Reader, &[], false),
 ];
 
 /// One record to write, in the terms an emitter would fill in.
@@ -1122,8 +1127,14 @@ const GOLDEN: &[Case] = &[
 fn keyring() -> Keyring {
     AGENTS
         .iter()
-        .fold(Keyring::new(), |ring, (agent, role, teams)| {
-            ring.with(Credential::new(*agent, *role, support::KEY).in_teams(teams.iter().copied()))
+        .fold(Keyring::new(), |ring, (agent, role, teams, files)| {
+            let credential =
+                Credential::new(*agent, *role, support::KEY).in_teams(teams.iter().copied());
+            ring.with(if *files {
+                credential.filing_subject_derived()
+            } else {
+                credential
+            })
         })
 }
 

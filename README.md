@@ -43,7 +43,7 @@ crates/
   yaam-knowledge  facts derived from record structure, rebuilt wholesale from the record tree
   yaam-server     HTTP service
   yaam-agent      local sidecar: two sockets per caller, seals and signs on their behalf
-  yaam-cli        the five entry points: `yaam-server`, `yaam-agent`, `yaam`, `yaam-emit`, `yaam-read`
+  yaam-cli        the six entry points: `yaam-server`, `yaam-agent`, `yaam`, `yaam-emit`, `yaam-file`, `yaam-read`
 hooks/            the pre-commit guard for a repository holding a backup, and its installer
 xtask/            repository chores: generates spec/schemas, checks the shapes behind it
 spec/             the contract bundle other implementations vendor
@@ -58,20 +58,20 @@ spec/             the contract bundle other implementations vendor
 
 ## Running it
 
-Five binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
+Six binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
 `--key-store` default to sitting under it, and every setting is also read from the environment
 (`YAAM_ROOT`, `YAAM_INDEX`, `YAAM_KEY_STORE`, `YAAM_KEY_PASSPHRASE_FILE`,
 `YAAM_SUBJECT_KEY_FILE`, `YAAM_LISTEN`, `YAAM_KEYRING`, `YAAM_UNSEAL_KEY_FILE`,
 `YAAM_MAINTENANCE_MS`, `YAAM_AGENT_STATE`, `YAAM_SOCKET`, `YAAM_AGENT`, `YAAM_READ_SOCKET`,
 `YAAM_LOG`). A flag beats the environment.
 
-Two of the five open a store and three never do. `yaam-agent`, `yaam-emit` and `yaam-read` run on the
-caller's host and have no `--root` to give them: that is what lets a caller record what it did, and
-read what it remembers, while holding no key material and no path into anyone's memory tree. The one
-directory a caller-side binary will read is the one `--infer-entities` names — `yaam-emit` to lift
-references onto a record, `yaam-read bundle` to turn a request's own prose into lookup keys — and
-each reads two configuration files out of it. A spec directory is not a store, and nothing in either
-binary could open one.
+Two of the six open a store and four never do. `yaam-agent`, `yaam-emit`, `yaam-file` and
+`yaam-read` run on the caller's host and have no `--root` to give them: that is what lets a caller
+record what it did, and read what it remembers, while holding no key material and no path into
+anyone's memory tree. The one directory a caller-side binary will read is the one `--infer-entities`
+names — the emitters to lift references onto a record, `yaam-read bundle` to turn a request's own
+prose into lookup keys — and each reads two configuration files out of it. A spec directory is not a
+store, and nothing in any of them could open one.
 
 The service drains fan-out and sweeps every `--maintenance-ms` (30 s by default) *and* once at
 startup, so a process that comes up over an interrupted write converges without waiting an interval
@@ -291,9 +291,48 @@ memory tree.
 declaring a policy that was never run gives a false account of its own redaction; the emitter turns
 that refusal into the flag to change rather than a status code.
 
-Subjects stay empty and the data class stays `internal`. What a subject *is* — how a person becomes a
-pseudonym, and under whose canonicalisation — is still an open decision, so there is deliberately no
-flag: one would let a caller declare a record erasable that the deployment cannot erase.
+Subjects stay empty and the data class stays `internal`, and no flag on this binary changes either.
+A subject named here could only be invented — the secret a pseudonym is derived under lives with the
+service — and a data-class flag on the binary every agent runs would be an invitation to decide by
+judgement the one field that must be decided by rule. Filing a record the store will seal is
+`yaam-file`'s, below.
+
+### Filing a record about a transaction
+
+`yaam-file` is `yaam-emit` with one thing changed: it classifies the record `subject_derived`, so the
+store seals the body under a key that can be destroyed. Same arguments, same protocol, same exit
+codes, plus one that is required:
+
+```bash
+yaam-file --erasure-unit order_ref:ord10014733 \
+          --action refund --outcome success --summary "…"
+```
+
+**A record is subject-derived if and only if it names the transaction it is about.** That is the
+whole rule, and it is one argument rather than two on purpose: there is no way to invoke this binary
+and leave a body in the clear, and no way to claim a record erasable without stating the reference
+that makes it so. The reference is recorded as an ordinary stated entity at confidence `1.0`, which
+is what the service's resolver requires — a reference lifted from prose is a guess, and a guess may
+not decide whether a body is sealed.
+
+`subjects` stays empty here too. This binary holds no keying secret and cannot derive a pseudonym;
+the service does that, from this reference, under the entity kinds the store's own
+`spec/subjects.yaml` declares as erasure units. A kind it does not declare is a refused record, not a
+plaintext one.
+
+A separate binary rather than a flag, because `data_class` decides whether a body is sealed and a
+subject linkage becomes permanent, and the store has no re-key, no re-seal and no delete. Installing
+it is a decision an operator makes about a host; a flag would be one a caller makes about a record.
+Two grants stand behind it, and neither is on its command line:
+
+| where | what it says |
+|---|---|
+| the sidecar's `upstream.json`, `files_subject_derived: [agent]` | which callers may send the class on their own socket. An unlisted caller is refused there, before anything is masked, sealed or spooled — whether the record came from this binary or from a line of JSON somebody wrote by hand |
+| the service's keyring, `"files_subject_derived": true` per caller | which credentials may send it at all. `403`, and nothing is written. This is the one that binds: a sidecar's configuration is edited by whoever runs the caller, and the keyring is not |
+
+Both default to nobody, and stay that way for a configuration written before they existed. A store
+that declares no erasure units refuses the class regardless, so the two halves — the writer and the
+resolver — can be turned on in either order without a record being written wrong.
 
 ### Reading it back
 

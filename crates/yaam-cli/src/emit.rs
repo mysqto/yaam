@@ -9,8 +9,21 @@
 //!
 //! Minted here: the identifier, both timestamps, the schema version, and every empty collection.
 //! Asked for: the agent, what was done, how it went, the prose, and whatever attributes, entity
-//! references and tags the caller has. Fixed: `subjects` is empty and `data_class` is
-//! [`DataClass::Internal`] — see [`crate::cli::EmitCli`] for why there is no flag.
+//! references and tags the caller has. Fixed: `subjects` is empty, whichever binary is calling —
+//! see [`crate::cli::EmitCli`] for why there is no flag for it.
+//!
+//! # The one field that is not the caller's to toggle
+//!
+//! `data_class` arrives as [`Filing`], a parameter of [`emit`] rather than a flag, and the two
+//! binaries that call it pass a different constant each. `yaam-emit` passes [`Filing::Internal`] as
+//! a literal and parses nothing that could reach the parameter, so it still cannot produce a
+//! subject-derived record and the eighteen flags it does have still cannot make it. `yaam-file`
+//! passes [`Filing::Transaction`] built from its one required argument, so it cannot produce an
+//! internal one, and cannot produce anything without saying which transaction the record is about.
+//!
+//! Which binary is on a host is therefore the whole of what that host can classify — a fact an
+//! operator installs rather than one a caller decides at runtime. The store does not take either
+//! binary's word for it: see [`crate::cli::FileCli`] for the two refusals behind this one.
 //!
 //! # The timestamps, and why one flag is not enough
 //!
@@ -107,11 +120,58 @@ const LIVE_SKEW_MS: i64 = 5_000;
 /// running, and a flag would let one claim a version whose fields it is not sending.
 const SCHEMA_VER: SchemaVer = SchemaVer(1);
 
+/// What a writer says a record is about, and therefore whether its body is sealed.
+///
+/// The one thing on a record that no process may decide by judgement. §10.4's rule is that
+/// `data_class` and subject resolution "are settled by deterministic rules only — never by an LLM's
+/// judgement, and never by a skill", and this enum is where that rule is kept: it is not a flag with
+/// a default, and neither variant is reachable from the other's command line. [`Filing::Internal`]
+/// is a literal at `yaam-emit`'s call site — that binary parses no argument that reaches this — and
+/// [`Filing::Transaction`] is reachable only from `yaam-file`, whose erasure unit is required, so
+/// there is no invocation of it that produces an internal record and none that produces a
+/// subject-derived one without naming the transaction it is about.
+///
+/// That pairing is the whole safety argument. A `--subject-derived` flag beside the other eighteen
+/// would be a switch a caller could throw without saying what the record is about; here the class
+/// and the reference the store keys erasure on are one argument, so a record cannot claim to be
+/// erasable without stating the thing that makes it erasable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filing<'a> {
+    /// About this deployment's own work. `internal`, plaintext body, no subject, for ever.
+    Internal,
+    /// About one transaction, named as `kind:id` in the spelling `spec/entities.yaml` declares.
+    ///
+    /// The reference is recorded as a stated entity at [`extract::FIELD_CONFIDENCE`], which is what
+    /// the store's resolver requires before it will key erasure on it, and the record is classified
+    /// `subject_derived`. `subjects` stays empty all the same: the pseudonym is derived under a
+    /// secret that lives with the service, so a value named here could only be one this host
+    /// invented.
+    Transaction {
+        /// The erasure unit, as `kind:id`.
+        unit: &'a str,
+    },
+}
+
+impl Filing<'_> {
+    /// The class a record filed this way carries.
+    fn data_class(self) -> DataClass {
+        match self {
+            Self::Internal => DataClass::Internal,
+            Self::Transaction { .. } => DataClass::SubjectDerived,
+        }
+    }
+}
+
 /// Builds one record from the arguments and sends it, reporting what became of it.
 ///
 /// Validated locally before it is sent, so a record that cannot possibly be accepted fails here —
 /// naming the field — rather than after a round trip that names it second-hand.
-pub fn emit(settings: &EmitSettings, args: &EmitArgs, out: &mut dyn Write) -> Result<Exit> {
+pub fn emit(
+    settings: &EmitSettings,
+    args: &EmitArgs,
+    filing: Filing<'_>,
+    out: &mut dyn Write,
+) -> Result<Exit> {
     // Ahead of the record, so a dry run fails on an unreadable spec directory too. The flag asks for
     // references the record will carry, which makes it part of building one rather than of sending
     // it — and a dry run that skipped the check would rehearse a record the real send could not make.
@@ -120,7 +180,7 @@ pub fn emit(settings: &EmitSettings, args: &EmitArgs, out: &mut dyn Write) -> Re
         .as_deref()
         .map(infer::load)
         .transpose()?;
-    let record = record(settings, args, inferring.as_ref(), now_ms())?;
+    let record = record(settings, args, filing, inferring.as_ref(), now_ms())?;
     record
         .validate()
         .map_err(|error| Error::Rejected(error.to_string()))?;
@@ -314,6 +374,7 @@ fn silence(socket: &Path, error: &std::io::Error) -> Error {
 fn record(
     settings: &EmitSettings,
     args: &EmitArgs,
+    filing: Filing<'_>,
     extractor: Option<&Extractor>,
     now: i64,
 ) -> Result<ActionRecord> {
@@ -333,12 +394,16 @@ fn record(
         action: args.action.clone(),
         outcome: args.outcome.into_contract(),
         attrs: declared_attrs(args)?,
-        entities: entities(args, extractor)?,
-        // Empty, and no flag can change it: see `crate::cli::EmitCli`.
+        entities: entities(args, filing, extractor)?,
+        // Empty whichever way the record is filed, and no flag can change it: see
+        // [`crate::cli::EmitCli`] and [`crate::cli::FileCli`]. A pseudonym is derived under a secret
+        // that lives with the service, so a subject named on either of these command lines could
+        // only be a value invented on a host that holds no key material. The service's resolver
+        // fills them in from the reference below.
         subjects: Vec::new(),
         visibility: args.visibility.into_contract(),
         team: args.team.clone(),
-        data_class: DataClass::Internal,
+        data_class: filing.data_class(),
         redaction_policy: args.redaction_policy.clone(),
         // Nothing was masked here. A sidecar that masks on the way past adds its own account, and a
         // caller that redacted before calling this can say so by masking and naming it there.
@@ -486,12 +551,19 @@ fn pair<'a>(flag: &str, spec: &'a str) -> Result<(&'a str, &'a str)> {
 /// the write path canonicalises every identifier it is given, so `ticket:proj-42` stated and
 /// `ticket:PROJ-42` inferred are one key by the time either is stored. Comparing the spellings as
 /// typed would collapse only the pairs that happened to match, which is not a rule.
-fn entities(args: &EmitArgs, extractor: Option<&Extractor>) -> Result<Vec<EntityRef>> {
+fn entities(
+    args: &EmitArgs,
+    filing: Filing<'_>,
+    extractor: Option<&Extractor>,
+) -> Result<Vec<EntityRef>> {
     let mut stated = args
         .entities
         .iter()
         .map(|spec| entity_ref(spec))
         .collect::<Result<Vec<_>>>()?;
+    if let Filing::Transaction { unit } = filing {
+        merge_erasure_unit(&mut stated, unit)?;
+    }
     let Some(extractor) = extractor else {
         return Ok(stated);
     };
@@ -521,6 +593,44 @@ fn entities(args: &EmitArgs, extractor: Option<&Extractor>) -> Result<Vec<Entity
         .collect();
     stated.extend(inferred);
     Ok(stated)
+}
+
+/// Adds the erasure unit to the references a record states, or refuses a record that contradicts it.
+///
+/// The unit is an ordinary stated reference — same role, same confidence — because that is what the
+/// store's resolver reads. Naming it twice is not an error and does not double it: `--entity
+/// order_ref:X --erasure-unit order_ref:X` says one thing once.
+///
+/// A second reference of the *same kind* with a different identifier is refused here, and the reason
+/// is worth the local check rather than leaving it to the store. The resolver refuses such a record
+/// outright — two references of equal standing have no rule to choose between them — so the round
+/// trip would end in the same refusal, less clearly, after the record had been sealed to the
+/// service's key and queued on a sidecar's disk. A record refused before it is sent is the only
+/// failure in this area that costs nothing at all.
+///
+/// The comparison is on the identifier as typed, because this binary opens no store and holds no
+/// entity registry, so it cannot know that two spellings are one identifier. It therefore refuses a
+/// pair the store would have accepted as one — which is the direction to be wrong in, and the
+/// message says which two strings it compared.
+fn merge_erasure_unit(stated: &mut Vec<EntityRef>, unit: &str) -> Result<()> {
+    let reference = entity_ref(unit)?;
+    for existing in stated.iter() {
+        if existing.kind != reference.kind {
+            continue;
+        }
+        if existing.id == reference.id {
+            return Ok(());
+        }
+        return Err(Error::Usage(format!(
+            "--erasure-unit names `{}:{}` and --entity names `{}:{}`: a record filed about a \
+             transaction names one erasure unit, and two references of the same kind have no rule \
+             to choose between them. State the other reference under a different kind, or file the \
+             two actions as two records",
+            reference.kind, reference.id, existing.kind, existing.id
+        )));
+    }
+    stated.push(reference);
+    Ok(())
 }
 
 /// A stated identifier as the store will hold it, or as it was typed when the registry cannot say.
@@ -582,9 +692,9 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        ActionRecord, DEFAULT_REDACTION_POLICY, Extractor, emit, extract, guidance, record,
+        ActionRecord, DEFAULT_REDACTION_POLICY, Extractor, Filing, emit, extract, guidance, record,
     };
-    use crate::cli::EmitCli;
+    use crate::cli::{EmitCli, FileCli};
     use crate::config::{EmitSettings, Env};
     use crate::error::Error;
     use crate::exit::Exit;
@@ -631,6 +741,7 @@ mod tests {
         record(
             &settings(PathBuf::from("/nowhere")),
             &cli.args,
+            Filing::Internal,
             Some(extractor),
             0,
         )
@@ -662,6 +773,34 @@ mod tests {
         path
     }
 
+    /// The arguments a transaction writer would pass, plus whatever a test adds.
+    fn filed(extra: &[&str]) -> FileCli {
+        let mut args = vec![
+            "yaam-file",
+            "--action",
+            "refund",
+            "--outcome",
+            "success",
+            "--summary",
+            "settled the refund at the gateway",
+        ];
+        args.extend_from_slice(extra);
+        FileCli::try_parse_from(args).expect("parsed")
+    }
+
+    /// One record as `yaam-file` builds it, at a fixed instant.
+    fn built_from(cli: &FileCli) -> Result<ActionRecord, Error> {
+        record(
+            &settings(PathBuf::from("/nowhere")),
+            &cli.args,
+            Filing::Transaction {
+                unit: &cli.erasure_unit,
+            },
+            None,
+            1_787_217_242_117,
+        )
+    }
+
     /// Every field the schema requires, from the arguments a hook actually passes.
     #[test]
     fn the_mechanical_fields_are_filled_in() {
@@ -669,6 +808,7 @@ mod tests {
         let built = record(
             &settings(PathBuf::from("/nowhere")),
             &cli.args,
+            Filing::Internal,
             None,
             1_787_217_242_117,
         )
@@ -695,6 +835,7 @@ mod tests {
         let built = record(
             &settings(PathBuf::from("/nowhere")),
             &cli.args,
+            Filing::Internal,
             None,
             1_787_217_242_117,
         )
@@ -716,6 +857,7 @@ mod tests {
         let built = record(
             &settings(PathBuf::from("/nowhere")),
             &cli.args,
+            Filing::Internal,
             None,
             i64::MAX,
         )
@@ -728,8 +870,14 @@ mod tests {
     fn a_live_record_may_name_its_own_instant_within_the_skew_a_hook_has() {
         let now = 1_787_217_242_117;
         let cli = parsed(&["--at", "2026-08-20T09:14:00Z"]);
-        let built =
-            record(&settings(PathBuf::from("/nowhere")), &cli.args, None, now).expect("built");
+        let built = record(
+            &settings(PathBuf::from("/nowhere")),
+            &cli.args,
+            Filing::Internal,
+            None,
+            now,
+        )
+        .expect("built");
 
         assert!(!built.backfilled);
         assert_eq!(built.at, "2026-08-20T09:14:00.000Z");
@@ -758,8 +906,14 @@ mod tests {
         ];
         for (extra, expected) in cases {
             let cli = parsed(extra);
-            let error = record(&settings(PathBuf::from("/nowhere")), &cli.args, None, now)
-                .expect_err("refused before a socket is opened");
+            let error = record(
+                &settings(PathBuf::from("/nowhere")),
+                &cli.args,
+                Filing::Internal,
+                None,
+                now,
+            )
+            .expect_err("refused before a socket is opened");
             assert!(
                 matches!(&error, Error::Usage(why) if why.contains(expected)),
                 "{extra:?} produced {error}"
@@ -775,6 +929,7 @@ mod tests {
         let error = record(
             &settings(PathBuf::from("/nowhere")),
             &cli.args,
+            Filing::Internal,
             None,
             1_787_217_242_117,
         )
@@ -790,8 +945,8 @@ mod tests {
     fn each_record_gets_its_own_identifier() {
         let cli = parsed(&[]);
         let settings = settings(PathBuf::from("/nowhere"));
-        let first = record(&settings, &cli.args, None, 0).expect("built");
-        let second = record(&settings, &cli.args, None, 0).expect("built");
+        let first = record(&settings, &cli.args, Filing::Internal, None, 0).expect("built");
+        let second = record(&settings, &cli.args, Filing::Internal, None, 0).expect("built");
         assert_ne!(first.record_id, second.record_id);
     }
 
@@ -805,8 +960,14 @@ mod tests {
             "--attr-bool",
             "rolled_back=false",
         ]);
-        let built =
-            record(&settings(PathBuf::from("/nowhere")), &cli.args, None, 0).expect("built");
+        let built = record(
+            &settings(PathBuf::from("/nowhere")),
+            &cli.args,
+            Filing::Internal,
+            None,
+            0,
+        )
+        .expect("built");
 
         // The case the three flags exist for: a build number is declared `string` and would be sent
         // as an integer by anything guessing from its shape.
@@ -838,8 +999,14 @@ mod tests {
         ];
         for extra in cases {
             let cli = parsed(&extra);
-            let error = record(&settings(PathBuf::from("/nowhere")), &cli.args, None, 0)
-                .expect_err("refused before a socket is opened");
+            let error = record(
+                &settings(PathBuf::from("/nowhere")),
+                &cli.args,
+                Filing::Internal,
+                None,
+                0,
+            )
+            .expect_err("refused before a socket is opened");
             assert!(
                 matches!(error, Error::Usage(_)),
                 "{extra:?} produced {error}"
@@ -851,8 +1018,14 @@ mod tests {
     fn an_entity_argument_is_a_primary_reference_at_full_confidence() {
         // The identifier keeps its own colons; only the kind is split off.
         let cli = parsed(&["--entity", "deploy:api/staging#1146"]);
-        let built =
-            record(&settings(PathBuf::from("/nowhere")), &cli.args, None, 0).expect("built");
+        let built = record(
+            &settings(PathBuf::from("/nowhere")),
+            &cli.args,
+            Filing::Internal,
+            None,
+            0,
+        )
+        .expect("built");
         let reference = &built.entities[0];
         assert_eq!(reference.kind, "deploy");
         assert_eq!(reference.id, "api/staging#1146");
@@ -958,7 +1131,8 @@ mod tests {
         );
         let place = settings(PathBuf::from("/nowhere"));
 
-        let plain = record(&place, &cli.args, None, 1_787_217_242_117).expect("built");
+        let plain =
+            record(&place, &cli.args, Filing::Internal, None, 1_787_217_242_117).expect("built");
         assert_eq!(
             plain.entities.len(),
             1,
@@ -966,8 +1140,14 @@ mod tests {
             plain.entities
         );
 
-        let mut inferring =
-            record(&place, &cli.args, Some(&shipped()), 1_787_217_242_117).expect("built");
+        let mut inferring = record(
+            &place,
+            &cli.args,
+            Filing::Internal,
+            Some(&shipped()),
+            1_787_217_242_117,
+        )
+        .expect("built");
         assert_eq!(inferring.entities.len(), 2, "{:?}", inferring.entities);
         inferring.record_id = plain.record_id.clone();
         inferring.entities.truncate(plain.entities.len());
@@ -999,8 +1179,13 @@ mod tests {
                     spec.to_str().expect("utf-8"),
                 ],
             );
-            let error = emit(&settings(PathBuf::from("/nowhere")), &cli.args, &mut out)
-                .expect_err("a spec directory this cannot infer from");
+            let error = emit(
+                &settings(PathBuf::from("/nowhere")),
+                &cli.args,
+                Filing::Internal,
+                &mut out,
+            )
+            .expect_err("a spec directory this cannot infer from");
             assert_eq!(error.exit(), Exit::Config, "{error}");
             assert!(error.to_string().contains("--infer-entities"), "{error}");
         }
@@ -1030,6 +1215,7 @@ mod tests {
         let error = emit(
             &settings(PathBuf::from("/nowhere/at/all.sock")),
             &cli.args,
+            Filing::Internal,
             &mut out,
         )
         .expect_err("a team-scoped record with no team");
@@ -1053,7 +1239,7 @@ mod tests {
 
         let mut out = Vec::new();
         assert_eq!(
-            emit(&resolved, &cli.args, &mut out).expect("printed"),
+            emit(&resolved, &cli.args, Filing::Internal, &mut out).expect("printed"),
             Exit::Ok
         );
         assert_eq!(String::from_utf8(out).expect("utf-8").lines().count(), 1);
@@ -1066,6 +1252,7 @@ mod tests {
         let exit = emit(
             &settings(PathBuf::from("/nowhere/at/all.sock")),
             &cli.args,
+            Filing::Internal,
             &mut out,
         )
         .expect("no socket is needed");
@@ -1090,7 +1277,8 @@ mod tests {
             let path = answering(dir.path(), &format!("caller-{index}.sock"), answer);
             let cli = parsed(&[]);
             let mut out = Vec::new();
-            let exit = emit(&settings(path), &cli.args, &mut out).expect("answered");
+            let exit =
+                emit(&settings(path), &cli.args, Filing::Internal, &mut out).expect("answered");
             assert_eq!(exit, expected, "{answer}");
 
             // The identifier is on the first line whatever else is said, so a script can take it.
@@ -1111,7 +1299,8 @@ mod tests {
         );
         let cli = parsed(&[]);
         let mut out = Vec::new();
-        let error = emit(&settings(path), &cli.args, &mut out).expect_err("refused");
+        let error =
+            emit(&settings(path), &cli.args, Filing::Internal, &mut out).expect_err("refused");
         assert_eq!(error.exit(), Exit::Rejected);
         // The reason, and what to do about it, rather than a code the caller has to look up.
         let told = error.to_string();
@@ -1129,7 +1318,8 @@ mod tests {
         );
         let cli = parsed(&[]);
         let mut out = Vec::new();
-        let error = emit(&settings(path), &cli.args, &mut out).expect_err("failed");
+        let error =
+            emit(&settings(path), &cli.args, Filing::Internal, &mut out).expect_err("failed");
         assert_eq!(error.exit(), Exit::Failed);
         assert!(error.to_string().contains("spool lock poisoned"));
     }
@@ -1142,6 +1332,7 @@ mod tests {
         let error = emit(
             &settings(dir.path().join("absent.sock")),
             &cli.args,
+            Filing::Internal,
             &mut out,
         )
         .expect_err("nothing is listening");
@@ -1160,7 +1351,8 @@ mod tests {
 
         let cli = parsed(&[]);
         let mut out = Vec::new();
-        let error = emit(&settings(path), &cli.args, &mut out).expect_err("no answer");
+        let error =
+            emit(&settings(path), &cli.args, Filing::Internal, &mut out).expect_err("no answer");
         assert_eq!(error.exit(), Exit::Unreachable);
     }
 
@@ -1171,7 +1363,8 @@ mod tests {
         let path = answering(dir.path(), "caller.sock", "not json at all\n");
         let cli = parsed(&[]);
         let mut out = Vec::new();
-        let error = emit(&settings(path), &cli.args, &mut out).expect_err("unreadable");
+        let error =
+            emit(&settings(path), &cli.args, Filing::Internal, &mut out).expect_err("unreadable");
         assert_eq!(error.exit(), Exit::Failed);
         assert!(error.to_string().contains("unknown"), "{error}");
     }
@@ -1193,7 +1386,8 @@ mod tests {
 
         let cli = parsed(&["--timeout-ms", "150"]);
         let mut out = Vec::new();
-        let error = emit(&settings(path), &cli.args, &mut out).expect_err("timed out");
+        let error =
+            emit(&settings(path), &cli.args, Filing::Internal, &mut out).expect_err("timed out");
         assert_eq!(error.exit(), Exit::Failed);
         assert!(error.to_string().contains("unknown"), "{error}");
         held.join().expect("the holder");
@@ -1230,7 +1424,8 @@ mod tests {
         let resolved = EmitSettings::resolve(&cli.args, &Env::default()).expect("resolves");
         assert!(resolved.socket.is_none());
         let mut sink = Vec::new();
-        let missing = emit(&resolved, &cli.args, &mut sink).expect_err("nothing names a socket");
+        let missing = emit(&resolved, &cli.args, Filing::Internal, &mut sink)
+            .expect_err("nothing names a socket");
         assert_eq!(missing.exit(), Exit::Config);
         assert!(missing.to_string().contains("YAAM_SOCKET"));
 
@@ -1270,5 +1465,126 @@ mod tests {
         .expect("resolved");
         assert_eq!(resolved.socket, Some(PathBuf::from("/run/b.sock")));
         assert_eq!(resolved.agent, "agent_b");
+    }
+
+    /// The one thing `yaam-file` exists to do, and the shape the store's resolver needs it in.
+    #[test]
+    fn filing_a_transaction_classifies_the_record_and_states_the_reference() {
+        let cli = filed(&["--erasure-unit", "order_ref:abcd1234"]);
+        let built = built_from(&cli).expect("built");
+
+        built.validate().expect("a record the contract accepts");
+        assert_eq!(built.data_class, yaam_contract::DataClass::SubjectDerived);
+        // Still empty, and for the reason `yaam-emit`'s are: the pseudonym is derived under a secret
+        // this host does not hold, so a subject named here could only be one it invented.
+        assert!(built.subjects.is_empty());
+
+        let stated: Vec<_> = built
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == "order_ref")
+            .collect();
+        assert_eq!(stated.len(), 1, "{:?}", built.entities);
+        assert_eq!(stated[0].id, "abcd1234");
+        // Full confidence, because anything less is a guess and a guess may not decide erasability:
+        // `ReferenceSubjects` counts only references stated at `FIELD_CONFIDENCE`.
+        assert!(stated[0].confidence >= extract::FIELD_CONFIDENCE);
+        assert_eq!(stated[0].role, yaam_contract::entity::Role::Primary);
+    }
+
+    /// The pairing that is the whole safety argument: neither half of it is reachable alone.
+    #[test]
+    fn neither_binary_can_reach_the_other_class() {
+        // `yaam-emit` has no argument that produces a subject-derived record, whatever it is passed.
+        let emitted = record(
+            &settings(PathBuf::from("/nowhere")),
+            &parsed(&["--entity", "order_ref:abcd1234"]).args,
+            Filing::Internal,
+            None,
+            1_787_217_242_117,
+        )
+        .expect("built");
+        assert_eq!(emitted.data_class, yaam_contract::DataClass::Internal);
+
+        // And `yaam-file` has none that produces an internal one: the erasure unit is required, so
+        // there is no invocation of it that leaves a body in the clear.
+        assert!(
+            FileCli::try_parse_from([
+                "yaam-file",
+                "--action",
+                "refund",
+                "--outcome",
+                "success",
+                "--summary",
+                "s"
+            ])
+            .is_err(),
+            "--erasure-unit has to be required, or the class is a flag after all"
+        );
+    }
+
+    /// Naming the same reference twice is one reference, not two.
+    #[test]
+    fn the_erasure_unit_and_an_identical_entity_are_one_reference() {
+        let cli = filed(&[
+            "--erasure-unit",
+            "order_ref:abcd1234",
+            "--entity",
+            "order_ref:abcd1234",
+        ]);
+        let built = built_from(&cli).expect("built");
+
+        assert_eq!(
+            built
+                .entities
+                .iter()
+                .filter(|entity| entity.kind == "order_ref")
+                .count(),
+            1,
+            "{:?}",
+            built.entities
+        );
+    }
+
+    /// Two references of one kind have no rule to choose between them, and the store says so too.
+    ///
+    /// Refused here rather than upstream because the round trip ends in the same refusal, less
+    /// clearly, after the record has been sealed to the service's key and queued on a disk.
+    #[test]
+    fn a_second_reference_of_the_erasure_units_kind_is_refused_before_it_is_sent() {
+        let cli = filed(&[
+            "--erasure-unit",
+            "order_ref:abcd1234",
+            "--entity",
+            "order_ref:wxyz9876",
+        ]);
+        let Err(Error::Usage(message)) = built_from(&cli) else {
+            panic!("two erasure units of one kind must not be filed");
+        };
+        assert!(message.contains("order_ref:abcd1234"), "{message}");
+        assert!(message.contains("order_ref:wxyz9876"), "{message}");
+    }
+
+    /// A reference of another kind is an ordinary join and says nothing about erasability.
+    #[test]
+    fn an_entity_of_another_kind_travels_beside_the_erasure_unit() {
+        let cli = filed(&[
+            "--erasure-unit",
+            "order_ref:abcd1234",
+            "--entity",
+            "ticket:PROJ-42",
+        ]);
+        let built = built_from(&cli).expect("built");
+
+        assert_eq!(built.entities.len(), 2, "{:?}", built.entities);
+        assert!(built.entities.iter().any(|e| e.kind == "ticket"));
+        assert!(built.entities.iter().any(|e| e.kind == "order_ref"));
+    }
+
+    /// An erasure unit that is not `kind:id` fails where every other malformed reference does.
+    #[test]
+    fn an_erasure_unit_with_no_kind_is_a_usage_error() {
+        let cli = filed(&["--erasure-unit", "abcd1234"]);
+        assert!(matches!(built_from(&cli), Err(Error::Usage(_))));
     }
 }

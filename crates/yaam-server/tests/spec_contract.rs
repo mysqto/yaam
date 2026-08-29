@@ -257,6 +257,15 @@ fn write_body(agent: &str) -> String {
     serde_json::json!({ "record": record(agent) }).to_string()
 }
 
+/// A write request whose record is classified `subject_derived`, attributed to `agent`.
+///
+/// None of the callers in this file carry the grant, so this is the refusal and not the write.
+fn subject_derived_body(agent: &str) -> String {
+    let mut record = record(agent);
+    record.data_class = DataClass::SubjectDerived;
+    serde_json::json!({ "record": record }).to_string()
+}
+
 /// A write request whose record carries a field no schema declares.
 fn nested_unknown_field(agent: &str) -> String {
     let mut record = serde_json::to_value(record(agent)).expect("a record serialises");
@@ -348,6 +357,16 @@ fn write_cases() -> Vec<Case> {
             path,
             Some(WRITER),
             write_body(READER),
+            Mode::Stored,
+        ),
+        // And a writer entitled to everything else may not classify a record erasable: the grant is
+        // per credential and no role carries it.
+        case(
+            "POST",
+            path,
+            path,
+            Some(WRITER),
+            subject_derived_body(WRITER),
             Mode::Stored,
         ),
         // Permanent: an undeclared field at the request's top level, and a record that breaks a
