@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `yaam-server` | The HTTP service, plus the maintenance its store needs. |
 //! | `yaam-agent` | The local sidecar: two sockets per caller, sealing and signing on their behalf. |
-//! | `yaam` | The operator command line: rebuild, drain, erase, verify, read a sealed body, back up, restore, read health, guard a commit, derive knowledge. |
+//! | `yaam` | The operator command line: rebuild, drain, erase, verify, read a sealed body, back up, restore, recover a key store, read health, guard a commit, derive knowledge. |
 //! | `yaam-emit` | One record, built from arguments and written to a caller socket. |
 //! | `yaam-read` | One read, sent to a caller read socket; the service's answer, unchanged. |
 //!
@@ -261,6 +261,13 @@ fn run_operator(cli: &OperatorCli, env: &Env, out: &mut dyn Write) -> Result<Exi
         ),
         Command::Check => ops::check(&pipeline, out),
         Command::Backup { to } => ops::backup(&pipeline, to, out),
+        // Unlike `restore`, this one opens the store first and has to: the erasure log it holds the
+        // recovered key material to arrives with the tree, so a key store recovered into a directory
+        // that is not a store yet has nothing to be held to. The strict resolve is what says so.
+        Command::RestoreKeys {
+            from,
+            confirm_restore_keys,
+        } => ops::restore_keys(&mut pipeline, from, *confirm_restore_keys, out),
         Command::Restore { .. } | Command::GuardCommit { .. } | Command::Knowledge { .. } => {
             unreachable!("all three return before the store is opened")
         }

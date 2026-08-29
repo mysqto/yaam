@@ -1,4 +1,4 @@
-//! The seven operator commands.
+//! The eight operator commands.
 //!
 //! Thin on purpose: each one opens a pipeline, calls the library operation the documentation names,
 //! and renders the report. Every judgement they make — what drift is, what a backlog is, what an
@@ -21,6 +21,7 @@ use yaam_core::drain::{self, DrainReport};
 use yaam_core::erase::{self, ErasePreview};
 use yaam_core::health::{self, HealthReport};
 use yaam_core::reindex;
+use yaam_core::restore::{self as keys, Attestation};
 use yaam_core::{Paths, Pipeline};
 use yaam_crypto::keystore::KeyMaterial;
 
@@ -145,13 +146,25 @@ pub fn erase(
     Ok(Exit::Ok)
 }
 
-/// Reports whether an erasure can be asserted complete.
+/// Reports whether an erasure can be asserted complete, and when not, which condition is not met.
+///
+/// The verdict is [`erase::confirm_erasure`]'s and there is not a second one here. What this adds is
+/// the three conditions that verdict is made of, printed separately — because one "not yet" stood
+/// for all three, and two of them are a key store to put right while the third is a week to wait.
+/// An operator who has just recovered a key store could not use this command to find out whether
+/// they had broken an erasure, which is the one question they had.
+///
+/// The exit code carries the same split, so a monitor gets it without matching on text: `6` is the
+/// wait, `4` is a store that wants a person. Collapsing them onto `6` would make "the erasure is
+/// real and on schedule" and "a destroyed key is back on disk" the same signal.
 pub fn verify_erasure(
     pipeline: &mut Pipeline,
     tombstone: &str,
     out: &mut dyn Write,
 ) -> Result<Exit> {
     let complete = erase::confirm_erasure(pipeline, tombstone)
+        .map_err(|error| failed("reading the tombstone log", &error))?;
+    let attestation = keys::attestation(pipeline, tombstone)
         .map_err(|error| failed("reading the tombstone log", &error))?;
     if complete {
         let text = format!(
@@ -161,14 +174,233 @@ pub fn verify_erasure(
         emit(out, &text)?;
         return Ok(Exit::Ok);
     }
-    let text = format!(
-        "{tombstone}: not yet\neither a key file is still present, or a snapshot taken before the \
-         destruction is still inside its {} day retention window. The destruction stands; only \
-         the attestation waits.\n",
-        erase::KEY_BACKUP_WINDOW_MS / (24 * 60 * 60 * 1_000)
-    );
+    let mut text = format!("{tombstone}: not yet\n");
+    describe_attestation(&attestation, &mut text);
     emit(out, &text)?;
-    Ok(Exit::Incomplete)
+    if attestation.settled() {
+        Ok(Exit::Incomplete)
+    } else {
+        Ok(Exit::Degraded)
+    }
+}
+
+/// Installs a recovered key store and reconciles it against the erasures it was copied before.
+///
+/// The other half of `restore`, and the half a backup cannot carry: no copy of the tree contains key
+/// material, so a key store is recovered from its own bounded-window copy. Doing that with `cp` is
+/// what §10.4's key-store restore rule exists to stop — a copy taken before an erasure puts the
+/// destroyed keys back, and every live refusal goes on being made correctly by a store whose bodies
+/// are readable again.
+///
+/// The copy and the reconcile are one command rather than two steps, because the state between two
+/// steps is exactly the state that reads an erased body back. What it reconciled against is printed,
+/// and so is what it could not see, since the one recovery this cannot save is a tree and a key
+/// store both taken from before the same erasure.
+pub fn restore_keys(
+    pipeline: &mut Pipeline,
+    from: &Path,
+    confirmed: bool,
+    out: &mut dyn Write,
+) -> Result<Exit> {
+    let into = pipeline.paths().key_store.clone();
+    let preview = keys::preview_key_store(pipeline, from)
+        .map_err(|error| failed("reading the key-store copy", &error))?;
+
+    if !confirmed {
+        let mut text = describe_key_preview(from, &into, &preview);
+        text.push_str("\nnothing was installed. Pass --confirm-restore-keys to mean it.\n");
+        emit(out, &text)?;
+        return Err(Error::Unconfirmed(
+            "a key-store recovery cannot see an erasure ordered after both copies were taken, and \
+             was not confirmed"
+                .to_owned(),
+        ));
+    }
+
+    let report = keys::restore_key_store(pipeline, from)
+        .map_err(|error| failed("restoring the key store", &error))?;
+
+    let mut text = format!("restored {} from {}\n", into.display(), from.display());
+    line(&mut text, "key files", report.files);
+    line(&mut text, "erasure markers", report.markers);
+    line(
+        &mut text,
+        "subjects erased",
+        report.reconciled.subjects_erased,
+    );
+    line(
+        &mut text,
+        "keys walked back",
+        report.reconciled.keys_destroyed,
+    );
+    line(
+        &mut text,
+        "blocklist restored",
+        report.reconciled.blocklist_restored,
+    );
+    if report.reconciled.undid_something() {
+        let _ = writeln!(
+            text,
+            "\nthis copy predates {} erasure(s): it carried key material, or missed the blocklist \
+             entry, for a subject already erased. Both are now gone again. Had this been a file \
+             copy rather than this command, those bodies would be readable.",
+            report.reconciled.subjects_resurrected + report.reconciled.blocklist_restored
+        );
+    }
+    text.push_str(
+        "\nreconciled against the tree's erasure log and this key store's own blocklist, which are \
+         written together and travel separately. An erasure neither of them records is in neither \
+         copy and cannot be found here: restore the newest tree backup, because every backup taken \
+         after an erasure carries it forever.\n",
+    );
+
+    if report.attestations.is_empty() {
+        text.push_str("\nthe log records no erasure, so there is nothing to attest.\n");
+    } else {
+        text.push_str("\nerasures on record:\n");
+        for (tombstone, attestation) in &report.attestations {
+            let _ = writeln!(
+                text,
+                "  {tombstone}  {}",
+                if attestation.complete() {
+                    "complete".to_owned()
+                } else if attestation.settled() {
+                    format!(
+                        "waiting {} on the key backup window",
+                        duration(attestation.remaining_ms())
+                    )
+                } else {
+                    "NOT SETTLED — run `yaam verify-erasure` on it".to_owned()
+                }
+            );
+        }
+    }
+    emit(out, &text)?;
+    if report.all_attested() {
+        Ok(Exit::Ok)
+    } else {
+        Ok(Exit::Incomplete)
+    }
+}
+
+/// What a key-store recovery would install, and the one question only the operator can answer.
+///
+/// The shape of [`erase`]'s own preview and for the same reason: the destructive half of this is not
+/// the copying, it is that installing a key an erasure destroyed makes a body readable again in this
+/// store and in every copy taken from it afterwards. What the store cannot establish — whether an
+/// erasure was ordered after *both* of these copies were taken — is put in front of the person who
+/// can, with the date they need in order to answer it.
+fn describe_key_preview(from: &Path, into: &Path, preview: &keys::KeyRestorePreview) -> String {
+    let mut text = format!(
+        "recovering the key store at {} from {} would install:\n",
+        into.display(),
+        from.display()
+    );
+    line(&mut text, "key files", preview.key_files);
+    line(&mut text, "erasure markers", preview.markers);
+    text.push_str("\nand would be held to:\n");
+    line(&mut text, "erasures logged", preview.logged.len());
+    line(&mut text, "subjects blocked", preview.blocked_here);
+    for (tombstone, ordered_ms) in &preview.logged {
+        let _ = writeln!(
+            text,
+            "  {tombstone}  ordered {}",
+            yaam_contract::timestamp::format_ms(*ordered_ms)
+        );
+    }
+    text.push_str(
+        "\nevery key an erasure on record forbids is destroyed again on the way in, and a blocklist \
+         entry this copy is missing is written back. An erasure recorded by either half is applied, \
+         whichever half is the newer copy.\n",
+    );
+    match preview.newest_erasure_ms {
+        Some(ms) => {
+            let _ = writeln!(
+                text,
+                "\nthe newest erasure either copy has heard of was ordered {}. An erasure ordered \
+                 after that is in neither copy, and installing these keys would make its bodies \
+                 readable again — here, and in every copy taken from this store afterwards. \
+                 Nothing on disk can tell you whether there was one: the log line and the blocklist \
+                 entry are both in the copies that were not restored, which is why this is the one \
+                 question the store cannot answer and you can. If any erasure was ordered since, \
+                 restore a newer backup of the tree first — every backup taken after an erasure \
+                 carries it for ever.",
+                yaam_contract::timestamp::format_ms(ms)
+            );
+        }
+        None => text.push_str(
+            "\nneither copy records any erasure at all. That is a store that has never erased \
+             anything, or two copies that both predate the first one, and this command cannot tell \
+             those apart: an erasure this tree has no log line for is one these keys would walk \
+             back over. If this tree was restored from a backup, satisfy yourself it postdates \
+             every erasure ever ordered before confirming.\n",
+        ),
+    }
+    text
+}
+
+/// The three conditions a completion stamp waits on, and what to do about each.
+fn describe_attestation(attestation: &Attestation, text: &mut String) {
+    line(text, "key files present", attestation.keys_present);
+    let _ = writeln!(
+        text,
+        "  {:<20}{}",
+        "subject blocked",
+        if attestation.tombstoned { "yes" } else { "NO" }
+    );
+    let _ = writeln!(
+        text,
+        "  {:<20}{}",
+        "window closes in",
+        if attestation.window_passed() {
+            "passed".to_owned()
+        } else {
+            duration(attestation.remaining_ms())
+        }
+    );
+    if attestation.keys_present > 0 {
+        text.push_str(
+            "\na key file for this subject is under the key root. That is not a wait: a destroyed \
+             key that is back on disk is a key store recovered from a copy taken before the \
+             destruction, and the body it opens is readable again until it is gone. Recover a key \
+             store with `yaam restore-keys --from <copy>`, which reconciles as part of installing \
+             it; over a key store already in place, `yaam reindex --all` re-applies the log.\n",
+        );
+    }
+    if !attestation.tombstoned {
+        text.push_str(
+            "\nthe key store's blocklist does not name this subject, so the next record naming it \
+             would mint a fresh key and un-erase them. The same two commands put it back.\n",
+        );
+    }
+    if attestation.settled() {
+        text.push_str(
+            "\nthe destruction stands and nothing recoverable is on disk; only the attestation \
+             waits. A key copy taken before the destruction can still be inside its retention \
+             window, and this is the timestamp an erasure would be attested by.\n",
+        );
+    }
+}
+
+/// A span of milliseconds, as a person reads one.
+///
+/// Coarse on purpose: the spans this prints are days of a retention window and days a record has sat
+/// in a spool, and a figure to the millisecond would read as a precision the underlying clocks do not
+/// have.
+fn duration(ms: i64) -> String {
+    let seconds = ms / 1_000;
+    let (days, hours, minutes) = (
+        seconds / 86_400,
+        (seconds % 86_400) / 3_600,
+        (seconds % 3_600) / 60,
+    );
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 /// Copies the store's authoritative half into a fresh directory.
@@ -217,15 +449,28 @@ pub fn restore(paths: &Paths, from: &Path, out: &mut dyn Write) -> Result<Exit> 
     line(&mut text, "files copied", report.files);
     line(&mut text, "records indexed", report.records_indexed);
     line(&mut text, "erasures replayed", report.erasures_replayed);
+    line(
+        &mut text,
+        "keys walked back",
+        report.keys_reconciled.keys_destroyed,
+    );
     text.push_str(
         "\nthe index was rebuilt as part of this restore, and the restored tombstone log was \
          replayed over it: an erasure ordered before the backup was taken stays applied\n",
     );
     text.push_str(
-        "no key material was restored, because a backup carries none. Bodies are readable only \
-         where their keys still are: recover the key store from its own copy if this store is \
-         meant to read them\n",
+        "no key material was restored, because a backup carries none. Recover the key store from \
+         its own copy with `yaam restore-keys --from <copy>`, which reconciles that copy against \
+         this log rather than trusting it — a copy taken before an erasure holds the keys that \
+         erasure destroyed, and a plain file copy of one puts the bodies back\n",
     );
+    if report.keys_reconciled.undid_something() {
+        text.push_str(
+            "this store's key root already held key material, and the restored log names erasures \
+             it had not had applied to it. Those keys are gone again — which is what makes the \
+             order of a recovery stop mattering\n",
+        );
+    }
     // A store of this command's own, opened over what it has just written: the pipeline the rebuild
     // ran on belonged to the restore and is closed. Its failure is the drain's failure and is
     // reported as one — the files are in place either way, and the queue that is left is derived.
@@ -410,7 +655,17 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
         report.sweeper_backlog.fanout_pending,
         report.sweeper_backlog.stale_claims
     );
-    let _ = writeln!(text, "quarantine depth   {}", report.quarantine_depth);
+    let _ = writeln!(
+        text,
+        "quarantine depth   {}{}",
+        report.quarantine_depth,
+        describe_quarantine_age(report)
+    );
+    // Beside the quarantine depth, because it is the other way a key outlives the decision that was
+    // supposed to have ended it. Nil on every store where nothing has gone wrong, which is why it is
+    // printed rather than mentioned only when it fires: a line that only ever appears in an incident
+    // is a line nobody recognises during one.
+    let _ = writeln!(text, "resurrected keys   {}", report.resurrected_keys);
     // Beside the two queue depths above, because it is the third answer to "how much work is this
     // store holding" — and the only one that no service converges on its own.
     let _ = writeln!(text, "dead-lettered      {}", report.dead_lettered);
@@ -442,6 +697,40 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
         text.push('\n');
         text.push_str(DEAD_LETTERED);
     }
+    if report.resurrected_keys > 0 {
+        let _ = writeln!(
+            text,
+            "\n{} key file(s) stand for subject(s) this store has already erased. Erasure is key \
+             destruction, so those bodies are readable again — in this copy and in any copy taken \
+             from it. A key store recovered by hand from a copy taken before the erasure is how \
+             this happens, and every other refusal goes on being made correctly meanwhile, because \
+             they are made from the tree. Recover through `yaam restore-keys --from <copy>`, which \
+             reconciles as part of installing; over a key store already in place, `yaam reindex \
+             --all` re-applies the erasure log.",
+            report.resurrected_keys
+        );
+    }
+    if report.quarantine_undated > 0 {
+        let _ = writeln!(
+            text,
+            "\n{} held record(s) carry no readable `received_at`, so no age threshold will ever \
+             fire for them. They are in `.quarantine/` and only a person will clear them.",
+            report.quarantine_undated
+        );
+    } else if report.quarantine_overdue() {
+        let _ = writeln!(
+            text,
+            "\nthe oldest held record has waited {}, past the {} hard stop. A record waits in \
+             `.quarantine/` for its subjects to resolve, and one that has waited this long is an \
+             outage that outlived the SLA rather than a lookup that is about to answer. There is \
+             no automatic terminal state: publishing an unresolved record structure-only needs a \
+             representation the write path refuses today, so this is reported and alarmed on and \
+             nothing expires it. Resolve the lookup and re-present the records, or clear them by \
+             hand.",
+            duration(report.quarantine_oldest_ms.unwrap_or_default()),
+            duration(health::QUARANTINE_SLA_MS)
+        );
+    }
     if let KeyMaterial::Mixed { unwrapped, .. } = report.key_material {
         // The one key-material state a person has to settle, so it gets the sentence rather than
         // being left to a reader of the line above. Both halves are wrong at once: the files with no
@@ -457,6 +746,35 @@ fn describe_health(pipeline: &Pipeline, report: &HealthReport) -> String {
         );
     }
     text
+}
+
+/// What follows the quarantine depth: how long the oldest held record has waited.
+///
+/// Beside the depth rather than on a line of its own, because the two are one fact. A depth of three
+/// that turns over every minute and a depth of three that has not moved in a fortnight are the same
+/// number and opposite situations, and the depth alone is what made the missing hard stop invisible.
+fn describe_quarantine_age(report: &HealthReport) -> String {
+    if report.quarantine_depth == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if let Some(age) = report.quarantine_oldest_ms {
+        parts.push(format!("oldest held {}", duration(age)));
+    }
+    if report.quarantine_undated > 0 {
+        parts.push(format!("{} undated", report.quarantine_undated));
+    }
+    if report.quarantine_overdue() {
+        parts.push(format!(
+            "past the {} hard stop",
+            duration(health::QUARANTINE_SLA_MS)
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
 }
 
 /// One `label  count` line of a report, aligned so a column of numbers reads as one.
@@ -483,7 +801,7 @@ mod tests {
 
     use yaam_core::{Paths, Pipeline};
 
-    use super::{backup, check, drain, erase, reindex, restore, verify_erasure};
+    use super::{backup, check, drain, erase, reindex, restore, restore_keys, verify_erasure};
     use crate::exit::Exit;
     use crate::fixtures::{self, BODY};
 
@@ -786,7 +1104,12 @@ mod tests {
         let (exit, printed) = run(|out| verify_erasure(&mut tree.pipeline, &tombstone, out));
         assert_eq!(exit, Exit::Incomplete);
         assert!(printed.contains("not yet"), "{printed}");
-        assert!(printed.contains("The destruction stands"), "{printed}");
+        assert!(printed.contains("the destruction stands"), "{printed}");
+        // And it says *which* of the three conditions is the one not yet met, which is the whole
+        // difference between "wait a week" and "a key came back".
+        assert!(printed.contains("key files present   0"), "{printed}");
+        assert!(printed.contains("subject blocked     yes"), "{printed}");
+        assert!(printed.contains("window closes in    6d"), "{printed}");
 
         // Re-running says the subject is already tombstoned rather than pretending it is new work.
         let (_, again) = run(|out| erase(&mut tree.pipeline, subject.as_str(), true, out));
@@ -1107,6 +1430,275 @@ mod tests {
         assert!(
             printed.contains("stay unreadable until they are wrapped"),
             "{printed}"
+        );
+    }
+    /// Copies a key root aside, the way an operator's own bounded-window key copy is taken.
+    fn copy_keys(from: &Path, to: &Path) {
+        fs::create_dir_all(to).expect("dir");
+        for entry in fs::read_dir(from).expect("read") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_keys(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), &target).expect("copy");
+            }
+        }
+    }
+
+    /// The rehearsal's own scenario, through the commands an operator runs.
+    ///
+    /// A tree restored from a **pre-erasure** backup into a fresh root, then a key store recovered
+    /// from a **pre-erasure** copy. That pair reads the erased body back in full plaintext, and it
+    /// is the deployment's own disaster-recovery path. Neither artifact records the erasure — the
+    /// log line and the blocklist entry are both in the copies that were not restored — so nothing
+    /// here can *find* it, and the protection is a refusal rather than a repair.
+    ///
+    /// Written so it fails if the refusal is removed: without it the confirmation is skipped, the
+    /// keys land, and the body is readable. The assertion is on the body, through the only command
+    /// that reads one.
+    #[test]
+    fn a_pre_erasure_tree_and_a_pre_erasure_key_copy_are_refused_rather_than_installed() {
+        let mut source = Tree::new();
+        let subject = fixtures::subject('a');
+        let record = fixtures::subject_record("2026-08-20T09:00:00Z", &subject);
+        let id = record.record_id.clone();
+        source.pipeline.accept(record, BODY).expect("accepted");
+        source.pipeline.drain_fanout(100).expect("drained");
+
+        // Both artifacts, taken before the erasure: last night's tree backup and a key copy from
+        // the rolling window.
+        let held = elsewhere();
+        let backup_dir = held.path().join("backup-pre-erase");
+        let key_copy = held.path().join("keys-pre-erase");
+        let (exit, _) = run(|out| backup(&source.pipeline, &backup_dir, out));
+        assert_eq!(exit, Exit::Ok);
+        copy_keys(&source.pipeline.paths().key_store.clone(), &key_copy);
+        assert!(key_copy.join("keys").is_dir(), "the copy carries the key");
+
+        let (exit, _) = run(|out| erase(&mut source.pipeline, subject.as_str(), true, out));
+        assert_eq!(exit, Exit::Ok);
+
+        // Disaster recovery into a fresh root, from the older of the backups.
+        let into = elsewhere();
+        let paths = Paths::under(into.path().join("restored"));
+        let (exit, printed) = run(|out| restore(&paths, &backup_dir, out));
+        assert_eq!(exit, Exit::Ok, "{printed}");
+        assert!(
+            printed.contains("erasures replayed   0"),
+            "this backup predates the erasure, which is the whole premise: {printed}"
+        );
+        assert!(
+            printed.contains("yaam restore-keys"),
+            "the restore has to name the command that recovers the other half: {printed}"
+        );
+
+        // And now the step that used to be `cp`.
+        let mut restored = Pipeline::with_paths(paths.clone()).expect("the restored store");
+        let mut out = Vec::new();
+        let error = restore_keys(&mut restored, &key_copy, false, &mut out).expect_err("refused");
+        assert_eq!(error.exit(), Exit::Unconfirmed);
+        let printed = String::from_utf8(out).expect("utf-8");
+        assert!(
+            printed.contains("neither copy records any erasure"),
+            "the refusal has to name the case it cannot see: {printed}"
+        );
+        assert!(printed.contains("--confirm-restore-keys"), "{printed}");
+
+        // Nothing was installed, so the body is exactly as unreadable as the restore left it.
+        assert_eq!(
+            restored
+                .paths()
+                .key_store
+                .join("keys")
+                .read_dir()
+                .map(std::iter::Iterator::count)
+                .unwrap_or_default(),
+            0,
+            "a refused recovery must install no key"
+        );
+        let read = yaam_core::unseal::read_body(
+            &mut restored,
+            &id,
+            "operator",
+            "the restored store must not answer this",
+        )
+        .expect("a refusal, not a failure");
+        assert!(
+            !matches!(read, yaam_core::unseal::Read::Revealed { .. }),
+            "the erased body came back after a disaster recovery: {read:?}"
+        );
+    }
+
+    /// The recovery §10.4 actually specifies, and the one this can repair rather than refuse: the
+    /// tree is newer than the key copy, so the tree's log names the erasure the copy predates.
+    #[test]
+    fn a_key_copy_older_than_the_tree_has_its_resurrected_keys_walked_back() {
+        let mut tree = Tree::new();
+        let subject = fixtures::subject('b');
+        tree.pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &subject),
+                BODY,
+            )
+            .expect("accepted");
+        tree.pipeline.drain_fanout(100).expect("drained");
+
+        let held = elsewhere();
+        let key_copy = held.path().join("keys-pre-erase");
+        copy_keys(&tree.pipeline.paths().key_store.clone(), &key_copy);
+
+        let (exit, _) = run(|out| erase(&mut tree.pipeline, subject.as_str(), true, out));
+        assert_eq!(exit, Exit::Ok);
+        let (_, health) = run(|out| check(&tree.pipeline, out));
+        assert!(health.contains("resurrected keys   0"), "{health}");
+
+        // The key disk failed; this copy is all there is.
+        let key_root = tree.pipeline.paths().key_store.clone();
+        fs::remove_dir_all(&key_root).expect("the key disk failed");
+
+        // Unconfirmed first: the erasure is on record here, so the preview can name its date.
+        let mut out = Vec::new();
+        let error =
+            restore_keys(&mut tree.pipeline, &key_copy, false, &mut out).expect_err("unconfirmed");
+        assert_eq!(error.exit(), Exit::Unconfirmed);
+        let preview = String::from_utf8(out).expect("utf-8");
+        assert!(preview.contains("erasures logged     1"), "{preview}");
+        assert!(
+            preview.contains("the newest erasure either copy has heard of"),
+            "{preview}"
+        );
+
+        let (exit, printed) = run(|out| restore_keys(&mut tree.pipeline, &key_copy, true, out));
+        assert_eq!(
+            exit,
+            Exit::Incomplete,
+            "the erasure is re-applied and its attestation still waits out the window: {printed}"
+        );
+        assert!(printed.contains("keys walked back    1"), "{printed}");
+        assert!(printed.contains("this copy predates"), "{printed}");
+
+        // The property §10.4 step 7 asserts at T0, restored: no key for the subject, anywhere.
+        let (exit, health) = run(|out| check(&tree.pipeline, out));
+        assert_eq!(exit, Exit::Ok, "{health}");
+        assert!(health.contains("resurrected keys   0"), "{health}");
+    }
+
+    /// A key store put back with `cp`, which reaches none of the above. `check` is the standing
+    /// signal for it, and the exit code is what a monitor branches on.
+    #[test]
+    fn a_key_recovered_by_hand_shows_up_as_a_resurrected_key_and_degrades_the_store() {
+        let mut tree = Tree::new();
+        let subject = fixtures::subject('e');
+        tree.pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &subject),
+                BODY,
+            )
+            .expect("accepted");
+        tree.pipeline.drain_fanout(100).expect("drained");
+
+        let held = elsewhere();
+        let key_copy = held.path().join("keys-pre-erase");
+        copy_keys(&tree.pipeline.paths().key_store.clone(), &key_copy);
+        let (exit, printed) = run(|out| erase(&mut tree.pipeline, subject.as_str(), true, out));
+        assert_eq!(exit, Exit::Ok, "{printed}");
+
+        let tombstone = printed
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("tombstone           "))
+            .expect("the tombstone id")
+            .to_owned();
+        let (exit, _) = run(|out| verify_erasure(&mut tree.pipeline, &tombstone, out));
+        assert_eq!(exit, Exit::Incomplete, "a wait, on a store that is right");
+
+        // The file copy, straight into the live key root.
+        copy_keys(
+            &key_copy.join("keys"),
+            &tree.pipeline.paths().key_store.join("keys"),
+        );
+
+        let (exit, health) = run(|out| check(&tree.pipeline, out));
+        assert_eq!(exit, Exit::Degraded, "{health}");
+        assert!(health.contains("resurrected keys   1"), "{health}");
+        assert!(health.contains("readable again"), "{health}");
+
+        // And the command whose output is the SLA figure now says which of the three it is.
+        let (exit, printed) = run(|out| verify_erasure(&mut tree.pipeline, &tombstone, out));
+        assert_eq!(
+            exit,
+            Exit::Degraded,
+            "a key that came back is not a wait: {printed}"
+        );
+        assert!(printed.contains("key files present   1"), "{printed}");
+        assert!(printed.contains("That is not a wait"), "{printed}");
+
+        // A rebuild re-applies the log, which is the narrower remedy the report names.
+        let (_, _) = run(|out| reindex(&mut tree.pipeline, out));
+        let (exit, printed) = run(|out| verify_erasure(&mut tree.pipeline, &tombstone, out));
+        assert_eq!(exit, Exit::Incomplete, "{printed}");
+    }
+
+    /// Spans a person reads, at the three scales a report prints them at.
+    #[test]
+    fn a_span_reads_at_the_scale_it_is() {
+        assert_eq!(super::duration(0), "0m");
+        assert_eq!(super::duration(90 * 60 * 1_000), "1h 30m");
+        assert_eq!(super::duration((36 * 60 + 30) * 60 * 1_000), "1d 12h");
+    }
+
+    /// A key-store copy pointed at the wrong directory, and one pointed at a store that still has
+    /// its keys. Both refuse before anything is installed.
+    #[test]
+    fn a_key_store_recovery_refuses_a_wrong_source_and_a_merge() {
+        let mut tree = Tree::new();
+        let held = elsewhere();
+        let mut out = Vec::new();
+        let error = restore_keys(&mut tree.pipeline, held.path(), false, &mut out)
+            .expect_err("not a key store");
+        assert!(
+            error.to_string().contains("not a copy of a key store"),
+            "{error}"
+        );
+
+        tree.pipeline
+            .accept(
+                fixtures::subject_record("2026-08-20T09:00:00Z", &fixtures::subject('f')),
+                BODY,
+            )
+            .expect("accepted");
+        let key_copy = held.path().join("keys");
+        copy_keys(&tree.pipeline.paths().key_store.clone(), &key_copy);
+        let error =
+            restore_keys(&mut tree.pipeline, &key_copy, true, &mut out).expect_err("would merge");
+        assert!(error.to_string().contains("not a merge"), "{error}");
+    }
+
+    /// The quarantine age, beside the depth, and the threshold that makes a stalled spool visible.
+    #[test]
+    fn a_spool_past_the_hard_stop_is_reported_and_degrades_the_store() {
+        let tree = Tree::new();
+        let spool = tree.root().join(".quarantine");
+        fs::create_dir_all(&spool).expect("spool");
+
+        // A held record stamped long enough ago that the SLA has passed. Written by hand for the
+        // reason the completion stamp is: a test cannot wait a week.
+        let mut record = fixtures::record("2020-01-01T00:00:00Z");
+        record.data_class = yaam_contract::DataClass::SubjectDerived;
+        let document = yaam_md::Document {
+            record,
+            body: yaam_md::Body::Plain(String::new()),
+        };
+        fs::write(spool.join("held.md"), document.render()).expect("held");
+
+        let (exit, printed) = run(|out| check(&tree.pipeline, out));
+        assert_eq!(exit, Exit::Degraded, "{printed}");
+        assert!(printed.contains("quarantine depth   1"), "{printed}");
+        assert!(printed.contains("oldest held"), "{printed}");
+        assert!(printed.contains("past the 7d 0h hard stop"), "{printed}");
+        assert!(
+            printed.contains("outlived the SLA"),
+            "the operator needs told this is not a lookup about to answer: {printed}"
         );
     }
 }

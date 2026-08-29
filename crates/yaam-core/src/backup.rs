@@ -245,6 +245,12 @@ pub struct RestoreReport {
     pub records_indexed: usize,
     /// Erasures the rebuild replayed out of the restored tombstone log.
     pub erasures_replayed: usize,
+    /// What reconciling the destination's key store against the restored log found.
+    ///
+    /// Ordinarily all zeroes, because a restore installs no key material. It is not always zero, and
+    /// the case where it is not is the one worth having: a destination whose key store was recovered
+    /// *before* the tree, which is one of the two orders an operator can do a disaster recovery in.
+    pub keys_reconciled: crate::restore::Reconciliation,
 }
 
 /// Every entry a backup copies.
@@ -361,6 +367,13 @@ pub fn back_up(pipeline: &Pipeline, into: &Path) -> Result<BackupReport> {
 /// backup: reading the list out of the backup would let a hand-assembled directory nominate the key
 /// store for restoration. The file is read only to confirm the directory is a backup at all, and
 /// one this build understands.
+///
+/// It ends in [`crate::restore::reconcile`] as well as in a rebuild, and the two are not the same
+/// pass. The rebuild replays the *tree's* log, which is what stops restored records re-indexing
+/// erased structure. The reconcile holds the *key store* to that same log and to its own blocklist,
+/// which is what stops a key store recovered before the tree from outliving the erasure the tree has
+/// just told it about. Running it here makes the order of a recovery stop mattering: whichever half
+/// is put back second reconciles the pair.
 pub fn restore(paths: &Paths, from: &Path) -> Result<RestoreReport> {
     read_manifest(from)?;
     refuse_excluded_present(from)?;
@@ -383,10 +396,12 @@ pub fn restore(paths: &Paths, from: &Path) -> Result<RestoreReport> {
 
     let mut pipeline = Pipeline::with_paths(paths.clone())?;
     let rebuilt = crate::reindex::reindex_all(&mut pipeline)?;
+    let keys_reconciled = crate::restore::reconcile(&pipeline)?;
     Ok(RestoreReport {
         files,
         records_indexed: rebuilt.from_tree + rebuilt.from_manifests,
         erasures_replayed: rebuilt.tombstones_replayed,
+        keys_reconciled,
     })
 }
 
@@ -604,7 +619,10 @@ fn copy_tree(from: &Path, to: &Path, files: &mut usize, bytes: &mut u64) -> Resu
 /// The crate's error type has no arm for one, and these *are* statements about the filesystem — a
 /// directory that is not empty, a copy carrying a key store — so they are reported as such rather
 /// than dressed up as a contract violation.
-fn refused(detail: String) -> crate::Error {
+///
+/// Shared with [`crate::restore`], which refuses the same kinds of thing about the other half of a
+/// recovery: one spelling of "this directory is not what you meant" rather than two.
+pub(crate) fn refused(detail: String) -> crate::Error {
     crate::Error::Io(io::Error::other(detail))
 }
 

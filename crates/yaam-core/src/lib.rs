@@ -31,7 +31,10 @@
 //!
 //! Which of these a copy of the store may contain is not a property of whoever writes the copy:
 //! [`backup::MANIFEST`] declares it, and `keystore/` is on the excluded side because that is what
-//! makes [`erase`] reach every copy rather than only the live one.
+//! makes [`erase`] reach every copy rather than only the live one. The other side of that exclusion
+//! is that `keystore/` has a recovery path of its own: [`restore`], which holds a recovered key
+//! store to the erasures it was copied before, so that disaster recovery does not walk back over an
+//! erasure the way an unreconciled file copy does.
 
 #![forbid(unsafe_code)]
 
@@ -48,6 +51,7 @@ pub mod paths;
 pub mod pipeline;
 pub mod reindex;
 pub mod resolve;
+pub mod restore;
 pub mod sweeper;
 pub mod unseal;
 

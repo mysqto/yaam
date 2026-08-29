@@ -333,6 +333,75 @@ impl FsKeyStore {
         Ok(files)
     }
 
+    /// Every subject this store's own blocklist names.
+    ///
+    /// The key store keeps its own account of what was erased — one marker per subject under
+    /// `tombstones/` — and that account is *not* a copy of the tree's erasure log. The two are
+    /// written at the same moment and then travel separately: the log goes into every backup of the
+    /// tree, the markers go into whatever copy the key store's own recovery keeps, and neither copy
+    /// carries the other. So a key store recovered beside a tree can hold an erasure the tree has
+    /// never heard of, and the reconcile that runs after a restore has to be able to enumerate them
+    /// rather than only ask about a subject it was already told to ask about.
+    ///
+    /// A marker whose name is not a pseudonym is an error rather than a file skipped. It names a
+    /// subject whose keys a reconcile would otherwise silently leave standing, which is the one
+    /// direction this must never be wrong in.
+    pub fn tombstoned_subjects(&self) -> crate::Result<Vec<SubjectHash>> {
+        let mut subjects = Vec::new();
+        let entries = match fs::read_dir(self.root.join("tombstones")) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(subjects),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        for entry in entries {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            subjects.push(SubjectHash::parse(&name).map_err(|_| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "`{name}` in the key store's tombstones is not a subject pseudonym, so \
+                         nothing can tell whose keys it forbids"
+                    ),
+                ))
+            })?);
+        }
+        // Directory order is whatever the filesystem hands back, and a reconcile reports what it
+        // reached: one sorted order so two runs over one store read the same.
+        subjects.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(subjects)
+    }
+
+    /// Key files this store holds for one subject, anywhere under its root.
+    ///
+    /// Counted the way an erasure's own verification counts them: any file whose parent directory
+    /// is named for the subject, wherever under the root it sits. That reaches a copy kept beside
+    /// the live tree — a recovery directory, a half-finished restore — and that copy is precisely
+    /// what makes a destruction a fiction. A count taken over `keys/<subject>/` alone would answer
+    /// a narrower question than the one anybody asking this is asking.
+    pub fn key_files_for(&self, subject: &SubjectHash) -> crate::Result<usize> {
+        let wanted = safe_component(subject.as_str())?;
+        let mut count = 0;
+        let mut pending = vec![self.root.clone()];
+        while let Some(dir) = pending.pop() {
+            let is_subject_dir = dir.file_name().is_some_and(|name| name == wanted);
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::Io(e)),
+            };
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    pending.push(entry.path());
+                } else if is_subject_dir {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
     /// Path of a subject's key directory, rejecting anything that could escape the root.
     fn subject_dir(&self, subject: &SubjectHash) -> crate::Result<PathBuf> {
         Ok(self

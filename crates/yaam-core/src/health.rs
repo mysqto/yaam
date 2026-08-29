@@ -1,10 +1,18 @@
 //! A read-only account of whether the store needs attention.
 //!
-//! Six questions, chosen because they are the ones whose answers change what an operator does
+//! Eight questions, chosen because they are the ones whose answers change what an operator does
 //! next: is the index a version this build can use, has the index fallen behind the tree, is there
 //! work the sweeper has not got through, how many records are held back waiting for a subject to
-//! resolve, is anything set aside in `.dead-letter/` that only a person will clear, and is the key
-//! material on disk protected.
+//! resolve **and how long the oldest of them has waited**, is anything set aside in `.dead-letter/`
+//! that only a person will clear, is the key material on disk protected, and **does any key stand
+//! for a subject an erasure has already destroyed the keys of**.
+//!
+//! The last of those is the standing signal for a key store recovered by hand. Erasure is key
+//! destruction, so a key file put back from a copy taken before an erasure un-erases a body — and
+//! nothing else in this deployment would say so, because the live refusals are made from the tree
+//! and would go on being made correctly by a store that had one. [`crate::restore`] is the remedy
+//! and this is the alarm; a remedy nobody knows to run is a runbook step, which is what this
+//! guarantee had instead of a mechanism.
 //!
 //! Every figure is derived the same way the operation that acts on it derives it —
 //! [`crate::sweeper`]'s own scans, not a second definition of them. A drift count that disagrees
@@ -17,7 +25,27 @@
 use yaam_crypto::keystore::KeyMaterial;
 use yaam_store::health::IndexHealth;
 
-use crate::{Pipeline, Result, fsutil, layout, sweeper};
+use crate::{Pipeline, Result, fsutil, layout, restore, sweeper};
+
+/// How long a record may sit in quarantine before the spool is a fault rather than a wait.
+///
+/// Seven days, and the same seven days as [`crate::erase::KEY_BACKUP_WINDOW_MS`] — deliberately, and
+/// for the reason §10.4 gives for tying them: re-keying a record needs every one of its shares, so a
+/// record's subjects must resolve before any of them is shredded, and a shred completes at the end of
+/// the key-backup window. A quarantine that outlived that window would hold a body whose re-keying
+/// had already become impossible.
+///
+/// Two constants rather than one because they are two facts that happen to coincide, and a build that
+/// moved one without the other would be making a claim nobody had argued for. A test asserts they
+/// still agree, which is the assertion that turns the coincidence into something that cannot drift
+/// silently.
+///
+/// This is a *threshold on visibility*, not the hard stop itself. The hard stop — publish the record
+/// structure-only and destroy the day's quarantine key — needs a representation for an unresolved
+/// `subject_derived` record that the write path deliberately refuses today, and that is a contract
+/// change nobody has taken. Until it exists, the honest interim is that a spool outliving the SLA is
+/// reported and degrades the store rather than sitting there silently.
+pub const QUARANTINE_SLA_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// What a health read found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +65,30 @@ pub struct HealthReport {
     /// The spool rather than the index register, because the spool is the authority: the register is
     /// derived from it, and a rebuild reproduces the register from these files.
     pub quarantine_depth: usize,
+    /// How long the oldest held record has been waiting, in milliseconds, or `None` when nothing is
+    /// held.
+    ///
+    /// Measured from the record's own `received_at` and never from `quarantine_pending.first_seen_ms`.
+    /// That column is a wall-clock read taken at registration, and a rebuild deletes and re-registers
+    /// the whole table — so an age keyed on it returns to zero on every `reindex --all`, and a spool
+    /// that had outlived its SLA for a month would never once have said so. The spool file is the
+    /// authority on what is held and the record inside it carries the only clock a rebuild cannot
+    /// move.
+    pub quarantine_oldest_ms: Option<i64>,
+    /// Held records whose own `received_at` will not parse, so nothing can age them out.
+    ///
+    /// Counted apart rather than folded into the age above: a record held too long and a record held
+    /// with nothing saying since when are different files to go and look at, and the second one is
+    /// invisible to every threshold there is.
+    pub quarantine_undated: usize,
+    /// Key files standing for subjects an erasure has already destroyed the keys of.
+    ///
+    /// Nil on every store where nothing has gone wrong, and the whole point of the figure is that it
+    /// is not nil on the one where something has: a key store recovered from a copy taken before an
+    /// erasure. `yaam restore-keys` reconciles a recovery as part of installing it, so this counts
+    /// the recoveries that did not go through it — a hand copy, an interrupted one, a volume
+    /// remounted from a snapshot.
+    pub resurrected_keys: usize,
     /// Fan-out jobs sitting in `.dead-letter/`, waiting for a person.
     ///
     /// The same figure [`crate::drain`] reports, counted by the same function: a job nothing will
@@ -62,6 +114,12 @@ impl HealthReport {
     /// which is the same judgement [`crate::drain::DrainReport::needs_attention`] makes, so the two
     /// commands cannot differ about whether one store wants somebody.
     ///
+    /// A resurrected key counts, and it is the most serious thing this report can say: a body a data
+    /// subject was told had been erased is readable again. A quarantine past
+    /// [`QUARANTINE_SLA_MS`] counts too — the depth alone never distinguished a spool draining
+    /// normally from one that had stopped, which is what made the missing hard stop invisible rather
+    /// than merely unimplemented.
+    ///
     /// Key material in the clear is reported but not judged either, with one exception. A store
     /// deliberately opened unwrapped is a development store, and a command whose exit code called
     /// that broken would be a command a development script has to ignore. A store holding *both*
@@ -72,7 +130,21 @@ impl HealthReport {
         self.index_drift > 0
             || self.sweeper_backlog.total() > 0
             || self.dead_lettered > 0
+            || self.resurrected_keys > 0
+            || self.quarantine_overdue()
             || matches!(self.key_material, KeyMaterial::Mixed { .. })
+    }
+
+    /// Whether the quarantine spool has outlived the SLA, or holds something no clock can age out.
+    ///
+    /// Both arms are the same fault seen twice: a record nobody will come back for. The undated arm
+    /// is the one a threshold alone would miss forever.
+    #[must_use]
+    pub fn quarantine_overdue(&self) -> bool {
+        self.quarantine_undated > 0
+            || self
+                .quarantine_oldest_ms
+                .is_some_and(|age| age >= QUARANTINE_SLA_MS)
     }
 }
 
@@ -109,6 +181,7 @@ pub fn check(pipeline: &Pipeline) -> Result<HealthReport> {
     let store = pipeline.reader()?;
     let index = yaam_store::health::read(&store)?;
     let claim_cutoff = fsutil::now_ms() - sweeper::CLAIM_GRACE_MS;
+    let (quarantine_oldest_ms, quarantine_undated) = restore::quarantine_age(pipeline)?;
     Ok(HealthReport {
         index,
         index_drift: sweeper::unindexed(pipeline)?.len(),
@@ -122,6 +195,9 @@ pub fn check(pipeline: &Pipeline) -> Result<HealthReport> {
             layout::RECORD_EXT,
         )?
         .len(),
+        quarantine_oldest_ms,
+        quarantine_undated,
+        resurrected_keys: restore::resurrected_keys(pipeline)?,
         dead_lettered: crate::drain::dead_lettered(pipeline)?,
         key_material: pipeline.key_material()?,
     })
@@ -215,9 +291,11 @@ mod tests {
         assert_eq!(report.index_drift, 1, "the tree still holds the record");
     }
 
-    /// A quarantined record is held on disk, and the depth is read from there.
+    /// A quarantined record is held on disk, and the depth is read from there — with the age of
+    /// the oldest beside it, because the depth alone never told a spool that is draining from one
+    /// that has stopped.
     #[test]
-    fn a_held_record_is_counted_from_the_spool() {
+    fn a_held_record_is_counted_from_the_spool_and_carries_its_age() {
         let mut harness = Harness::new().resolving_with(testkit::UnavailableLookup);
         harness
             .pipeline
@@ -227,10 +305,92 @@ mod tests {
             )
             .expect("quarantined");
 
-        assert_eq!(
-            check(&harness.pipeline).expect("health").quarantine_depth,
-            1
+        let report = check(&harness.pipeline).expect("health");
+        assert_eq!(report.quarantine_depth, 1);
+        assert!(
+            report.quarantine_oldest_ms.is_some_and(|age| age > 0),
+            "the age comes from the record's own stamp: {report:?}"
         );
+        assert_eq!(report.quarantine_undated, 0);
+    }
+
+    /// The threshold, and the fault it makes visible. A spool that has outlived the SLA is an
+    /// outage that stopped, not a lookup about to answer, and there is no terminal state to expire
+    /// it — so being seen is the whole mechanism.
+    #[test]
+    fn a_spool_past_the_sla_wants_a_person() {
+        let harness = Harness::new();
+        let spool = harness.root().join(crate::layout::QUARANTINE_DIR);
+        fs::create_dir_all(&spool).expect("spool");
+        let document =
+            crate::testkit::plain_document(&testkit::internal("2020-01-01T00:00:00Z"), "");
+        fs::write(spool.join("held.md"), document.render()).expect("held");
+
+        let report = check(&harness.pipeline).expect("health");
+        assert_eq!(report.quarantine_depth, 1);
+        assert!(
+            report.quarantine_oldest_ms.expect("an age") >= super::QUARANTINE_SLA_MS,
+            "{report:?}"
+        );
+        assert!(report.quarantine_overdue());
+        assert!(report.needs_attention());
+    }
+
+    /// Two numbers, one argument. §10.4 ties the quarantine hard stop to the key-backup window —
+    /// re-keying a record needs every share, so its subjects must resolve before any of them is
+    /// shredded, and a shred completes at the end of that window. They are separate constants
+    /// because they are separate facts; this is what stops one moving without the other being
+    /// argued for.
+    #[test]
+    fn the_quarantine_sla_is_the_key_backup_window() {
+        assert_eq!(
+            super::QUARANTINE_SLA_MS,
+            crate::erase::KEY_BACKUP_WINDOW_MS,
+            "a record whose quarantine outlived the key-backup window is one whose re-keying had \
+             already become impossible"
+        );
+    }
+
+    /// The most serious thing this report can say, and it is nil on every store where nothing has
+    /// gone wrong — which is why it is a figure rather than a warning that only ever appears once.
+    #[test]
+    fn a_key_standing_for_an_erased_subject_wants_a_person() {
+        let mut harness = Harness::new();
+        let subject = testkit::subject('a');
+        harness
+            .pipeline
+            .accept(
+                testkit::subject_derived("2026-08-20T09:00:00Z", std::slice::from_ref(&subject)),
+                BODY,
+            )
+            .expect("accepted");
+        assert_eq!(
+            check(&harness.pipeline).expect("health").resurrected_keys,
+            0
+        );
+
+        crate::erase::erase_subject(&mut harness.pipeline, &subject).expect("erased");
+        let report = check(&harness.pipeline).expect("health");
+        assert_eq!(
+            report.resurrected_keys, 0,
+            "an erasure leaves nothing standing: {report:?}"
+        );
+
+        // A key store recovered by hand from a copy taken before the erasure. Every live refusal
+        // goes on being made correctly, because they are made from the tree — this is the one figure
+        // that says the destruction has been walked back.
+        let key = harness
+            .pipeline
+            .paths()
+            .key_store
+            .join("keys")
+            .join(subject.as_str());
+        fs::create_dir_all(&key).expect("dir");
+        fs::write(key.join("2026-Q3"), [0u8; 32]).expect("a key that came back");
+
+        let report = check(&harness.pipeline).expect("health");
+        assert_eq!(report.resurrected_keys, 1);
+        assert!(report.needs_attention());
     }
 
     /// A staging file a dead write left behind is backlog once the grace period has passed.

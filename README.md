@@ -134,7 +134,7 @@ yaam-emit --action note --outcome success --summary "closing ticket PROJ-42 afte
 yaam-emit --action deploy --outcome success --summary "…" --dry-run   # the exact line, no sidecar needed
 
 # The operator command line.
-yaam --root /srv/memory check                       # schema, drift, backlog, quarantine, dead letters
+yaam --root /srv/memory check                       # schema, drift, backlog, quarantine age, keys, dead letters
 yaam --root /srv/memory reindex --all               # rebuild the index from the tree, then drain
 yaam --root /srv/memory drain                       # run queued fan-out: timelines, audit records
 yaam --root /srv/memory drain --max-jobs 500        # …up to a bound; the rest stays queued
@@ -147,6 +147,8 @@ yaam --root /srv/memory unseal --record 01ARZ… --operator lead_ops \
      --reason "subject access request" --confirm-read-body
 yaam --root /srv/memory backup --to /srv/backups/2026-08-20   # authoritative half only
 yaam --root /restored     restore --from /srv/backups/2026-08-20   # copy, rebuild, then drain
+yaam --root /restored     restore-keys --from /srv/keys/2026-08-20  # prints what it would install, and stops
+yaam --root /restored     restore-keys --from /srv/keys/2026-08-20 --confirm-restore-keys
 ```
 
 A backup carries the tree, the cold manifests, the subject audit trail, the erasure log and the
@@ -162,9 +164,40 @@ complete. `restore` refuses a backup that carries one, and refuses a store that 
 records; it rebuilds the index, replays the restored tombstone log and drains the fan-out that
 rebuild queued, all as part of the same command.
 
-The key store has its own recovery path and is not part of this one. Restoring a tree without it
-gives a store that answers structure and no bodies, which is the honest outcome: bodies are
-readable only where their keys still are.
+### Recovering the key store
+
+The key store has its own recovery path and is not part of the one above. Restoring a tree without it
+gives a store that answers structure and no bodies, which is the honest outcome: bodies are readable
+only where their keys still are.
+
+Putting the keys back is where erasure can be undone, and `yaam restore-keys` is the command for it
+rather than `cp`. A key-store copy taken before an erasure holds the keys that erasure destroyed, so
+a plain file copy of one makes those bodies readable again — in the store and in every copy taken
+from it afterwards — and nothing announces it, because every live refusal is made from the tree and
+goes on being made correctly by a store whose keys have come back. So the copy and the reconcile are
+one command: it installs the copy, destroys every key an erasure on record forbids, writes back any
+blocklist entry the copy was missing, and re-runs the verification for every erasure in the log.
+
+**Both accounts of what was erased are consulted**, because they are written together and travel
+apart: `tombstones.jsonl` goes into every backup of the tree, and the key store's own
+`tombstones/<subject>` markers go into the key store's own copy. Whichever of the two artifacts is
+the newer one carries the erasures ordered between them, so a reconcile against the union applies
+them either way round — and the order of a recovery stops mattering.
+
+**What no command can reach**, stated because a silence here would be the dangerous kind: an erasure
+ordered after *both* copies were taken is recorded in neither, and installing the keys walks back
+over it. Nothing on disk can find it — the log line and the marker are in the copies that were not
+restored. That is why the command is confirmed rather than merely correct: the unconfirmed run prints
+the date of the newest erasure either half has heard of and stops, because the question "was anything
+erased after that" is the operator's and nobody else's. The rule that answers it is the one the
+log's append-only-ness was for: **restore the newest backup of the tree**, since every backup taken
+after an erasure carries it for ever.
+
+`yaam check` is the standing signal for the recovery that went round all of this. It reports
+`resurrected keys` — key files standing for subjects the store has already erased — and is degraded
+whenever that is not nil. `yaam verify-erasure` tells the same thing apart from a wait: `6` is the
+key-backup window not yet passed, `4` is a key that has come back or a blocklist entry that has not,
+and those are a week and a command respectively.
 
 ### Keeping a backup under version control
 

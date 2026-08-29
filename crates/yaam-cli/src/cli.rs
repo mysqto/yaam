@@ -645,8 +645,8 @@ pub enum ReadQuery {
     },
 }
 
-/// Operate a memory store: rebuild the index, run its queued work, erase a subject, copy it, read
-/// its health.
+/// Operate a memory store: rebuild the index, run its queued work, erase a subject, copy it,
+/// recover it, read its health.
 #[derive(Debug, Parser)]
 #[command(
     name = "yaam",
@@ -748,8 +748,9 @@ pub enum Command {
         #[arg(long)]
         confirm_read_body: bool,
     },
-    /// Read the store's health: schema version, index drift, sweeper backlog, quarantine depth,
-    /// dead-lettered fan-out.
+    /// Read the store's health: schema version, index drift, sweeper backlog, quarantine depth and
+    /// the age of the oldest record held there, keys standing for an erased subject, dead-lettered
+    /// fan-out.
     ///
     /// The first command to run when something looks wrong. Degraded whenever any of it wants a
     /// person, a job set aside in `.dead-letter/` included: nothing retries one, so a store holding
@@ -806,6 +807,40 @@ pub enum Command {
         /// Directory holding the backup.
         #[arg(long = "from", value_name = "PATH")]
         from: PathBuf,
+    },
+    /// Recover the key store from its own copy, holding that copy to the erasures on record.
+    ///
+    /// The half `restore` cannot do. No backup of the tree contains key material — that exclusion is
+    /// what makes destroying a key reach every copy — so the key store is recovered from its own
+    /// bounded-window copy, and a copy taken before an erasure holds the keys that erasure
+    /// destroyed. Put back with `cp`, those bodies are readable again, and nothing says so: every
+    /// live refusal is made from the tree and goes on being made correctly by a store whose keys
+    /// have come back.
+    ///
+    /// So this installs and reconciles in one command, because the state between two commands is
+    /// the state that reads an erased body back. It destroys every key an erasure forbids, restores
+    /// the blocklist entries the copy was missing, and re-runs the verification for every erasure on
+    /// record. Both accounts of what was erased are consulted — the tree's log and the key store's
+    /// own blocklist — since they are written together and travel in different copies.
+    ///
+    /// Run it *after* `restore`, into a store that exists: the log this reconciles against arrives
+    /// with the tree. Refuses a source that is not a key store, and refuses to merge into a key root
+    /// that already holds keys.
+    ///
+    /// Confirmed rather than merely correct, because of the one case it cannot reach. An erasure
+    /// ordered *between* the two copies is recorded by whichever is newer and is applied; an erasure
+    /// ordered after them both is recorded by neither, and installing the keys would make its bodies
+    /// readable again. Nothing on disk can tell you whether there was one — the log line and the
+    /// blocklist entry are in the copies that were not restored — so the unconfirmed run prints the
+    /// date of the newest erasure either half has heard of and stops. That date is the question.
+    RestoreKeys {
+        /// Directory holding the key-store copy: the `keys/` and `tombstones/` a key root carries.
+        #[arg(long = "from", value_name = "PATH")]
+        from: PathBuf,
+        /// Mean it. Without this the command prints what it would install, what it would be held
+        /// to, and the one question it cannot answer for itself, then stops.
+        #[arg(long)]
+        confirm_restore_keys: bool,
     },
     /// Derive knowledge from the record tree, and read what was derived.
     ///
