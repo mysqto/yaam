@@ -108,18 +108,39 @@ pub(crate) struct Tombstone {
     /// subject was a principal on one record and merely a party to another, that distinction is
     /// part of it.
     ///
-    /// **Read this before deciding the log is a safe place to keep it.** The tombstone log is
-    /// plaintext, is never deleted, and travels in the backup — so this list is a permanent,
-    /// concentrated, greppable subject-to-record mapping in the clear, in the one file no later
-    /// decision can prune. It adds no *fact* the store did not already retain: the same pairings
-    /// survive in each erased record's own frontmatter, in `record_subjects`, and in
-    /// `audit/subjects/`, all three live and all three in the backup. What it changes is shape and
-    /// permanence — a ready-made dossier per erasure instead of a join across surfaces that could
-    /// in principle be narrowed later. That is a widening of the *documented* residue, not of the
-    /// data, and it is a decision for whoever signs the residue off rather than one this code
-    /// should make quietly. Written because the plan requires it in steps 2 and 5 and cites it as
-    /// where the retained graph lives; flagged because the sign-off rests on a document that
-    /// describes this log as holding the pseudonym alone.
+    /// **What keeping this costs, and why it is kept anyway.** The tombstone log is plaintext, is
+    /// never deleted, and travels in the backup — so this list is a permanent, greppable
+    /// subject-to-record mapping in the clear, in the one file no later decision can prune. It adds
+    /// no *fact* the store did not already retain: the same pairings survive in each erased
+    /// record's own frontmatter, in `record_subjects`, and in `audit/subjects/`. The objection
+    /// (amendment A6, option 3) was that those three are in principle narrowable and this one is
+    /// not, so writing it here converts a join that could later be reduced into a ready-made
+    /// dossier per erasure, for ever.
+    ///
+    /// That objection prices a separation the store does not offer. `backup::MANIFEST` carries
+    /// `records/`, `audit/` and this log under one `Included` disposition, into one archive and one
+    /// git history: there is no copy that holds the log without the tree beside it, so narrowing
+    /// the log binds only an adversary the manifest never produces. And the narrowing it is
+    /// weighed against is narrower than it sounds — the frontmatter linkage is what [`verify_live`]
+    /// makes its one positive assertion over and what [`replay_tombstones`] re-erases a restored
+    /// copy from, so removing it costs erasure its verification; `record_subjects` is a function of
+    /// that frontmatter and cannot go first; and excluding `audit/` from the manifest narrows
+    /// distribution while the same graph stays live and greppable in the tree. The reduction on
+    /// offer was small, and it was to be bought by giving up the one artefact that says what an
+    /// erasure reached after the tree has been restored, rebuilt or archived — which §10.4 requires
+    /// in steps 2 and 5 and cites in its residue table.
+    ///
+    /// Dropping only the roles (option 2) was rejected for the reverse reason: the role is
+    /// recoverable from the frontmatter of a record this list already names, so it removes proof
+    /// value and almost no residue. The concentration is the record identifiers; the roles are a
+    /// column on it.
+    ///
+    /// So the list stays, with its roles, and the residue is documented rather than reduced:
+    /// `erasure-residue.md` carries the tombstone log as a fifth retained surface, the one with no
+    /// removal path even in principle. That document is what the D3 residue decision is made
+    /// against, and it is open. The property the argument above rests on is asserted by
+    /// `the_tombstone_list_states_no_pairing_the_erased_tree_does_not`, which goes red if the
+    /// frontmatter linkage is ever stripped and this list becomes the sole holder of the mapping.
     ///
     /// Absent from a line an older build wrote, and empty is not "reached nothing" — it is "this
     /// line does not say". Nothing derives behaviour from it: the replay re-reads the tree.
@@ -556,6 +577,7 @@ fn unverified(subject: &SubjectHash, detail: &str) -> crate::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use yaam_contract::{CanonVer, Role, SubjectRef};
@@ -932,6 +954,91 @@ mod tests {
             .expect("the completion line");
         assert!(stamped.complete);
         assert_eq!(stamped.records, expected);
+    }
+
+    /// The tombstone list states no pairing the erased tree does not state for itself.
+    ///
+    /// This is the property the decision to keep the list rests on, so it is asserted rather than
+    /// argued. The objection to [`Tombstone::records`] is concentration: a subject-to-record
+    /// mapping in a file that is never pruned. The answer is that every pairing in it is also on
+    /// the erased record's own frontmatter, which erasure deliberately leaves standing and which
+    /// [`verify_live`] and [`replay_tombstones`] both read — and both files travel in the same
+    /// backup, so no copy holds the log without the tree.
+    ///
+    /// That answer is only as good as its second half. If [`drop_bodies`] ever begins stripping
+    /// subject linkage from an erased record's frontmatter, this list stops restating the tree and
+    /// becomes the sole holder of the mapping, which is a different residue than the one anyone
+    /// weighed. This test goes red on that day, which is the point of it: the concentration
+    /// question has to be reopened rather than silently answered by a change somewhere else.
+    #[test]
+    fn the_tombstone_list_states_no_pairing_the_erased_tree_does_not() {
+        let (harness, subject, _) = with_sealed_record();
+
+        // A second record naming the subject as a party, so the roles are not all one value.
+        let mut second = testkit::subject_derived("2026-08-23T10:00:00Z", &[]);
+        second.subjects = vec![
+            SubjectRef {
+                hash: testkit::subject('c'),
+                role: Role::Principal,
+                canon_ver: CanonVer(1),
+            },
+            SubjectRef {
+                hash: subject.clone(),
+                role: Role::Party,
+                canon_ver: CanonVer(1),
+            },
+        ];
+        let mut harness = harness;
+        harness.pipeline.accept(second, BODY).expect("accepted");
+
+        // And one held by an outage, which the erasure publishes structure-only into the tree.
+        let mut harness = harness.resolving_with(testkit::UnavailableLookup);
+        let field =
+            testkit::subject_derived("2026-08-24T09:00:00Z", std::slice::from_ref(&subject));
+        harness.pipeline.accept(field, BODY).expect("held");
+        let mut harness = harness.resolving_with(crate::resolve::DeclaredSubjects);
+
+        let report = erase_subject(&mut harness.pipeline, &subject).expect("erased");
+        let entry = read_log(&harness.pipeline)
+            .expect("log")
+            .into_iter()
+            .rfind(|entry| entry.id == report.tombstone_id)
+            .expect("the line this erasure wrote");
+        assert!(
+            !entry.records.is_empty(),
+            "an erasure that reached records has to name them, or this proves nothing"
+        );
+
+        // Read the same mapping back out of the erased tree, from the frontmatter alone — no
+        // index, no audit trail, no tombstone. This is the join the log is accused of replacing.
+        let mut from_tree: BTreeMap<String, Vec<Role>> = BTreeMap::new();
+        for path in fsutil::walk_files(
+            &harness.root().join(crate::layout::RECORDS_DIR),
+            crate::layout::RECORD_EXT,
+        )
+        .expect("walk")
+        {
+            let document = Document::parse(&fs::read_to_string(&path).expect("read")).expect("md");
+            let roles: Vec<Role> = document
+                .record
+                .subjects
+                .iter()
+                .filter(|named| named.hash == subject)
+                .map(|named| named.role)
+                .collect();
+            if !roles.is_empty() {
+                from_tree.insert(document.record.record_id.as_str().to_owned(), roles);
+            }
+        }
+
+        let restated: Vec<ErasedRecord> = from_tree
+            .into_iter()
+            .map(|(record_id, roles)| ErasedRecord { record_id, roles })
+            .collect();
+        assert_eq!(
+            entry.records, restated,
+            "the log states a pairing the erased tree does not already state in the clear"
+        );
     }
 
     /// A line an older build wrote is still readable, and says so rather than claiming nothing.
