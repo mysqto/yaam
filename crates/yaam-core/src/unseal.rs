@@ -23,10 +23,17 @@
 //! chasing a store fault instead of reading the erasure that is working exactly as designed.
 //!
 //! The audit record itself is an ordinary record: [`Visibility::Operator`], so only the operator role
-//! reads it back, and [`DataClass::Internal`], so no key destruction can ever reach it. It names the
-//! subjects whose keys were used, in pseudonym, and that naming deliberately outlives their erasure
-//! — the tombstone log retains the same pseudonyms for the same reason. A trail that erasure could
-//! prune is a trail that cannot answer "who read this before it was erased".
+//! reads it back, and [`DataClass::Internal`], so no key destruction can ever reach it. A trail that
+//! erasure could prune is a trail that cannot answer "who read this before it was erased".
+//!
+//! **It names no subject, and that is the one thing it deliberately cannot answer.** Being out of
+//! erasure's reach is what makes a pseudonym written here permanent: plaintext, full-text indexed,
+//! protected by no key, and still there long after the subject it names has been erased. So the
+//! trail attests that *this record* was decrypted rather than that *these subjects'* keys were used,
+//! and the pairing is recovered by join — the erased record's own frontmatter retains whom it
+//! named, exactly as amendment A6 argued for the tombstone's record list. What is not written here
+//! is a restatement, not a fact. The epoch label stays, because an epoch is a calendar quarter
+//! rather than anybody's identifier, and it is what keeps the trail joinable to the key store.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -237,7 +244,7 @@ pub fn read_body(
 
     // The audit record, before the key store is asked for anything. A failure here is the whole read
     // failing, which is the property this module exists for.
-    let audit = audit_record(pipeline, record, &subjects, &epoch, operator, reason);
+    let audit = audit_record(pipeline, record, subjects.len(), &epoch, operator, reason);
     let audit_id = audit.record_id.clone();
     let body = audit.summary.clone();
     match pipeline.accept(audit, &body)? {
@@ -321,27 +328,26 @@ fn reveal(pipeline: &Pipeline, record: &RecordId, audit: &RecordId) -> Result<Re
 /// a regulator asks for: that this operator was authorised to read this body, at this instant, for
 /// this stated reason. Whether the bytes then decrypted is a question about the key store, and the
 /// tombstone log is what answers it.
+///
+/// It is handed a count and an epoch rather than the pseudonyms themselves, which is the point: a
+/// function that is never given a subject cannot write one, so the property holds by shape and not
+/// by the care of whoever next edits the prose below.
 fn audit_record(
     pipeline: &Pipeline,
     record: &RecordId,
-    subjects: &[SubjectHash],
+    keys_used: usize,
     epoch: &str,
     operator: &str,
     reason: &str,
 ) -> ActionRecord {
     let now = timestamp::format_ms(fsutil::now_ms());
-    let mut summary = format!(
+    let summary = format!(
         "operator `{operator}` was granted a decrypt of [[record:{}]].\n\nreason: {reason}\n\n\
-         keys used: epoch {epoch}, subject(s)",
+         keys used: {keys_used} subject key(s) of epoch {epoch}.\nWhich subjects those were is not \
+         restated here: that record's own frontmatter names them, and a copy of it in this record \
+         would be plaintext no key protects and no erasure can reach.\nThis record is written before \
+         the keys are fetched, so it stands whether or not the body decrypted.\n",
         record.as_str()
-    );
-    for subject in subjects {
-        summary.push(' ');
-        summary.push_str(subject.as_str());
-    }
-    summary.push_str(
-        ".\nThis record is written before the keys are fetched, so it stands whether or not the \
-         body decrypted.\n",
     );
 
     ActionRecord {
@@ -366,7 +372,8 @@ fn audit_record(
         entities: Vec::new(),
         // Empty because the record is internal, which is what keeps it out of erasure's reach: an
         // audit record a subject could erase is an audit record that disappears exactly when it is
-        // being asked for. The pseudonyms are in the prose instead.
+        // being asked for. Nothing puts them in the prose either — out of erasure's reach is
+        // precisely why a pseudonym must not be written here at all.
         subjects: Vec::new(),
         visibility: Visibility::Operator,
         team: None,
@@ -482,6 +489,66 @@ mod tests {
         found
     }
 
+    /// Every audit record's file exactly as it sits on disk, frontmatter and body together.
+    ///
+    /// The parsed record is not enough for the property below: what the store holds is this text,
+    /// and a pseudonym reaches full-text search from either half of it.
+    fn audit_files(harness: &Harness) -> Vec<String> {
+        let mut found: Vec<(String, String)> =
+            crate::fsutil::walk_files(&harness.root().join("records"), crate::layout::RECORD_EXT)
+                .expect("walk")
+                .into_iter()
+                .filter_map(|path| {
+                    let text = fs::read_to_string(&path).expect("read");
+                    let document = Document::parse(&text).ok()?;
+                    (document.record.action == AUDIT_ACTION)
+                        .then(|| (document.record.record_id.as_str().to_owned(), text))
+                })
+                .collect();
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found.into_iter().map(|(_, text)| text).collect()
+    }
+
+    /// Nothing the trail publishes names a subject.
+    ///
+    /// Asserted over the whole file rather than over one field: an unseal audit record lands in
+    /// `records/` as `data_class: internal`, so it is plaintext, full-text indexed, protected by no
+    /// key, and it outlives the subjects it would name. Erasure cannot reach it, so a pseudonym
+    /// written here is searchable for ever.
+    ///
+    /// Two subjects, because one could pass by accident on a summary that happened to mention only
+    /// the other.
+    #[test]
+    fn no_subject_pseudonym_appears_in_what_the_unseal_trail_publishes() {
+        let mut harness = Harness::new();
+        let subjects = [testkit::subject('a'), testkit::subject('b')];
+        let record = testkit::subject_derived(T11, &subjects);
+        harness
+            .pipeline
+            .accept(record.clone(), BODY)
+            .expect("accepted");
+
+        let read = read_body(
+            &mut harness.pipeline,
+            &record.record_id,
+            "operator_a",
+            "regulator asked what is retained",
+        )
+        .expect("read");
+        assert!(matches!(read, Read::Revealed { .. }), "{read:?}");
+
+        let files = audit_files(&harness);
+        assert_eq!(files.len(), 1, "one reading, one line");
+        for subject in &subjects {
+            assert!(
+                !files[0].contains(subject.as_str()),
+                "the trail names subject `{}`, which erasure can never reach:\n{}",
+                subject.as_str(),
+                files[0]
+            );
+        }
+    }
+
     /// The body comes back, and the reading is on the record before it does.
     ///
     /// The property the whole module exists for: there is no arrangement of these two writes that
@@ -527,8 +594,13 @@ mod tests {
         );
         assert!(
             trail[0].summary.contains(record.record_id.as_str())
-                && trail[0].summary.contains(subject.as_str()),
-            "the trail has to say which body and whose keys: {}",
+                && trail[0].summary.contains("epoch 2026-Q3"),
+            "the trail has to say which body and which key epoch: {}",
+            trail[0].summary
+        );
+        assert!(
+            !trail[0].summary.contains(subject.as_str()),
+            "and it must not restate whose keys, which erasure could never take back: {}",
             trail[0].summary
         );
     }

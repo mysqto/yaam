@@ -37,9 +37,15 @@ const RECORDED: &str = "the read is recorded first: one record with `action: uns
      read.";
 
 /// What survives a read, said where the body is handed over.
+///
+/// Both halves of the trade, because an operator reading the trail back has to know what it will
+/// and will not answer. Out of erasure's reach is why it names no subject: a pseudonym written
+/// there would be plaintext no key protects and no erasure can prune, for ever.
 const RETAINED_TRAIL: &str = "the audit record is internal and names no subject, so no erasure \
      reaches it: a trail a data subject could destroy is a trail that disappears exactly when \
-     somebody asks who read their data before it went.";
+     somebody asks who read their data before it went. It attests that this record was decrypted, \
+     by whom, when and why, and under which key epoch — not whose keys those were. That pairing is \
+     in the record's own frontmatter, which is where erasure can still reach it.";
 
 /// Reads one record's sealed body, once the operator has said so explicitly.
 ///

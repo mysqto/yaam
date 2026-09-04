@@ -517,8 +517,12 @@ afterwards, an audit trail is a courtesy; written first, it is a precondition.
 
 The audit record is `internal` and names no subject, so no erasure reaches it: a trail a data subject
 could destroy is a trail that disappears exactly when somebody asks who read their data before it
-went. It names the subject pseudonyms in its prose, deliberately, for the same reason the tombstone
-log keeps them.
+went. Being out of erasure's reach is also why it names no subject *in its prose*. It attests that
+this record was decrypted, by whom, when, why and under which key epoch — an epoch is a calendar
+quarter and identifies nobody — and not whose keys those were. That pairing is not lost, it is
+recovered by join: the record's own frontmatter retains the subjects it named, and erasure can still
+reach that. A restatement here could not be reached, ever, and this record is plaintext and
+full-text indexed.
 
 `--confirm-read-body` is `erase`'s register, because the two are irreversible in the same way: an
 erasure cannot be undone, and a reading cannot be unread. Without it the command prints whose keys
