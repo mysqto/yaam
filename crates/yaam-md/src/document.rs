@@ -136,6 +136,7 @@ mod tests {
 
     use super::{Body, Document, Error, is_sealed};
     use crate::frontmatter::fixture::{assert_same_record, record, subject_derived, subject_hash};
+    use yaam_contract::record::Role as SubjectRole;
 
     /// A plaintext document whose body is its summary, which is the shape the pipeline writes.
     fn plain(summary: &str) -> Document {
@@ -237,24 +238,23 @@ mod tests {
         assert!(!is_sealed("prose that mentions ```sealed blocks"));
     }
 
-    /// A sealed body with one share per subject of [`subject_derived`].
+    /// A sealed body with one share per subject of [`subject_derived`] — so, one.
     ///
     /// Built from stored bytes rather than by sealing: this crate is testing serialisation, and
     /// wiring a key store in would make the assertion depend on the sealing path too.
+    ///
+    /// One share rather than two, because a record names at most one subject and a fixture pairing
+    /// a one-subject record with a two-share body would be a document no store can hold. The block
+    /// format still encodes a share list, and `yaam_crypto::block` round-trips two of them; that is
+    /// the crate that owns the format, and the right place for it.
     fn sealed_body() -> SealedBody {
         SealedBody {
             nonce: Nonce::from_stored([9; 12]),
             epoch: Epoch::from_stored("2026-Q3").expect("a stored label"),
-            shares: vec![
-                WrappedShare {
-                    subject: subject_hash('a'),
-                    bytes: vec![0xa1; 40],
-                },
-                WrappedShare {
-                    subject: subject_hash('b'),
-                    bytes: vec![0xb2; 40],
-                },
-            ],
+            shares: vec![WrappedShare {
+                subject: subject_hash('a'),
+                bytes: vec![0xa1; 40],
+            }],
             ciphertext: vec![0xcd; 48],
         }
     }
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn a_sealed_document_round_trips_and_is_not_searchable() {
         let document = Document {
-            record: subject_derived(),
+            record: subject_derived(SubjectRole::Principal),
             body: Body::Sealed(sealed_body()),
         };
         let text = document.render();
@@ -292,7 +292,7 @@ mod tests {
         // Byte stability matters more here than elsewhere: the content checksum decides whether a
         // reindex thinks the file changed, and a sealed file must not look modified every pass.
         let document = Document {
-            record: subject_derived(),
+            record: subject_derived(SubjectRole::Principal),
             body: Body::Sealed(sealed_body()),
         };
         assert_eq!(document.render(), document.render());

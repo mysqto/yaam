@@ -201,7 +201,12 @@ paths:
         write it otherwise is. A caller that has the grant still does not choose the record's
         subjects: it names the transaction as an ordinary entity reference at `confidence: 1.0`, and
         the service's own resolver derives the pseudonyms from the entity kinds the deployment
-        declares as erasure units. A record naming none of them is refused.
+        declares as erasure units. A record naming none of them is refused, and so is one that
+        resolves to more than one: a body sealed under two subject shares ends for both subjects the
+        moment either one is erased, and there is nothing here to answer the survivor's right of
+        access to what it said about them. An event about two subjects is two records — one each,
+        related by `correlation_id` and by the entity references both carry — which is what makes
+        one erasure reach one body.
 
         Bodies are capped at 1 MiB. The signature covers the whole body, so the body must be held in
         memory before anything about it can be trusted; the cap is what stops that being a
@@ -320,8 +325,8 @@ paths:
             declares — at the top level, inside `record`, or inside one of its entity or subject
             references — or the record breaks a contract rule — an empty `action`, a timestamp
             that cannot be read, a `subject_derived` record naming no subject, an `internal` record
-            naming one, a `team` visibility with no team, or an entity confidence outside `0.0..=1.0`.
-            Do not retry these bytes.
+            naming one, a record naming more than one, a `team` visibility with no team, or an
+            entity confidence outside `0.0..=1.0`. Do not retry these bytes.
           content:
             application/json:
               schema:
@@ -1639,14 +1644,18 @@ components:
         Whether the body is erasable. `internal` bodies are plaintext and must name no subject.
         `subject_derived` bodies are sealed under a key derived from *all* the record's subjects, and
         must name at least one — a subject-derived record with no subjects would be sealed under a
-        key nobody can destroy, which is unerasable by construction.
+        key nobody can destroy, which is unerasable by construction — and at most one, because a
+        body sealed under two subject shares ends for both the moment either one is erased, and the
+        surviving subject keeps a right of access to what it said about them that no re-key, re-seal
+        or delete here can answer.
 
     SubjectRole:
       type: string
       enum: [principal, party]
       description: |
         `principal` acted or was acted for; `party` is named by the record without being its
-        subject.
+        subject. A record carries one subject in one of these roles, never one of each: that pair is
+        exactly the shared body a `subject_derived` record may not have.
 
     EntityRole:
       type: string
@@ -1818,10 +1827,12 @@ components:
             $ref: '#/components/schemas/EntityRef'
         subjects:
           type: array
+          maxItems: 1
           description: |
-            Empty for `internal`; at least one entry for `subject_derived`. The body's key is derived
-            from all of them together, so no single share decrypts it and changing the set re-seals
-            under a fresh key.
+            Empty for `internal`; exactly one entry for `subject_derived`. The body's key is derived
+            from every share the record has, so a second entry would be a body either subject could
+            end for the other — which is why there is never one. Changing the set re-seals under a
+            fresh key rather than re-wrapping the old one.
           items:
             $ref: '#/components/schemas/SubjectRef'
         visibility:
@@ -1952,10 +1963,17 @@ components:
             $ref: '#/components/schemas/EntityRef'
         subjects:
           type: array
+          maxItems: 1
           description: |
-            Data subjects named by this record, as keyed pseudonyms — never a direct identifier. Two
-            records naming the same pseudonym are about the same subject, which is what a pseudonym
-            is for; the identity behind it needs the keying secret, which no caller holds.
+            The data subject this record is about, as a keyed pseudonym — never a direct
+            identifier. Two records naming the same pseudonym are about the same subject, which is
+            what a pseudonym is for; the identity behind it needs the keying secret, which no caller
+            holds.
+
+            At most one entry: one record, one subject, one body, one erasure. An event about two
+            subjects is two records, related by `correlation_id` and by the entity references both
+            carry — plaintext structure, which survives either subject's erasure, so a reader can
+            still tell the two were one event after one half has become unreadable.
           items:
             $ref: '#/components/schemas/SubjectRef'
         visibility:

@@ -20,6 +20,11 @@ use yaam_contract::{
 /// the contract only requires conditionally, and therefore the two easiest to leave out of a
 /// fixture.
 ///
+/// `subjects` carries one entry, not two. It used to carry one of each subject role, and the
+/// contract now refuses that: a body sealed under two subject shares ends for both subjects the
+/// moment either one is erased, so the sample was publishing a shape no store may hold. A `Vec` of
+/// one is still non-empty, which is all the projection check needs.
+///
 /// # Panics
 /// If the record it builds is not valid, which would mean the sample had drifted from the rules it
 /// exists to exercise.
@@ -46,10 +51,7 @@ pub fn maximal() -> ActionRecord {
             entity_ref("ticket", "PROJ-42", entity::Role::Primary, 1.0),
             entity_ref("deploy", "d-9", entity::Role::Related, 0.75),
         ],
-        subjects: vec![
-            subject_ref("ab", SubjectRole::Principal, 1),
-            subject_ref("cd", SubjectRole::Party, 2),
-        ],
+        subjects: vec![subject_ref("ab", SubjectRole::Principal, 2)],
         visibility: Visibility::Team,
         team: Some("platform".to_owned()),
         data_class: DataClass::SubjectDerived,

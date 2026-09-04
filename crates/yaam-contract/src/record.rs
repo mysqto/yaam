@@ -162,7 +162,12 @@ pub struct ActionRecord {
     pub attrs: BTreeMap<String, attrs::Value>,
     /// Entities this record joins on.
     pub entities: Vec<EntityRef>,
-    /// Data subjects named by this record. Empty for [`DataClass::Internal`].
+    /// The data subject this record is about — at most one.
+    ///
+    /// Empty for [`DataClass::Internal`], and empty on arrival for a [`DataClass::SubjectDerived`]
+    /// record whose pseudonym the store resolves. Never more than one, for the reason
+    /// [`ActionRecord::validate`] gives: one body cannot be two erasures.
+    #[schemars(length(max = 1))]
     pub subjects: Vec<SubjectRef>,
     /// Read scope.
     pub visibility: Visibility,
@@ -183,8 +188,8 @@ pub struct ActionRecord {
 impl ActionRecord {
     /// Checks the invariants that cannot be expressed in the type system.
     ///
-    /// Notably: a subject-derived record must name at least one subject, and a team-scoped record
-    /// must name its team.
+    /// Notably: a record names at most one data subject, a subject-derived record must name at
+    /// least one, and a team-scoped record must name its team.
     ///
     /// Both timestamps are checked for *format* here, at the boundary the writer can still act on.
     /// They are carried as text and converted downstream — by the index, and by the tree deriving a
@@ -204,6 +209,30 @@ impl ActionRecord {
     /// subject, before a byte of it is written, because its body would be sealed under a key nobody
     /// can destroy. Refusing it here as well would not add a guarantee; it would only rule out every
     /// deployment that resolves subjects on the write path.
+    ///
+    /// # At most one subject
+    ///
+    /// A sealed body's key is derived from *every* subject share, so a body naming two subjects ends
+    /// for both the moment either one is erased. The other subject still has a right of access to
+    /// what that body said about them, and this store has nothing to answer it with: no re-key, no
+    /// re-seal, no delete. So the shared body is not written. One record, one subject, one body, one
+    /// erasure — and an erasure that reaches one body reaches one subject's account of an event.
+    ///
+    /// Refused rather than split, because a split cannot be done here without doing harm. A write
+    /// carries one body: copying it into a body per subject would leave everything the record said
+    /// about the erased subject readable in the surviving copy, which defeats the erasure instead of
+    /// narrowing it, permanently and with no delete to undo it. Partitioning the prose by subject
+    /// instead would put a reading of that prose in the erasability path, which is the one decision
+    /// no judgement may make. A caller with an event about two subjects files a record each and
+    /// relates them with `correlation_id` and their shared entity references — plaintext structure,
+    /// which survives either erasure, so a reader can still tell the two records were one event.
+    ///
+    /// Unlike the rule above, this one has no half left to the write path: it is checked here, so a
+    /// caller cannot send two pseudonyms, and checked again once a deployment's resolver has
+    /// answered, so a resolver cannot settle on two either. Both are needed. A record arriving with
+    /// no subjects passes this check and says nothing about what it will resolve to, and a resolver
+    /// runs on one write path while this function runs on every path a record crosses — including
+    /// the rebuild, which is what keeps a shared body from being reindexed back into a store.
     pub fn validate(&self) -> crate::Result<()> {
         if self.action.trim().is_empty() {
             return Err(crate::Error::Invalid("action is empty".to_owned()));
@@ -220,6 +249,18 @@ impl ActionRecord {
         if self.data_class == DataClass::Internal && !self.subjects.is_empty() {
             return Err(crate::Error::Invalid(format!(
                 "internal record names {} subject(s)",
+                self.subjects.len()
+            )));
+        }
+
+        // The class check above comes first on purpose: for an internal record naming two, the
+        // class is the fault the caller has to fix, and this message would send them looking at the
+        // wrong field.
+        if self.subjects.len() > 1 {
+            return Err(crate::Error::Invalid(format!(
+                "record names {} subjects; one body sealed under all of them ends for every one of \
+                 them the moment any one is erased. File one record per subject and relate them \
+                 with `correlation_id`",
                 self.subjects.len()
             )));
         }
@@ -314,6 +355,35 @@ pub(crate) mod tests {
         r.subjects.push(subject());
         r.validate()
             .expect("and a record that brings its own is no worse");
+    }
+
+    /// The property: no record can be written whose one body belongs to two subjects.
+    ///
+    /// It is refused here rather than split, because a write carries one body. Copying it into a
+    /// body per subject would leave everything the record said about the erased subject readable in
+    /// the surviving copy — the erasure defeated rather than narrowed, permanently, since this store
+    /// has no delete. Dividing the prose instead would put a reading of it in the erasability path.
+    /// So the refusal is the answer, and it names the alternative a caller does have.
+    #[test]
+    fn a_record_naming_two_subjects_cannot_be_written_as_one_shared_body() {
+        let mut r = internal_record();
+        r.data_class = DataClass::SubjectDerived;
+        r.subjects.push(subject());
+        r.validate().expect("one subject is the writable case");
+
+        r.subjects.push(SubjectRef {
+            hash: SubjectHash::parse(&format!("s_{}", "cd".repeat(32))).expect("valid hash"),
+            role: Role::Party,
+            canon_ver: CanonVer(1),
+        });
+        let err = r
+            .validate()
+            .expect_err("one body cannot be two subjects' erasures");
+        assert!(err.to_string().contains("names 2 subjects"), "{err}");
+        assert!(
+            err.to_string().contains("correlation_id"),
+            "the refusal has to name what a caller does instead: {err}"
+        );
     }
 
     #[test]

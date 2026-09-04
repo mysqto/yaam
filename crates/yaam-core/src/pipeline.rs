@@ -455,7 +455,7 @@ impl Pipeline {
             // who holds the record and can fix what it names.
             Resolution::Refused(reason) => return Err(invalid(reason)),
         };
-        check_class(record, &resolved)?;
+        check_subjects(record, &resolved)?;
         let sealed = self.seal_body(record, &resolved, stamp, body)?;
         Ok((resolved, sealed))
     }
@@ -1014,14 +1014,28 @@ fn subject_role_text(role: yaam_contract::Role) -> &'static str {
     }
 }
 
-/// Holds the resolver to the contract rule that ties a record's class to its subjects.
+/// Holds the resolver to the contract's rules about a record's subjects.
 ///
 /// [`ActionRecord::validate`] already checked what arrived; this checks what resolution *replaced* it
-/// with, and the two failures need different words because they have different culprits. Neither is
+/// with, and the failures need different words because they have different culprits. None of them is
 /// survivable: a subject-derived record with no subjects would be sealed under a key nobody can
-/// destroy, and an internal record naming subjects would claim an erasability its plaintext body
-/// cannot deliver.
-fn check_class(record: &ActionRecord, resolved: &[SubjectRef]) -> Result<()> {
+/// destroy, an internal record naming subjects would claim an erasability its plaintext body cannot
+/// deliver, and a record resolving to two subjects would be one body either of them could end for
+/// the other — the case `validate` refuses on arrival, and the only way to reach it without
+/// arriving that way.
+///
+/// That last check is deliberately not left to the resolvers. [`crate::resolve::ReferenceSubjects`]
+/// answers with exactly one subject and refuses an ambiguous record itself, but
+/// [`crate::resolve::SubjectResolver`] is a deployment's to implement and its answer is a `Vec`. A
+/// rule living only in the implementations would bind none of them.
+fn check_subjects(record: &ActionRecord, resolved: &[SubjectRef]) -> Result<()> {
+    if resolved.len() > 1 {
+        return Err(invalid(format!(
+            "subject resolution produced {} subjects for one record; its body would be sealed \
+             under all of them, so erasing any one would end it for the rest",
+            resolved.len()
+        )));
+    }
     match record.data_class {
         DataClass::SubjectDerived if resolved.is_empty() => Err(invalid(
             "subject resolution produced no subject for a subject-derived record",
@@ -1202,8 +1216,7 @@ mod tests {
     #[test]
     fn a_subject_derived_record_is_sealed_and_indexes_no_searchable_text() {
         let mut harness = Harness::new();
-        let subjects = [testkit::subject('a'), testkit::subject('b')];
-        let record = testkit::subject_derived(T09, &subjects);
+        let record = testkit::subject_derived(T09, &[testkit::subject('a')]);
         let path = harness.path_of(&record);
 
         harness
@@ -1219,16 +1232,17 @@ mod tests {
         let parsed = Document::parse(&text).expect("parses");
         assert!(matches!(parsed.body, Body::Sealed(_)));
         assert_eq!(parsed.searchable_text(), "");
-        // One wrapped share per subject reached the index, each under an epoch.
+        // The record's one wrapped share reached the index, under an epoch. One, because a record
+        // names one subject: two shares under one body is the state `validate` refuses.
         let counts = harness.counts();
-        assert_eq!(counts["record_subjects"], 2);
+        assert_eq!(counts["record_subjects"], 1);
         let shares = harness.snapshot();
         assert_eq!(
             shares
                 .iter()
                 .filter(|line| line.starts_with("subject|"))
                 .count(),
-            2
+            1
         );
         assert!(
             shares
@@ -1908,7 +1922,9 @@ mod tests {
     fn what_the_resolver_answers_is_what_gets_sealed() {
         let declared = testkit::subject('a');
         let record = testkit::subject_derived(T09, std::slice::from_ref(&declared));
-        let resolved = [subject_ref('b'), subject_ref('c')];
+        // One subject, and not the one the record declared: a resolution of two is refused, so what
+        // this test is about is whose answer wins, not how many it may give.
+        let resolved = [subject_ref('b')];
         let mut harness = Harness::new().resolving_with(Mapped(BTreeMap::from([(
             record.record_id.as_str().to_owned(),
             resolved.to_vec(),
@@ -1939,7 +1955,7 @@ mod tests {
             shares.iter().all(|line| !line.contains(declared.as_str())),
             "the subject the record declared is not the one it was sealed under"
         );
-        assert_eq!(harness.counts()["record_subjects"], 2);
+        assert_eq!(harness.counts()["record_subjects"], 1);
 
         // And a record the table has no entry for is held, not rejected: a lookup that has not
         // caught up is the same transient failure whatever shape a resolver takes.
@@ -2001,6 +2017,63 @@ mod tests {
             extra.pipeline.accept(plain, BODY),
             Err(crate::Error::Invalid(_))
         ));
+    }
+
+    /// The property, on the write path: nothing reaches disk sealed under two subjects.
+    ///
+    /// Two ways in, so both are shut. A caller can declare two pseudonyms, which `validate` refuses
+    /// before resolution; and a deployment's own resolver can answer with two, which nothing before
+    /// `check_subjects` sees. Shutting the first only would leave the rule to the resolvers, and
+    /// `SubjectResolver` is a deployment's to implement.
+    ///
+    /// The assertion is not merely that `accept` errs but that the tree and the index are as they
+    /// were. A shared body that reached disk is the state nothing can walk back: no re-key, no
+    /// re-seal, no delete.
+    #[test]
+    fn a_multi_subject_write_cannot_produce_one_shared_body() {
+        let declared =
+            testkit::subject_derived(T09, &[testkit::subject('a'), testkit::subject('b')]);
+        let mut harness = Harness::new();
+        let path = harness.path_of(&declared);
+        let err = harness
+            .pipeline
+            .accept(declared, BODY)
+            .expect_err("two declared subjects would share one body");
+        assert!(
+            matches!(&err, crate::Error::Invalid(_))
+                && err.to_string().contains("names 2 subjects"),
+            "the caller is told what to fix: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "nothing sealed under two subjects reached disk"
+        );
+        assert_eq!(harness.counts()["records"], 0);
+        assert_eq!(harness.counts()["record_subjects"], 0);
+        assert_eq!(harness.counts()["quarantine_pending"], 0);
+
+        // The same body arrived at the other way: one declared subject, and a resolver answering
+        // with two.
+        let one = testkit::subject_derived(T09, &[testkit::subject('a')]);
+        let mut resolved = Harness::new().resolving_with(Mapped(BTreeMap::from([(
+            one.record_id.as_str().to_owned(),
+            vec![subject_ref('b'), subject_ref('c')],
+        )])));
+        let path = resolved.path_of(&one);
+        let err = resolved
+            .pipeline
+            .accept(one, BODY)
+            .expect_err("two resolved subjects would share one body");
+        assert!(
+            matches!(&err, crate::Error::Invalid(_))
+                && err.to_string().contains("produced 2 subjects"),
+            "the deployment is told what its resolver did: {err}"
+        );
+        assert!(!path.exists());
+        assert_eq!(resolved.counts()["records"], 0);
+        assert_eq!(resolved.counts()["record_subjects"], 0);
+        // Not held for a retry either: a resolver answering with two answers with two again.
+        assert_eq!(resolved.counts()["quarantine_pending"], 0);
     }
 
     #[test]

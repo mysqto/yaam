@@ -21,6 +21,7 @@ index that makes it queryable in single-digit milliseconds.
 | **Derived index** | SQLite + FTS5, rebuildable from the tree. Delete it and run `yaam reindex`. |
 | **Crash-recoverable** | Write-ahead staging, atomic publish, a sweeper that converges. No claim of distributed atomicity. |
 | **Erasable bodies** | Per-record keys, per-subject key encryption. Deleting a subject's keys makes their record bodies permanently unreadable in every copy, including backups. |
+| **One erasure reaches one body** | A record names at most one data subject. A body sealed under two subject shares would end for both the moment either one was erased, and the survivor would keep a right of access to it that no re-key, re-seal or delete here can answer — so it is refused on the way in rather than written. An event about two subjects is two records, related by `correlation_id` and by the entity references both carry, which are plaintext and survive either erasure. |
 | **Reads return structure, never a body** | A read answers with each matching record's frontmatter — action, outcome, declared attributes, entity references, subject pseudonyms, timestamps — and never its prose. The rule does not branch on data class: a sealed body is withheld because it is a body, and a plaintext one for the same reason. A plaintext body is read from the tree; a sealed one only through `yaam unseal`, which records the reading before it performs it. |
 | **One audited way back to a sealed body** | `yaam unseal` publishes an operator-visible record naming who read the body and why, and only then fetches a key. A store that cannot record the read cannot answer it, so there is no path that returns a sealed body without a line saying it did. |
 | **Derived knowledge** | One note per entity under `knowledge/`, rebuilt wholesale from the record tree by `yaam knowledge build`. Every line restates a structured field some record declared and names the records it came from. Nothing is derived from a record whose body is erasable, so a key destruction has no aggregate to chase. |
@@ -728,6 +729,25 @@ transaction's erasure destroy the other's body, and picking one would be a coin 
 fact. Only references a caller *stated* count — one inferred from prose is a guess, and a guess may
 not decide whether a body becomes permanently unerasable. A refused record is one that was never
 written, which is the only failure here that can still be fixed.
+
+**One record, one subject, one body, one erasure.** The rule above is the shipped resolver's; the
+rule beneath it is the contract's, and binds every writer. A body is sealed under a key derived from
+every share it has, so a record naming two subjects would be one body either of them could end for
+the other — and the survivor would keep a right of access to what it said about them that nothing
+here can answer, there being no re-key, no re-seal and no delete. So the record is refused rather
+than written, wherever it is read and again once a deployment's resolver has answered.
+
+Refused rather than split, and the reason is that a write carries one body. Copying it into a body
+per subject would leave everything the record said about the erased subject readable in the
+surviving copy — the erasure defeated rather than narrowed, permanently. Dividing the prose instead
+would put a reading of it in the erasability path, which is the one decision no judgement may make.
+An event about two subjects is therefore two records, related by `correlation_id` and by the entity
+references both carry. That relation is plaintext frontmatter and an erasure takes bodies and keys,
+not structure, so it survives either erasure: after one subject's half is unreadable a reader can
+still tell the two records were one event. `correlate` and `linked` need nothing new for this — they
+join on shape, time and entity references and never read a body — and erasure verification means
+what it says for the first time: it asserts the absence of the keys it was asked about, which with
+one subject per body is the same statement as "that subject's bodies are gone".
 
 Changing the canonicalisation is a version, never an edit: the version number is an input to the
 HMAC, so a bump makes every subject hash differently and uniformly, and the old rules stay registered
