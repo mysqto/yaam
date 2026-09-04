@@ -106,6 +106,7 @@ info:
     | `400` | query string not understood — unknown parameter, or one that would not parse |
     | `401` | signature missing, malformed, or wrong |
     | `403` | authenticated, but not permitted this operation |
+    | `409` | a legal hold forbids this destruction; a person must release it first |
     | `422` | **permanent.** Fix the record or the request; resending the same bytes cannot help |
     | `500` | this service's own fault. Raise it; do not spin on it |
     | `503` | **transient.** Retry — retrying is safe, because every write is idempotent |
@@ -875,6 +876,12 @@ paths:
         no row can be un-written, so the whole index is rebuilt from the erased tree before the
         answer comes back. Budget for that rather than putting this call anywhere a user waits.
 
+        A legal hold outranks this call. Where one stands over the subject the request is refused
+        `409` and no key is touched: an obligation to preserve and an obligation to erase point in
+        opposite directions, and only a person with the facts can say which now applies. Holds are
+        placed and lifted by whoever has custody of the store, not over this interface — the same
+        reason erasure's local half is an operator command.
+
         This endpoint takes plain JSON only. The sealed media type is accepted on `POST /records`
         alone; a sealed body sent here is parsed as JSON and fails `422`.
       requestBody:
@@ -911,6 +918,18 @@ paths:
                 $ref: '#/components/schemas/Error'
               example:
                 error: 'forbidden: `agent_a` is not permitted this operation'
+        '409':
+          description: |
+            A legal hold stands over this subject, so its keys must survive. No key was touched and
+            nothing was written. Not retryable: the hold has to be released by whoever has custody
+            of the store before this call can succeed. The message names each hold, when it was
+            placed, by whom, and on what grounds.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'held: 1 hold(s) stand over subject s_9f2c4b8a1d6e0f37c5a49b2d8e71f036a4c8b5d29e7f13a06c4b8d5e29f7a13c0, and destroying its keys would make bodies unreadable that this store has been ordered to preserve. Nothing was destroyed.'
         '422':
           description: |
             Permanent. The body is not JSON, carries an undeclared field, or `subject` is not a

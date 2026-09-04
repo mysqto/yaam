@@ -20,14 +20,15 @@
 //! subject-key-check.json      which subject key the pseudonyms above were derived from
 //! index.sqlite                 the derived index; deleting it is recoverable
 //! tombstones.jsonl             append-only erasure log, replayed on every rebuild
+//! holds.jsonl                  append-only legal-hold log, consulted before any key destruction
 //! .staging/<id>.md             write-ahead copies, before publish
 //! .quarantine/<id>.md          sealed copies of records whose subjects will not resolve
 //! .dead-letter/                fan-out work set aside after repeated failure
 //! ```
 //!
 //! The visible directories are the store; the dot-prefixed ones are machinery. Nothing outside
-//! `records/`, `cold/` and `tombstones.jsonl` is authoritative — the rest is either configuration
-//! or derived, which is what makes a rebuild routine rather than a recovery.
+//! `records/`, `cold/`, `tombstones.jsonl` and `holds.jsonl` is authoritative — the rest is either
+//! configuration or derived, which is what makes a rebuild routine rather than a recovery.
 //!
 //! Which of these a copy of the store may contain is not a property of whoever writes the copy:
 //! [`backup::MANIFEST`] declares it, and `keystore/` is on the excluded side because that is what
@@ -47,11 +48,13 @@ pub mod drain;
 pub mod erase;
 pub mod error;
 pub mod health;
+pub mod hold;
 pub mod paths;
 pub mod pipeline;
 pub mod reindex;
 pub mod resolve;
 pub mod restore;
+pub mod retain;
 pub mod sweeper;
 pub mod unseal;
 

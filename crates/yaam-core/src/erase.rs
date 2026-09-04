@@ -165,6 +165,12 @@ pub struct ErasePreview {
     pub quarantined: usize,
     /// Whether this subject has already been tombstoned by an earlier erasure.
     pub already_tombstoned: bool,
+    /// Legal holds standing over this subject, which refuse the erasure outright.
+    ///
+    /// In the preview because the refusal has to be visible before the confirmation, not after it:
+    /// an operator who confirms an irreversible destruction and is then told it was forbidden has
+    /// learned nothing they could not have been told first.
+    pub holds: Vec<crate::hold::Hold>,
 }
 
 /// Counts what [`erase_subject`] would destroy.
@@ -211,6 +217,7 @@ pub fn preview(pipeline: &Pipeline, subject: &SubjectHash) -> Result<ErasePrevie
         keys: count_key_files(pipeline, subject)?,
         quarantined,
         already_tombstoned: pipeline.keys().is_tombstoned(subject)?,
+        holds: crate::hold::standing_for(pipeline, subject)?,
     })
 }
 
@@ -234,6 +241,11 @@ pub fn preview(pipeline: &Pipeline, subject: &SubjectHash) -> Result<ErasePrevie
 /// crash anywhere after the append leaves a tombstone that already names everything this run was
 /// about; the other order leaves one that names nothing and cannot be completed by hand.
 pub fn erase_subject(pipeline: &mut Pipeline, subject: &SubjectHash) -> Result<EraseReport> {
+    // Before anything, including the log line. An erasure is irreversible from its first write
+    // onwards — the tombstone is replayed by every rebuild — so a hold that refused it halfway
+    // would have refused nothing.
+    crate::hold::refuse_if_held(pipeline, subject)?;
+
     let tombstone_id = format!("tomb-{}", RecordId::generate().as_str());
     append(
         pipeline,
@@ -307,6 +319,12 @@ pub fn confirm_erasure(pipeline: &mut Pipeline, tombstone_id: &str) -> Result<bo
 /// Called by the rebuild, and idempotent so it can be. Without it a rebuild would index a record
 /// restored from a backup — or replayed late by a sender that never heard about the erasure — as if
 /// its subject had never been erased, complete with the wrapped share the tree still carries.
+///
+/// Deliberately does *not* consult [`crate::hold`], unlike [`erase_subject`]. A line in this log is
+/// an erasure that already happened, and a hold cannot bring back a key: refusing the replay would
+/// leave a restored copy holding structure the erasure removed, which is the one failure this
+/// function exists to prevent. A hold can only stop an erasure that has not been ordered yet, which
+/// is where [`erase_subject`] consults it.
 pub(crate) fn replay_tombstones(pipeline: &Pipeline) -> Result<usize> {
     let mut seen = BTreeSet::new();
     let mut replayed = 0;

@@ -703,6 +703,55 @@ pub enum Command {
         #[arg(long)]
         confirm_destroy_keys: bool,
     },
+    /// Destroy every subject key whose calendar quarter has fallen past a retention cutoff.
+    ///
+    /// The pass that makes a retention period a mechanism rather than a claim. Keys are minted per
+    /// subject and per quarter precisely so this can exist, and until it does the period is a
+    /// sentence in a document that nothing enforces.
+    ///
+    /// Nothing runs it. There is no timer and no daemon here: an operator invokes it, or an
+    /// external scheduler does. A destruction nothing can undo is not one a service should decide
+    /// to perform while nobody is watching, and a period enforced on a process's own clock would
+    /// be enforced again on a restored store's.
+    ///
+    /// **The unit is a quarter, so "a year" is up to fifteen months.** A key of epoch `2025-Q4`
+    /// opens every body received in those three months, so the quarter cannot be split: this keeps
+    /// the current quarter and `--keep-quarters` before it, and destroys everything strictly older.
+    /// Four quarters therefore retains no record for less than twelve months and some for as long
+    /// as fifteen. The report prints both numbers, because they are different promises.
+    ///
+    /// Safe to run twice: a key already destroyed is not in the walk, and the second run reports
+    /// nothing destroyed. A legal hold outranks it — a held subject's keys are kept and the report
+    /// names the hold, rather than being passed over in silence.
+    Retain {
+        /// Quarters to keep behind the current one. Required: a retention period is policy, and a
+        /// default here would be this tool choosing one.
+        #[arg(long, value_name = "N")]
+        keep_quarters: u32,
+        /// Mean it. Without this the command prints what would be destroyed and stops.
+        #[arg(long)]
+        confirm_destroy_keys: bool,
+    },
+    /// Place, lift and list the legal holds that outrank erasure and retention.
+    ///
+    /// The arbitration between two obligations pointing in opposite directions: a litigation or AML
+    /// hold requires that keys survive, and `erase` and `retain` both destroy them. A hold is what
+    /// decides, and without one whichever obligation ran first simply won.
+    ///
+    /// Not an endpoint, for the reason erasure's local half is not one: a hold is placed and lifted
+    /// by whoever has custody of the store, which is a property of the host and not of a signature.
+    /// `POST /erase` *consults* it and refuses `409` under one.
+    ///
+    /// A hold is recorded against a subject, because the mechanism both obligations use is key
+    /// destruction and keys are per subject — a hold that could not be reduced to "these keys
+    /// survive" would be a label with nothing behind it. `--record` is still accepted, and is how a
+    /// preservation order usually reads: it resolves the record's own frontmatter to the subjects
+    /// whose keys its body depends on and holds those.
+    Hold {
+        /// Place one, lift one, or list what stands.
+        #[command(subcommand)]
+        what: HoldCommand,
+    },
     /// Report whether an erasure can be asserted complete.
     ///
     /// Two-phase by necessity: destruction cannot be asserted while a backup taken before it is
@@ -871,6 +920,60 @@ pub enum Command {
 /// to choose a page size first. It is named here so `--help` prints the figure — a cap nobody can
 /// see is a short answer that reads as an empty tree.
 const SEARCH_LIMIT: usize = 20;
+
+/// Placing, lifting and listing legal holds.
+///
+/// Subcommands rather than flags on one, for the reason `knowledge`'s reads are: a placement needs
+/// a subject or a record, a release needs a hold identifier and neither of those, and a listing
+/// takes nothing. Flattened together, `--help` would describe a surface where all of them were
+/// optional and the wrong combinations were quietly ignored.
+#[derive(Debug, Subcommand)]
+pub enum HoldCommand {
+    /// Place a hold, over a subject or over the subjects one record names.
+    ///
+    /// Exactly one of `--subject` and `--record`. A subject this store has never heard of is
+    /// accepted: a preservation order can arrive before the records it covers, and a hold that
+    /// could only be placed over a subject already on record would be unplaceable exactly when it
+    /// matters — the next record to arrive would mint a key nothing was protecting.
+    Place {
+        /// The subject's pseudonym, as `s_` followed by 64 hex characters.
+        #[arg(long, value_name = "HASH", conflicts_with = "record")]
+        subject: Option<String>,
+        /// A record, as the 26-character identifier it is filed under. Holds every subject its
+        /// frontmatter names, because holding a record without the keys its body depends on would
+        /// preserve a file nothing can read.
+        #[arg(long, value_name = "ID")]
+        record: Option<String>,
+        /// Why. There is no default: a hold nobody can account for is a hold nobody dares lift.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Who is placing it. Becomes part of the permanent log line.
+        #[arg(long, value_name = "NAME")]
+        operator: String,
+    },
+    /// Lift one hold, by its identifier.
+    ///
+    /// By identifier and never by subject: several holds may stand over one person, and lifting a
+    /// litigation hold must not lift the AML hold beside it. The lift is a second log line rather
+    /// than an edit of the first, so what was held then — and who ended it — stays readable.
+    Release {
+        /// The identifier `hold place` printed.
+        #[arg(long = "hold", value_name = "ID")]
+        id: String,
+        /// Why the obligation has ended.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Who is lifting it.
+        #[arg(long, value_name = "NAME")]
+        operator: String,
+    },
+    /// List every hold now standing, oldest first.
+    ///
+    /// What answers "what is currently held". A hold nobody can enumerate is a hold that will be
+    /// forgotten, and a forgotten hold either blocks an erasure nobody can explain or lapses
+    /// without anybody noticing the obligation did not.
+    List,
+}
 
 /// Building the knowledge tree, and the three reads over it.
 ///
@@ -1080,6 +1183,105 @@ mod tests {
             "evidence",
             "--record",
             "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ])
+        .expect("parsed");
+    }
+
+    /// A retention pass will not run without a policy, and will not destroy without confirmation.
+    ///
+    /// `--keep-quarters` has no default on purpose: a retention period is policy, and a default here
+    /// would be this tool choosing one — which is exactly the sentence-without-a-mechanism the pass
+    /// exists to replace.
+    #[test]
+    fn a_retention_pass_demands_a_policy_and_a_confirmation() {
+        OperatorCli::try_parse_from(["yaam", "--root", "/x", "retain"])
+            .expect_err("a retention period is policy, and there is nothing to default it to");
+        let unconfirmed =
+            OperatorCli::try_parse_from(["yaam", "--root", "/x", "retain", "--keep-quarters", "4"])
+                .expect("parsed");
+        assert!(matches!(
+            unconfirmed.command,
+            Command::Retain {
+                keep_quarters: 4,
+                confirm_destroy_keys: false,
+            }
+        ));
+        let confirmed = OperatorCli::try_parse_from([
+            "yaam",
+            "--root",
+            "/x",
+            "retain",
+            "--keep-quarters",
+            "4",
+            "--confirm-destroy-keys",
+        ])
+        .expect("parsed");
+        assert!(matches!(
+            confirmed.command,
+            Command::Retain {
+                confirm_destroy_keys: true,
+                ..
+            }
+        ));
+    }
+
+    /// A hold is placed over exactly one of a subject and a record, and lifted by identifier.
+    ///
+    /// The pair is refused by clap rather than by the command, because a hold over both would have
+    /// to pick one and whichever it picked would be a hold somebody did not place.
+    #[test]
+    fn every_hold_command_is_its_own_subcommand_with_its_own_requirements() {
+        OperatorCli::try_parse_from(["yaam", "--root", "/x", "hold"])
+            .expect_err("no default: one of these places an obligation and one lifts it");
+        OperatorCli::try_parse_from(["yaam", "--root", "/x", "hold", "list"])
+            .expect("a listing takes nothing");
+
+        let place = ["yaam", "--root", "/x", "hold", "place"];
+        OperatorCli::try_parse_from(place).expect_err("a hold has to say why and who");
+        OperatorCli::try_parse_from(place.iter().copied().chain([
+            "--subject",
+            "s_00",
+            "--reason",
+            "litigation",
+            "--operator",
+            "ops",
+        ]))
+        .expect("parsed");
+        OperatorCli::try_parse_from(place.iter().copied().chain([
+            "--record",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--reason",
+            "litigation",
+            "--operator",
+            "ops",
+        ]))
+        .expect("parsed");
+        OperatorCli::try_parse_from(place.iter().copied().chain([
+            "--subject",
+            "s_00",
+            "--record",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--reason",
+            "litigation",
+            "--operator",
+            "ops",
+        ]))
+        .expect_err("a hold is placed over one of the two, and this cannot pick");
+
+        OperatorCli::try_parse_from(["yaam", "--root", "/x", "hold", "release"])
+            .expect_err("a release names the hold, never the subject");
+        OperatorCli::try_parse_from([
+            "yaam",
+            "--root",
+            "/x",
+            "hold",
+            "release",
+            "--hold",
+            "hold-01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--reason",
+            "matter closed",
+            "--operator",
+            "ops",
         ])
         .expect("parsed");
     }

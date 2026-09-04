@@ -108,6 +108,56 @@ impl Epoch {
         }
         Ok(Self(label.to_owned()))
     }
+
+    /// The calendar quarter this label names, as a year and a quarter in `1..=4`.
+    ///
+    /// `None` for any label this build did not mint — a future format, or one an implementation
+    /// spelled differently. That is the whole reason it is an `Option` rather than a parse that
+    /// guesses: retention destroys keys by comparing labels, and a label it cannot read must be
+    /// kept rather than assumed old. Erring long costs an operator another quarter's storage;
+    /// erring short destroys a key nothing can mint again.
+    #[must_use]
+    pub fn quarter(&self) -> Option<(i64, u32)> {
+        let (year, quarter) = self.0.rsplit_once("-Q")?;
+        // Digits only, both halves: `from_str` would take `+2026` and a leading space, and a label
+        // this build did not write is exactly the one this must decline to read.
+        if !year.bytes().all(|b| b.is_ascii_digit()) || !quarter.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let year: i64 = year.parse().ok()?;
+        let quarter: u32 = quarter.parse().ok()?;
+        (1..=4).contains(&quarter).then_some((year, quarter))
+    }
+
+    /// The epoch `back` quarters before this one.
+    ///
+    /// `None` where this label is not a quarter this build can read, or where counting back leaves
+    /// the calendar the label format can express.
+    #[must_use]
+    pub fn quarters_before(&self, back: u32) -> Option<Self> {
+        let index = self.index()? - i64::from(back);
+        let year = index.div_euclid(4);
+        let quarter = index.rem_euclid(4) + 1;
+        (1..=9999)
+            .contains(&year)
+            .then(|| Self(format!("{year:04}-Q{quarter}")))
+    }
+
+    /// Whether this epoch's quarter falls strictly before `other`'s.
+    ///
+    /// `None` where either label is not a quarter this build can read, which a caller deciding what
+    /// to destroy must treat as "do not".
+    #[must_use]
+    pub fn precedes(&self, other: &Self) -> Option<bool> {
+        Some(self.index()? < other.index()?)
+    }
+
+    /// Quarters since year zero, which is what makes ordering and arithmetic one calculation.
+    fn index(&self) -> Option<i64> {
+        let (year, quarter) = self.quarter()?;
+        Some(year * 4 + i64::from(quarter) - 1)
+    }
 }
 
 /// Civil year and month (1-12) of a millisecond stamp, UTC.
@@ -852,6 +902,42 @@ mod tests {
             (253_402_300_799_000, "9999-Q4"),
         ] {
             assert_eq!(Epoch::containing(ms).as_str(), label, "at {ms}");
+        }
+    }
+
+    /// Quarters are ordered and countable, and an unreadable label is neither.
+    ///
+    /// The last case is the one that matters: retention decides what to destroy from these answers,
+    /// so a label this build cannot read has to come back `None` and be kept, not be guessed at.
+    #[test]
+    fn quarters_can_be_ordered_and_counted_back_and_an_unreadable_label_cannot() {
+        let q3 = Epoch::from_stored("2026-Q3").unwrap();
+        assert_eq!(q3.quarter(), Some((2026, 3)));
+        assert_eq!(q3.quarters_before(0).unwrap().as_str(), "2026-Q3");
+        assert_eq!(q3.quarters_before(2).unwrap().as_str(), "2026-Q1");
+        // Across the year boundary, which is where a naive `quarter - back` goes wrong.
+        assert_eq!(q3.quarters_before(3).unwrap().as_str(), "2025-Q4");
+        assert_eq!(q3.quarters_before(11).unwrap().as_str(), "2023-Q4");
+
+        let q4 = Epoch::from_stored("2026-Q4").unwrap();
+        assert_eq!(q3.precedes(&q4), Some(true));
+        assert_eq!(q4.precedes(&q3), Some(false));
+        assert_eq!(q3.precedes(&q3), Some(false), "strictly before");
+
+        // Off the end of the calendar the label format expresses.
+        assert_eq!(
+            Epoch::from_stored("0001-Q1").unwrap().quarters_before(1),
+            None
+        );
+
+        for unreadable in [
+            "2026-Q5", "2026-Q0", "2026-3", "later", "+2026-Q1", "2026-Qx",
+        ] {
+            let epoch = Epoch::from_stored(unreadable).unwrap();
+            assert_eq!(epoch.quarter(), None, "{unreadable}");
+            assert_eq!(epoch.quarters_before(1), None, "{unreadable}");
+            assert_eq!(epoch.precedes(&q3), None, "{unreadable}");
+            assert_eq!(q3.precedes(&epoch), None, "{unreadable}");
         }
     }
 

@@ -58,6 +58,8 @@ enum Mode {
     /// file can check is that the router reports them as the document says. That they *are* refused,
     /// over the repository's own `spec/entities.yaml` and a real index, is `end_to_end.rs`'s job.
     Unaskable,
+    /// A legal hold forbids the destruction asked for. Neither party's mistake.
+    Held,
     /// Everything is transiently unavailable.
     Unavailable,
     /// Everything fails in a way that is this service's own fault.
@@ -77,6 +79,9 @@ impl Fake {
             Mode::Unaskable => Err(yaam_server::Error::Unprocessable(
                 "entity id `not a ticket` is not canonical for kind `ticket`".to_owned(),
             )),
+            Mode::Held => Err(yaam_server::Error::Core(yaam_core::Error::Held(
+                "held: 1 hold(s) stand over subject s_9f2c4b8a1d6e0f37c5a49b2d8e71f036a4c8b5d29e7f13a06c4b8d5e29f7a13c0, and destroying its keys would make bodies unreadable that this store has been ordered to preserve. Nothing was destroyed.".to_owned(),
+            ))),
             Mode::Unavailable => Err(yaam_server::Error::Unavailable(
                 "index reopening".to_owned(),
             )),
@@ -647,6 +652,8 @@ fn erase_cases() -> Vec<Case> {
             r#"{"subject":"not-a-pseudonym"}"#,
             Mode::Stored,
         ),
+        // A hold, which is the one refusal that is neither the caller's mistake nor ours.
+        case("POST", path, path, Some(OPERATOR), erase_body(), Mode::Held),
         case(
             "POST",
             path,

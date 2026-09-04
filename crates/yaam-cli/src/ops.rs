@@ -20,6 +20,7 @@ use yaam_core::backup::{self, BackupReport};
 use yaam_core::drain::{self, DrainReport};
 use yaam_core::erase::{self, ErasePreview};
 use yaam_core::health::{self, HealthReport};
+use yaam_core::hold;
 use yaam_core::reindex;
 use yaam_core::restore::{self as keys, Attestation};
 use yaam_core::{Paths, Pipeline};
@@ -113,6 +114,20 @@ pub fn erase(
         .map_err(|error| failed("reading what an erasure would reach", &error))?;
     let mut text = describe_preview(&subject, &preview);
 
+    // Refused before the confirmation rather than after it. An operator who confirms an
+    // irreversible destruction and is only then told it was forbidden has learned nothing they
+    // could not have been told first — and `--confirm-destroy-keys` must not read as a flag that
+    // overrides a preservation order.
+    if !preview.holds.is_empty() {
+        emit(out, &text)?;
+        return Err(Error::Rejected(
+            hold::refuse_if_held(pipeline, &subject).err().map_or_else(
+                || "a hold stands over this subject".to_owned(),
+                |error| error.to_string(),
+            ),
+        ));
+    }
+
     if !confirmed {
         text.push_str("\nnothing was destroyed. Pass --confirm-destroy-keys to mean it.\n");
         emit(out, &text)?;
@@ -121,8 +136,12 @@ pub fn erase(
         ));
     }
 
-    let report = erase::erase_subject(pipeline, &subject)
-        .map_err(|error| failed("destroying the subject's keys", &error))?;
+    let report = erase::erase_subject(pipeline, &subject).map_err(|error| match error {
+        // A hold placed between the preview above and this call. The library refuses it too, and
+        // this is what keeps the two answers the same exit code.
+        yaam_core::Error::Held(message) => Error::Rejected(message),
+        error => failed("destroying the subject's keys", &error),
+    })?;
     let _ = writeln!(text, "\nerased {}", subject.as_str());
     line(&mut text, "bodies sealed off", report.bodies_sealed_off);
     line(&mut text, "keys destroyed", report.keys_destroyed);
@@ -621,6 +640,32 @@ fn describe_preview(subject: &SubjectHash, preview: &ErasePreview) -> String {
         text.push_str(
             "this subject is already tombstoned; re-running settles anything that arrived since\n",
         );
+    }
+    // Before the "irreversible" sentence, because it is the sentence that stops being true: under a
+    // hold nothing is about to happen at all.
+    if !preview.holds.is_empty() {
+        let _ = writeln!(
+            text,
+            "\nand it is refused: {} legal hold(s) stand over this subject, and a hold outranks an \
+             erasure. Nothing will be destroyed while one stands.",
+            preview.holds.len()
+        );
+        for hold in &preview.holds {
+            let _ = writeln!(
+                text,
+                "  {}  placed {} by `{}`: {}",
+                hold.id,
+                yaam_contract::timestamp::format_ms(hold.at_ms),
+                hold.operator,
+                hold.reason
+            );
+        }
+        text.push_str(
+            "release it first if the obligation has ended: `yaam hold release --hold <id> --reason \
+             … --operator …`. Two obligations point in opposite directions here, and only a person \
+             can say which one now applies.\n",
+        );
+        return text;
     }
     if preview.records == 0 && preview.keys == 0 && preview.quarantined == 0 {
         text.push_str(

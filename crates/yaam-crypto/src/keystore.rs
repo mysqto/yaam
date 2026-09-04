@@ -372,6 +372,56 @@ impl FsKeyStore {
         Ok(subjects)
     }
 
+    /// Every subject-and-epoch pair this store holds a key for.
+    ///
+    /// What a retention pass walks. `keys/<subject>/<epoch>` alone, unlike
+    /// [`FsKeyStore::key_files_for`]: a copy kept beside the live tree is exposure to *report*, but
+    /// it is not something a destruction may reach — walking into a half-finished restore and
+    /// unlinking from it would make a retention run a second, undeclared recovery.
+    ///
+    /// A directory or file name that is not a pseudonym or an epoch label is an error rather than
+    /// an entry skipped. A retention run reports what it destroyed and what it left; a name it
+    /// silently passed over would be a key nothing accounts for, in the one report an operator
+    /// checks the store against.
+    ///
+    /// Tombstones are not consulted. A key file standing for an erased subject is still a file, and
+    /// destroying it is the erasure finishing rather than retention overreaching.
+    ///
+    /// Sorted, so two runs over one store read the same.
+    pub fn key_epochs(&self) -> crate::Result<Vec<(SubjectHash, Epoch)>> {
+        let mut found = Vec::new();
+        let subjects = match fs::read_dir(self.root.join("keys")) {
+            Ok(subjects) => subjects,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(found),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        for subject in subjects {
+            let subject = subject?.path();
+            if !subject.is_dir() {
+                continue;
+            }
+            let hash = SubjectHash::parse(&name_of(&subject)?).map_err(|_| {
+                unreadable_entry(
+                    &subject,
+                    "is not a subject pseudonym, so nothing can say whose key it holds",
+                )
+            })?;
+            for epoch in fs::read_dir(&subject)? {
+                let path = epoch?.path();
+                let label = name_of(&path)?;
+                let epoch = Epoch::from_stored(&label).map_err(|_| {
+                    unreadable_entry(
+                        &path,
+                        "is not an epoch label, so nothing can say what it retains",
+                    )
+                })?;
+                found.push((hash.clone(), epoch));
+            }
+        }
+        found.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
+        Ok(found)
+    }
+
     /// Key files this store holds for one subject, anywhere under its root.
     ///
     /// Counted the way an erasure's own verification counts them: any file whose parent directory
@@ -511,6 +561,21 @@ impl KeyStore for FsKeyStore {
             other => other,
         }
     }
+}
+
+/// The final component of a path, as text.
+fn name_of(path: &Path) -> crate::Result<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| unreadable_entry(path, "has no name"))
+}
+
+/// A key store entry nothing can account for.
+fn unreadable_entry(path: &Path, detail: &str) -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("`{}` in the key store {detail}", path.display()),
+    ))
 }
 
 /// Rejects a path component that could climb out of the store root.
@@ -718,6 +783,38 @@ mod tests {
         store.destroy_subject(&subject).unwrap();
         store.destroy_subject(&subject).unwrap();
         assert!(!store.is_tombstoned(&subject).unwrap());
+    }
+
+    /// A retention pass can see what the store holds, subject by epoch.
+    ///
+    /// The enumeration a driver walks. Sorted and complete, because the run reports what it
+    /// destroyed and what it left, and an entry it never saw is a key nothing accounts for.
+    #[test]
+    fn every_subject_and_epoch_the_store_holds_can_be_walked() {
+        let (dir, store) = store();
+        let old = Epoch::containing(1_600_000_000_000);
+        store.mint(&subject(1), &epoch()).unwrap();
+        store.mint(&subject(1), &old).unwrap();
+        store.mint(&subject(0), &epoch()).unwrap();
+
+        let walked: Vec<(String, String)> = store
+            .key_epochs()
+            .unwrap()
+            .into_iter()
+            .map(|(s, e)| (s.as_str().to_owned(), e.as_str().to_owned()))
+            .collect();
+        assert_eq!(
+            walked,
+            vec![
+                (subject(0).as_str().to_owned(), epoch().as_str().to_owned()),
+                (subject(1).as_str().to_owned(), old.as_str().to_owned()),
+                (subject(1).as_str().to_owned(), epoch().as_str().to_owned()),
+            ]
+        );
+
+        // A name nothing can account for stops the walk rather than being passed over.
+        fs::create_dir_all(dir.path().join("keys/not-a-pseudonym")).unwrap();
+        assert!(store.key_epochs().is_err());
     }
 
     #[test]

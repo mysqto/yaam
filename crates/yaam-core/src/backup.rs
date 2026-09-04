@@ -137,6 +137,14 @@ pub const MANIFEST: &[Entry] = &[
                  backup taken before an erasure re-indexes the structure that erasure removed",
     },
     Entry {
+        name: layout::HOLD_LOG,
+        disposition: Disposition::Included,
+        reason: "the legal-hold log, and it travels because the obligation does. A backup that \
+                 dropped it would restore a store that erases or retains exactly what it has been \
+                 ordered to preserve, and nothing in the restored copy would say a hold had ever \
+                 been placed",
+    },
+    Entry {
         name: layout::SUBJECT_CHECK_FILE,
         disposition: Disposition::Included,
         reason: "which subject key the tree's pseudonyms were derived from, as a check value that \

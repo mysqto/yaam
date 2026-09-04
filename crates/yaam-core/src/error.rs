@@ -74,6 +74,18 @@ pub enum Error {
         /// What is wrong with it, as a clause the message reads on from.
         detail: String,
     },
+    /// A legal hold forbids this destruction.
+    ///
+    /// Its own variant because it is the one refusal that is neither the caller's mistake nor this
+    /// store's fault: two obligations point in opposite directions and [`crate::hold`] is what
+    /// arbitrates. A caller told `422` would go looking for the malformed field it did not send,
+    /// and one told `500` would raise an incident — the answer is that a person has to decide
+    /// which obligation now applies and release the hold, or not.
+    ///
+    /// The message carries the holds, because a refusal that does not say which obligation blocked
+    /// it is one nobody can act on.
+    #[error("{0}")]
+    Held(String),
     /// Filesystem failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

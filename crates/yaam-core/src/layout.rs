@@ -50,6 +50,12 @@ pub(crate) const SUBJECT_CHECK_FILE: &str = "subject-key-check.json";
 pub(crate) const SUBJECT_CHECK_TEMP: &str = "subject-key-check.tmp";
 /// The append-only erasure log.
 pub(crate) const TOMBSTONE_LOG: &str = "tombstones.jsonl";
+/// The append-only legal-hold log.
+///
+/// Beside the erasure log rather than inside the key store, because the obligation has to travel:
+/// a hold a restore dropped is a preservation order lifted by a disaster recovery. See
+/// [`crate::hold`] for what living here costs.
+pub(crate) const HOLD_LOG: &str = "holds.jsonl";
 /// Extension of every record file.
 pub(crate) const RECORD_EXT: &str = "md";
 

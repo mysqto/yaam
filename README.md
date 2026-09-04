@@ -731,6 +731,64 @@ Changing the canonicalisation is a version, never an edit: the version number is
 HMAC, so a bump makes every subject hash differently and uniformly, and the old rules stay registered
 because records filed under them keep a hash only those rules reproduce.
 
+## Retention, and the hold that outranks it
+
+Keys are minted per subject *and* per calendar quarter so that a retention period can be enforced by
+destroying a quarter's keys. That much the store always had; nothing walked the key store, so the
+period was a sentence rather than a mechanism. `yaam retain --keep-quarters N` is the pass.
+
+**The unit is a quarter, so "a year" is up to fifteen months.** A key of epoch `2025-Q4` opens every
+body received between October and December, so the quarter is indivisible: destroying it reaches the
+youngest record in it as well as the oldest. The pass therefore errs long — it keeps the current
+quarter and `N` before it, and destroys everything strictly older, so four quarters retains no
+record for less than twelve months and some for as long as fifteen. Both numbers are printed,
+because "one year" and "up to fifteen months" are different promises to make to a regulator.
+
+**Nothing here runs itself.** No timer, no daemon, no scheduled execution: an operator invokes it,
+or an external scheduler does. A destruction that cannot be undone is not one a process should
+decide to perform while nobody is watching, and a period a service enforced on its own clock would
+be enforced again on a restored store's. Without `--confirm-destroy-keys` the command prints what
+would go and stops. It is safe to run twice: a key already destroyed is not in the walk, and a
+second pass over an unchanged store destroys nothing and says so.
+
+**A hold outranks both of them.** Erasure destroys a subject's keys on request and retention
+destroys an epoch's on age, while a litigation or AML hold requires those same keys to survive.
+Without something arbitrating, whichever obligation ran first won and the loser was discovered
+afterwards or not at all. So a hold names a **subject** — not a matter or a case, because the
+mechanism both obligations use is key destruction and keys are per subject, and a hold that could
+not be reduced to "these keys survive" would be a label with nothing behind it. `hold place
+--record` is still how a preservation order usually reads, and it resolves that record's frontmatter
+to the subjects its body depends on and holds those; records are immutable, so resolving once cannot
+go stale. Several holds may stand over one subject, each with its own identifier, reason and author,
+because a litigation hold lifting must not release the AML hold beside it. A release is a second
+line rather than an edit of the first, for the reason a completed tombstone is: what was held then,
+and who lifted it, is the question an auditor asks.
+
+```sh
+yaam hold place --subject s_9f2c… --reason "preservation order, matter 41" --by ops_a
+yaam hold list                        # what stands, with who placed it and why
+yaam hold release --id <hold> --reason "matter closed" --by ops_a
+yaam retain --keep-quarters 4         # prints what would go
+yaam retain --keep-quarters 4 --confirm-destroy-keys
+```
+
+`POST /erase` consults holds and refuses `409` under one, naming each hold, when it was placed, by
+whom and on what grounds. Placing and lifting are not endpoints, for the reason erasure's local half
+is not one: custody of a store is a property of the host, not of a signature.
+
+**What the hold log costs.** It is append-only under the memory root and the backup manifest carries
+it, because the obligation travels — a hold a restore dropped would be a preservation order silently
+lifted by a disaster recovery, and the store would then destroy exactly what it was told to keep.
+The price is a plaintext, never-pruned file naming held subjects: the same residue class as the
+tombstone log it sits beside. It is deliberately not a record, so unlike a body it never enters the
+full-text index.
+
+**What neither pass reaches.** Structure does not expire. Frontmatter, references, roles and both
+append-only logs persist whatever the retention period says, and this pass does not rewrite the tree
+— the mechanism is that the key is gone in every copy and the ciphertext left behind is inert. And a
+body whose class is `internal` has no key at all, so key destruction does not reach it: retention
+here is a statement about sealed bodies and about nothing else in the store.
+
 ## Deployment seams
 
 Three traits a deployment implements, each with a shipped implementation that behaves exactly as not

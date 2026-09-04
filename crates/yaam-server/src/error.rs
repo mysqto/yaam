@@ -19,6 +19,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// | `400` | *not this type* — a rejected query string, before any handler runs | `text/plain` |
 /// | `401` | [`Error::Unauthenticated`] | `{"error": …}` |
 /// | `403` | [`Error::Forbidden`] | `{"error": …}` |
+/// | `409` | a legal hold forbidding a destruction | `{"error": …}` |
 /// | `422` | [`Error::Unprocessable`], and a core contract failure | `{"error": …}` |
 /// | `500` | any other core failure | `{"error": …}` |
 /// | `503` | [`Error::Unavailable`], and an unresolved subject | `{"error": …}` |
@@ -76,6 +77,13 @@ fn core_status(error: &yaam_core::Error) -> StatusCode {
     match error {
         yaam_core::Error::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
         yaam_core::Error::SubjectUnresolved => StatusCode::SERVICE_UNAVAILABLE,
+        // A third state, and neither of the two above. The request was well formed and the caller
+        // was permitted it; a legal hold requires that these keys survive, and two obligations
+        // pointing in opposite directions is a conflict rather than a bad request. `422` would send
+        // the caller looking for the malformed field it did not send, and `500` would have it raise
+        // an incident against a store that is working exactly as ordered. Neither is retryable and
+        // this is not either — what it needs is a person to release the hold, or not.
+        yaam_core::Error::Held(_) => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -139,6 +147,23 @@ mod tests {
 
         let unresolved = Error::Core(yaam_core::Error::SubjectUnresolved);
         assert_eq!(unresolved.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A hold is a conflict, not a bad request and not our fault.
+    ///
+    /// The one refusal that is neither party's mistake: the caller asked correctly, the store is
+    /// working, and an obligation to preserve outranks the obligation to erase. Reported as `422`
+    /// it would read as a malformed request; as `500` it would have somebody raise an incident.
+    #[test]
+    fn a_legal_hold_is_reported_as_a_conflict_rather_than_a_fault() {
+        let held = Error::Core(yaam_core::Error::Held(
+            "held: 1 hold(s) stand over subject s_00".to_owned(),
+        ));
+        assert_eq!(held.status(), StatusCode::CONFLICT);
+        assert!(
+            held.to_string().contains("hold"),
+            "the refusal has to say what blocked it: {held}"
+        );
     }
 
     /// Our own fault, not the caller's: a `500` stops the caller retrying its own record forever
