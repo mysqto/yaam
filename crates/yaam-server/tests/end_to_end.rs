@@ -21,6 +21,42 @@ use yaam_store::query::Filter;
 
 use support::{BODY, KEY, Tree, caller, keyring, record, subject, subject_record};
 
+/// The service refuses the class as permanently as it refuses a malformed record, and says so with
+/// a status rather than only with prose.
+///
+/// `422`, never `503`. The split is the one clients get backwards, and both ways cost something
+/// here: read as transient, a caller retries a record that can never land and burns its queue on
+/// it; read as this service's own fault, a caller raises an incident against a store that is
+/// working exactly as configured. Neither of them writes the record as `internal`, which is the
+/// thing it should do instead.
+#[test]
+fn the_service_refuses_a_class_it_does_not_write_permanently_rather_than_transiently() {
+    let tree = Tree::new();
+    let writer = caller("agent_a", Role::Writer, &["platform"]);
+
+    let error = tree
+        .service
+        .write(
+            &writer,
+            subject_record("agent_a", "2026-08-20T09:00:00Z", &subject('a')),
+            BODY,
+        )
+        .expect_err("a store in the shipped state writes no such record");
+    assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert!(
+        error.to_string().contains("subject-writes.yaml"),
+        "and the caller is told which file decides it: {error}"
+    );
+
+    // An internal record on the same store is untouched by any of this.
+    assert!(matches!(
+        tree.service
+            .write(&writer, record("agent_a", "2026-08-20T09:00:00Z"), BODY)
+            .expect("accepted"),
+        Accepted::Stored(_)
+    ));
+}
+
 /// The identifiers a read answered with.
 ///
 /// A read hands back structure, and most assertions here are about *which* records reached the
@@ -34,7 +70,7 @@ fn read_ids(records: &[yaam_contract::RecordStructure]) -> Vec<RecordId> {
 
 #[test]
 fn a_record_written_through_the_service_is_queryable_bundled_and_then_erasable() {
-    let tree = Tree::new();
+    let tree = Tree::writing_subjects();
     let service = Arc::clone(&tree.service);
     let writer = caller("agent_a", Role::Writer, &["platform"]);
     let operator = caller("agent_ops", Role::Operator, &["platform"]);
@@ -387,7 +423,7 @@ async fn a_read_returns_only_what_the_authenticated_caller_may_see() {
 /// is what is *absent*, and a parsed assertion only sees fields somebody thought to look for.
 #[tokio::test]
 async fn no_read_returns_a_body_for_either_data_class() {
-    let tree = Tree::new();
+    let tree = Tree::writing_subjects();
     let operator = caller("agent_ops", Role::Operator, &["platform"]);
 
     let plain = record("agent_a", "2026-08-20T09:00:00Z");

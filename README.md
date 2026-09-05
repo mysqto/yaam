@@ -47,13 +47,14 @@ crates/
 hooks/            the pre-commit guard for a repository holding a backup, and its installer
 xtask/            repository chores: generates spec/schemas, checks the shapes behind it
 spec/             the contract bundle other implementations vendor
-  memory.v1.yaml    the wire contract as OpenAPI 3.1, checked against the router and the types
-  schemas/          the same shapes as JSON Schema 2020-12, generated — never edit by hand
-  entities.yaml     entity kinds and their canonical ID forms
-  extractors.yaml   when text is evidence that a kind was meant — anchors, guards, confidence
-  attrs-schema.yaml declared attributes per action, and which of them may sit in plaintext
-  subjects.yaml     which entity kinds are erasure units — absent, and no body is ever sealed
-  redaction/        the redaction policies the writer masks against and the service checks
+  memory.v1.yaml      the wire contract as OpenAPI 3.1, checked against the router and the types
+  schemas/            the same shapes as JSON Schema 2020-12, generated — never edit by hand
+  entities.yaml       entity kinds and their canonical ID forms
+  extractors.yaml     when text is evidence that a kind was meant — anchors, guards, confidence
+  attrs-schema.yaml   declared attributes per action, and which of them may sit in plaintext
+  subjects.yaml       which entity kinds are erasure units — absent, and no body is ever sealed
+  subject-writes.yaml whether that class may be written at all — absent, and every one is refused
+  redaction/          the redaction policies the writer masks against and the service checks
 ```
 
 ## Running it
@@ -708,6 +709,40 @@ records one at a time; a secret with no declaration refuses too, because the alt
 operator who believes bodies are sealed while every one is written in the clear — into the tree, the
 cold manifests and every backup, where nothing later can reach them. Neither half is the shipped
 state and changes nothing: no subject resolves, and no key is ever minted.
+
+**Declaring what an erasure unit is does not permit writing one.** Those are two decisions and
+`spec/subject-writes.yaml` is the second, in a file of its own:
+
+```yaml
+version: 1
+writes: enabled
+```
+
+Absent, or `writes: refused`, and `Pipeline::accept` turns away every record whose `data_class` is
+`subject_derived` — from the HTTP service, from a sidecar socket, from the CLI, from anywhere,
+because that one function is what every writer crosses. The refusal names the record, says nothing
+was written, names the file to change, and says what accepting it would have done; a caller that
+gets a bare rejection assumes a bug and retries.
+
+The default is refusal and cannot be anything else. Everything else in a store is recoverable by a
+rebuild; this is not. The first subject-derived record a store writes is sealed under a pseudonym
+that is an HMAC of a key that can never be rotated, and there is no re-key, no re-seal and no
+delete. A posture that could drift to enabled — by an upgrade, by an environment variable, by a
+default nobody chose — would be machinery taking a decision machinery cannot undo. So it is a line
+an operator writes, and an operator reading a store can tell which state it is in by opening one
+file.
+
+A file of its own rather than another key in `subjects.yaml`, because the two are independent: a
+store may write subject-derived records while declaring no erasure unit at all — that is the
+deployment whose writers send pseudonyms they computed themselves — and `subjects.yaml` cannot say
+that, since a declaration naming kinds demands a subject key by the both-halves rule above.
+
+**Only the accept path refuses.** A store that enabled the class, wrote under it, and then turned it
+off still holds those records and must go on holding them: `reindex`, `verify-erasure`, `unseal` and
+`erase` all keep working over what is already there. The index is derived and deleting it is a
+routine remedy, so a refusal that also fired on a rebuild would leave such a store unqueryable with
+no way back — and it would fall on exactly the operator who took the decision seriously and then
+reconsidered.
 
 **The erasure unit is the transaction, not the person.** Nothing on the write path claims to know
 whose transaction it is, so nothing on the write path can be wrong about that — which matters because

@@ -39,6 +39,7 @@ use crate::layout::{self, Stamp};
 use crate::paths::Paths;
 use crate::policy::Redaction;
 use crate::resolve::{DeclaredSubjects, Resolution, SubjectResolver};
+use crate::subject_writes::SubjectWrites;
 use crate::{Error, Result};
 
 /// Claims of one fan-out job before it is set aside.
@@ -99,6 +100,13 @@ pub struct Pipeline {
     keys: FsKeyStore,
     /// How a record's subjects are determined. Declared-as-sent unless a deployment replaces it.
     resolver: Box<dyn SubjectResolver>,
+    /// Whether this store accepts subject-derived records at all.
+    ///
+    /// Read from the tree at open, like every other `spec/` answer, and held here rather than
+    /// handed in by whoever built the pipeline. That is the point of it: there is no constructor,
+    /// no builder and no flag that produces a pipeline without this, so no caller can be the one
+    /// that forgot to ask.
+    subject_writes: SubjectWrites,
     /// Configured entity kinds, for canonicalising identifiers.
     registry: Registry,
     /// Configured attribute surface.
@@ -155,6 +163,7 @@ impl Pipeline {
         Ok(Self {
             keys: FsKeyStore::unwrapped(&paths.key_store)?,
             resolver: Box::new(DeclaredSubjects),
+            subject_writes: SubjectWrites::load(&paths.root)?,
             writer: Writer::open(&paths.index)?,
             registry: load_registry(&spec.join("entities.yaml"))?,
             attrs: load_attrs(&spec.join("attrs-schema.yaml"))?,
@@ -297,6 +306,16 @@ impl Pipeline {
         &self.registry
     }
 
+    /// Whether this store accepts subject-derived records.
+    ///
+    /// Public so a startup log can state the posture it came up under. What it is *not* is a way to
+    /// ask before writing: the refusal is in [`Pipeline::accept`] precisely so that no caller has to
+    /// remember to check, and a caller that branches on this answer has reintroduced the gap.
+    #[must_use]
+    pub fn subject_writes(&self) -> SubjectWrites {
+        self.subject_writes
+    }
+
     /// The paths this pipeline works over.
     ///
     /// Public because the operations built on a pipeline need the same three paths it uses — an
@@ -380,6 +399,15 @@ impl Pipeline {
     /// Checked here rather than at the index: a contract failure the caller can fix must arrive
     /// before a partially written record exists to clean up.
     fn validated(&self, mut record: ActionRecord, body: &str) -> Result<ActionRecord> {
+        // First, and before the contract's own rules, because this one is not about the record: it
+        // is about whether this store writes records of that class at all. It sits on the accept
+        // path and nowhere else, which is the distinction the whole thing turns on. A store that
+        // enabled the class, wrote under it, and then turned it off still holds those records, and
+        // must still reindex, verify, unseal and erase them — none of which comes through here.
+        // Refusing on a rebuild would brick exactly the store that took the decision seriously.
+        if record.data_class == DataClass::SubjectDerived && !self.subject_writes.accepts() {
+            return Err(invalid(self.subject_writes_refused(&record)));
+        }
         record.validate()?;
         layout::stamp(&record.at)
             .ok_or_else(|| invalid(format!("record has an unreadable at `{}`", record.at)))?;
@@ -420,6 +448,38 @@ impl Pipeline {
             DataClass::SubjectDerived => String::new(),
         };
         Ok(record)
+    }
+
+    /// What a caller is told when this store does not write the class its record declares.
+    ///
+    /// Three things, in the order a caller needs them: what was refused and that nothing was
+    /// written, what to change, and what accepting it would have done. The last one is not
+    /// decoration — a caller reading only "rejected" concludes it has found a bug and retries, and
+    /// an operator reading only "rejected" reaches for the setting that makes it stop.
+    ///
+    /// Front-loaded because it is read through a keyhole: the sidecar quotes a bounded prefix of
+    /// the service's answer back to the caller, so the refusal and the remedy have to arrive before
+    /// the reasoning does.
+    fn subject_writes_refused(&self, record: &ActionRecord) -> String {
+        format!(
+            "subject-derived records are refused by this store, and nothing was written. To accept \
+             them, declare `{key}: {enabled}` in spec/{file} ({path}). Accepting record `{id}` \
+             would have derived a pseudonym for an entity reference it states and sealed its body \
+             under a subject key that cannot be rotated; a store's first subject-derived record \
+             cannot be taken back, because there is no re-key, no re-seal and no delete. Until that \
+             declaration is made, this record is writable as `data_class: internal`, whose body is \
+             stored in plaintext and which names no subject",
+            key = SubjectWrites::SPEC_KEY,
+            enabled = SubjectWrites::Enabled.as_str(),
+            file = SubjectWrites::SPEC_FILE,
+            path = self
+                .paths
+                .root
+                .join(layout::SPEC_DIR)
+                .join(SubjectWrites::SPEC_FILE)
+                .display(),
+            id = record.record_id.as_str(),
+        )
     }
 
     /// Step 1, second half: resolve the record's subjects, then seal the body under them.
@@ -1072,7 +1132,7 @@ mod tests {
     use yaam_crypto::keystore::{KeyStore as _, KeyWrapper};
     use yaam_md::{Body, Document};
 
-    use super::{Accepted, Pipeline, quarantine_subject};
+    use super::{Accepted, Error, KeyMaterial, Pipeline, quarantine_subject};
     use crate::resolve::{DeclaredSubjects, Resolution, SubjectResolver};
     use crate::testkit::{self, BODY, Harness};
 
@@ -1139,6 +1199,222 @@ mod tests {
 
     /// One way to break a record, and the name of what it breaks.
     type Case = (&'static str, Box<dyn Fn(&mut yaam_contract::ActionRecord)>);
+
+    /// A resolver that counts every record it was asked about, into a counter its caller keeps.
+    ///
+    /// What it proves is not that a record was refused but *where*: a pseudonym is derived inside
+    /// the resolver, so a refusal that reaches this at all is a refusal that came too late.
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl SubjectResolver for Counting {
+        fn resolve(&self, record: &yaam_contract::ActionRecord) -> Resolution {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Resolution::Resolved(record.subjects.clone())
+        }
+    }
+
+    /// The default a store cannot drift away from: a record whose class says its body is sealed and
+    /// keyed to a subject is refused, and the store is left exactly as it was.
+    ///
+    /// A store declares no such thing when it ships. What used to happen instead is the whole point
+    /// of this test: the record was accepted, a key was minted for a pseudonym under a subject key
+    /// that cannot be rotated, and nothing afterwards could take it back.
+    #[test]
+    fn a_subject_derived_record_is_refused_unless_the_store_declares_the_class() {
+        let mut harness = Harness::new().declaring(None);
+        let record = testkit::subject_derived(T09, &[testkit::subject('a')]);
+        let path = harness.path_of(&record);
+
+        let error = harness
+            .pipeline
+            .accept(record, BODY)
+            .expect_err("a store that declared nothing writes no such record");
+        assert!(
+            matches!(error, Error::Invalid(_)),
+            "permanent and the caller's to act on, not a retry: {error}"
+        );
+        assert!(!path.exists(), "nothing was published");
+        assert!(
+            fs::read_dir(harness.root().join(".staging"))
+                .expect("staging")
+                .next()
+                .is_none(),
+            "and nothing was staged either: the refusal is ahead of every byte"
+        );
+        assert!(
+            fs::read_dir(harness.root().join(".quarantine"))
+                .expect("quarantine")
+                .next()
+                .is_none(),
+            "a refusal is not a hold; there is nothing here to re-present"
+        );
+        assert!(
+            matches!(
+                harness.pipeline.key_material().expect("readable"),
+                KeyMaterial::Absent
+            ),
+            "no key was minted, which is the thing that could not have been undone"
+        );
+        assert_eq!(harness.counts()["records"], 0, "and no index row");
+    }
+
+    /// The same refusal from the declaration that says so out loud, rather than from an absent file.
+    /// An operator who turned the class off has said the same thing as one who never turned it on.
+    #[test]
+    fn a_declaration_that_refuses_the_class_refuses_it_as_firmly_as_an_absent_one() {
+        let mut harness = Harness::new().declaring(Some(testkit::SPEC_WRITES_REFUSED));
+        let error = harness
+            .pipeline
+            .accept(
+                testkit::subject_derived(T09, &[testkit::subject('a')]),
+                BODY,
+            )
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains("refused by this store"),
+            "{error}"
+        );
+    }
+
+    /// A caller that gets a bare rejection assumes a bug and retries. This one is told what was
+    /// refused, that nothing was written, what to change, and what accepting it would have done —
+    /// the last because "just turn it on" is the wrong reflex for a decision nothing can undo.
+    #[test]
+    fn the_refusal_says_what_was_refused_what_to_change_and_what_it_would_have_cost() {
+        let mut harness = Harness::new().declaring(None);
+        let record = testkit::subject_derived(T09, &[testkit::subject('a')]);
+        let id = record.record_id.clone();
+        let said = harness
+            .pipeline
+            .accept(record, BODY)
+            .expect_err("refused")
+            .to_string();
+
+        for expected in [
+            "subject-derived records are refused by this store",
+            "nothing was written",
+            "writes: enabled",
+            "subject-writes.yaml",
+            id.as_str(),
+            "cannot be rotated",
+            "no re-key, no re-seal and no delete",
+            "data_class: internal",
+        ] {
+            assert!(said.contains(expected), "{expected} missing from: {said}");
+        }
+        assert!(
+            said.contains(harness.root().to_str().expect("utf-8 root")),
+            "a host running several stores needs to know which one refused: {said}"
+        );
+    }
+
+    /// Where the refusal sits, asserted rather than assumed: ahead of resolution, which is where a
+    /// pseudonym would have been derived. A refusal downstream of that has already done the one
+    /// thing this exists to prevent, and would look identical from the outside.
+    #[test]
+    fn a_refused_record_never_reaches_the_subject_resolver() {
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let mut harness = Harness::new()
+                .declaring(None)
+                .resolving_with(Counting(std::sync::Arc::clone(&asked)));
+            harness
+                .pipeline
+                .accept(
+                    testkit::subject_derived(T09, &[testkit::subject('a')]),
+                    BODY,
+                )
+                .expect_err("refused");
+            assert_eq!(
+                asked.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the resolver derives the pseudonym; it must not have been asked"
+            );
+
+            // An internal record on the same store still goes through it, so the count above is the
+            // refusal and not a resolver that was never wired up.
+            harness
+                .pipeline
+                .accept(testkit::internal(T09), BODY)
+                .expect("accepted");
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// And the declaration is what lets one through: the same record, the same store, one line of
+    /// configuration apart.
+    #[test]
+    fn the_declaration_is_what_lets_a_subject_derived_record_through() {
+        let mut harness = Harness::new();
+        let record = testkit::subject_derived(T09, &[testkit::subject('a')]);
+        let path = harness.path_of(&record);
+        assert!(matches!(
+            harness.pipeline.accept(record, BODY).expect("accepted"),
+            Accepted::Stored(_)
+        ));
+
+        let parsed = Document::parse(&fs::read_to_string(&path).expect("read")).expect("parses");
+        assert!(
+            matches!(parsed.body, Body::Sealed(_)),
+            "enabled means sealed, which is the state the refusal was protecting"
+        );
+    }
+
+    /// The regression that matters most, and the one a refusal in the wrong layer would cause: a
+    /// store that enabled the class, wrote under it, and then stopped still holds those records.
+    ///
+    /// Every operation over what it already holds has to keep working — the index is derived and
+    /// deleting it is a routine remedy, so a rebuild that refused the records in its own tree would
+    /// leave the store unqueryable with no way back. Only the accept path refuses.
+    #[test]
+    fn a_store_that_stops_writing_the_class_still_rebuilds_and_reads_what_it_holds() {
+        let mut harness = Harness::new();
+        let subject = testkit::subject('a');
+        let stored = testkit::subject_derived(T09, std::slice::from_ref(&subject));
+        let id = stored.record_id.clone();
+        let path = harness.path_of(&stored);
+        harness.pipeline.accept(stored, BODY).expect("accepted");
+        harness.pipeline.drain_fanout(16).expect("drained");
+
+        // The decision is taken back.
+        let mut harness = harness.declaring(Some(testkit::SPEC_WRITES_REFUSED));
+        harness
+            .pipeline
+            .accept(
+                testkit::subject_derived(T09, &[testkit::subject('b')]),
+                BODY,
+            )
+            .expect_err("no new record of the class");
+
+        // A rebuild — from the tree, over records of the class it no longer writes.
+        let report = crate::reindex::reindex_all(&mut harness.pipeline).expect("rebuilt");
+        assert_eq!(
+            report.from_tree, 1,
+            "the record it already holds: {report:?}"
+        );
+        assert_eq!(report.skipped, 0);
+        assert_eq!(harness.counts()["records"], 1);
+        assert_eq!(harness.counts()["record_subjects"], 1);
+
+        // And from nothing at all, which is what an operator who deletes the index gets.
+        let mut harness = harness.without_index();
+        assert_eq!(
+            crate::reindex::reindex_all(&mut harness.pipeline)
+                .expect("rebuilt from an empty index")
+                .from_tree,
+            1
+        );
+
+        // The body still opens, and the erasure that is the whole point of the class still runs.
+        let document = Document::parse(&fs::read_to_string(&path).expect("read")).expect("parses");
+        assert!(matches!(document.body, Body::Sealed(_)));
+        crate::unseal::inspect(&harness.pipeline, &id).expect("inspectable");
+        let report = crate::erase::erase_subject(&mut harness.pipeline, &subject).expect("erased");
+        assert!(
+            report.keys_destroyed > 0,
+            "the store can still answer an erasure request for what it wrote: {report:?}"
+        );
+    }
 
     #[test]
     fn a_record_lands_in_a_dated_path_and_reads_back_unchanged() {

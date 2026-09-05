@@ -23,6 +23,7 @@ use std::time::Duration;
 use yaam_core::Paths;
 use yaam_core::arming::Arming;
 use yaam_core::resolve::{ReferenceSubjects, SubjectKinds};
+use yaam_core::subject_writes::SubjectWrites;
 use yaam_crypto::custody::{SubjectKeyFile, SubjectKeySource};
 use yaam_crypto::subject::SubjectKey;
 
@@ -456,6 +457,19 @@ impl StoreSettings {
                     None => "none: no body can be sealed".to_owned(),
                 },
             ),
+            // The store's own decision rather than this process's, which is why it is read from the
+            // tree here and not taken from a flag. A startup log that did not say this would leave
+            // an operator with two plausible readings of a quiet service: writing sealed bodies, or
+            // refusing every one it is sent.
+            (
+                "subject-writes",
+                match SubjectWrites::load(&self.paths.root) {
+                    Ok(posture) => {
+                        format!("{} (spec/{})", posture.as_str(), SubjectWrites::SPEC_FILE)
+                    }
+                    Err(error) => format!("unreadable, and the store will not open: {error}"),
+                },
+            ),
         ]
     }
 }
@@ -773,6 +787,44 @@ mod tests {
         let key = dir.path().join("subject.key");
         std::fs::write(&key, format!("{}\n", "5a".repeat(32))).expect("written");
         (dir, key)
+    }
+
+    /// A startup log has to answer "does this store write subject-derived records" without anyone
+    /// opening a file, because that is the question an operator asks about a service that looks
+    /// quiet, and both answers look identical from outside.
+    #[test]
+    fn the_startup_log_says_whether_this_store_writes_subject_derived_records() {
+        let dir = tree();
+        let settings = StoreSettings::resolve(&store_args(Some(dir.path())), &Env::default())
+            .expect("resolved");
+        let posture = |settings: &StoreSettings| {
+            settings
+                .describe()
+                .into_iter()
+                .find(|(name, _)| *name == "subject-writes")
+                .expect("the startup log says which posture this store came up under")
+                .1
+        };
+        let said = posture(&settings);
+        assert!(said.starts_with("refused"), "{said}");
+        assert!(said.contains("subject-writes.yaml"), "{said}");
+
+        std::fs::write(
+            dir.path().join("spec").join("subject-writes.yaml"),
+            "version: 1\nwrites: enabled\n",
+        )
+        .expect("written");
+        assert!(posture(&settings).starts_with("enabled"));
+
+        // A declaration this build cannot read is not the same as no declaration, and the log must
+        // not report the safe answer for it: the store refuses to open at all.
+        std::fs::write(
+            dir.path().join("spec").join("subject-writes.yaml"),
+            "version: 1\nwrites: sometimes\n",
+        )
+        .expect("written");
+        assert!(posture(&settings).starts_with("unreadable"));
+        settings.open().expect_err("and the store does not open");
     }
 
     /// The state every store is in until an operator decides otherwise: nothing declared, no secret,

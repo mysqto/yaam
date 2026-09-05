@@ -50,12 +50,17 @@ pub const PATIENCE: Duration = Duration::from_secs(30);
 /// per-test variables are applied after this one.
 pub const MAINTENANCE_MS: &str = "250";
 
+/// The declaration a store makes when it has decided to write subject-derived records.
+pub const SPEC_WRITES: &str = "version: 1\nwrites: enabled\n";
+
 /// A memory tree with this repository's own spec, a keyring, and a sealing key.
 pub struct Deployment {
     dir: tempfile::TempDir,
 }
 
 impl Deployment {
+    /// A store in the shipped state: the repository's `spec/` declares no erasure units, so
+    /// subject-derived records are refused.
     pub fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec");
@@ -66,6 +71,21 @@ impl Deployment {
         )
         .expect("keyring");
         Self { dir }
+    }
+
+    /// The same deployment, with the operator's decision to write subject-derived records on the
+    /// page.
+    ///
+    /// Written out rather than defaulted, because the default is the opposite and has to be: the
+    /// first such record a store writes is sealed under a key that cannot be rotated, and there is
+    /// no re-key, no re-seal and no delete.
+    pub fn writing_subjects(self) -> Self {
+        fs::write(
+            self.dir.path().join("spec").join("subject-writes.yaml"),
+            SPEC_WRITES,
+        )
+        .expect("subject-writes spec");
+        self
     }
 
     pub fn root(&self) -> &Path {

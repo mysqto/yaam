@@ -28,6 +28,9 @@ pub const POLICY: &str = "default-v1";
 /// the agent name in the signature, not the secret.
 pub const KEY: &[u8] = b"an-integration-test-key";
 
+/// The declaration a store makes when it has decided to write subject-derived records.
+pub const SPEC_WRITES: &str = "version: 1\nwrites: enabled\n";
+
 /// A memory tree with the repository's spec in place, and the service over it.
 pub struct Tree {
     dir: TempDir,
@@ -37,10 +40,31 @@ pub struct Tree {
 
 impl Tree {
     /// Builds a tree, copying `spec/` in from the repository.
+    ///
+    /// The repository's `spec/` declares no erasure units, so this is a store in the shipped state:
+    /// subject-derived records are refused. A test that needs them written says so.
     pub fn new() -> Self {
+        Self::open(None)
+    }
+
+    /// The same tree, with the operator's decision to write subject-derived records on the page.
+    ///
+    /// Written out rather than defaulted, because the default is the opposite and has to be: the
+    /// first such record a store writes is sealed under a key that cannot be rotated, and there is
+    /// no re-key, no re-seal and no delete.
+    pub fn writing_subjects() -> Self {
+        Self::open(Some(SPEC_WRITES))
+    }
+
+    /// Builds a tree whose `spec/subject-writes.yaml` is `declaration`, or absent.
+    fn open(declaration: Option<&str>) -> Self {
         let dir = TempDir::new().expect("temp dir");
         let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec");
         copy_dir(&spec, &dir.path().join("spec"));
+        if let Some(text) = declaration {
+            fs::write(dir.path().join("spec").join("subject-writes.yaml"), text)
+                .expect("subject-writes spec");
+        }
         let service = CoreService::open(dir.path(), &dir.path().join("index.sqlite"))
             .expect("a service over a fresh tree");
         Self {
@@ -172,7 +196,7 @@ fn copy_dir(from: &Path, to: &Path) {
 }
 
 /// Every file under `root`, recursively.
-fn walk(root: &Path) -> Vec<PathBuf> {
+pub fn walk(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let Ok(entries) = fs::read_dir(root) else {
         return found;

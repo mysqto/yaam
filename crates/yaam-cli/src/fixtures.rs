@@ -25,14 +25,31 @@ pub(crate) const BODY: &str = "Rolled out the api service to staging across two 
 /// The redaction policy this repository's spec declares. A record must name the one in force.
 pub(crate) const POLICY: &str = "default-v1";
 
+/// This deployment's decision about writing subject-derived records.
+///
+/// Spelled out rather than left to a default, because the default is the opposite: a store refuses
+/// them until `writes: enabled` is on the page. Most of what this crate proves — an erasure, a
+/// hold, an operator read of a sealed body — needs a tree that holds such records, so the fixture
+/// is a store whose operator took that decision, and says so in the file a real one would.
+pub(crate) const SPEC_WRITES: &str = "version: 1\nwrites: enabled\n";
+
 /// A temporary memory tree with this repository's own `spec/` in place.
 ///
 /// The repository's spec rather than a fixture one, so a spec change that stopped admitting these
-/// records fails here rather than in a deployment.
+/// records fails here rather than in a deployment. The one thing added on top is the subject-writes
+/// declaration, which the repository's `spec/` deliberately does not carry: shipped, a store writes
+/// no subject-derived record at all.
 pub(crate) fn tree() -> TempDir {
     let dir = TempDir::new().expect("tempdir");
     let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec");
     copy_dir(&spec, &dir.path().join("spec"));
+    fs::write(
+        dir.path()
+            .join("spec")
+            .join(yaam_core::subject_writes::SubjectWrites::SPEC_FILE),
+        SPEC_WRITES,
+    )
+    .expect("subject-writes spec");
     dir
 }
 

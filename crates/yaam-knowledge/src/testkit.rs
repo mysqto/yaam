@@ -20,6 +20,7 @@ use yaam_contract::{
     entity::{self, EntityRef},
 };
 use yaam_core::Pipeline;
+use yaam_core::subject_writes::SubjectWrites;
 
 /// Entity kinds this deployment configures.
 const SPEC_ENTITIES: &str = concat!(
@@ -62,6 +63,14 @@ const SPEC_REDACTION: &str = concat!(
     "    action: mask\n",
 );
 
+/// This deployment's decision about writing subject-derived records.
+///
+/// Spelled out rather than left to a default, because the default is the opposite: a store refuses
+/// them until `writes: enabled` is on the page. This crate's claim is that knowledge holds nothing
+/// an erasure would have to reach, which needs a tree that actually holds sealed records — so the
+/// fixture is a store whose operator took that decision.
+const SPEC_WRITES: &str = "version: 1\nwrites: enabled\n";
+
 /// The policy name records must declare.
 const POLICY: &str = "default-v1";
 
@@ -87,6 +96,7 @@ impl Harness {
         fs::write(spec.join("entities.yaml"), SPEC_ENTITIES).expect("entities spec");
         fs::write(spec.join("attrs-schema.yaml"), SPEC_ATTRS).expect("attrs spec");
         fs::write(spec.join("redaction/default.yaml"), SPEC_REDACTION).expect("redaction spec");
+        fs::write(spec.join(SubjectWrites::SPEC_FILE), SPEC_WRITES).expect("subject-writes spec");
         let pipeline = Pipeline::new(dir.path()).expect("pipeline");
         Self { dir, pipeline }
     }

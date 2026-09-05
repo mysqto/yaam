@@ -1617,7 +1617,7 @@ fn no_prose_came_back(raw: &str, question: &str) {
 
 #[tokio::test]
 async fn every_golden_query_finds_exactly_the_records_its_question_needs() {
-    let tree = Tree::new();
+    let tree = Tree::writing_subjects();
     let app = router(AppState::new(
         Arc::new(keyring()),
         Arc::clone(&tree.service) as Arc<dyn Service>,

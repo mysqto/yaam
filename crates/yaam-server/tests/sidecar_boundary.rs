@@ -266,6 +266,95 @@ async fn an_unredacted_body_is_still_refused_when_no_policy_is_fitted() {
     assert!(!tree.holds(&id), "an unredacted record must not land");
 }
 
+/// The write this refusal exists to stop, arriving the way it would have arrived.
+///
+/// One JSON line on a caller's socket, carrying `data_class: subject_derived` and an entity of a
+/// kind the store's `spec/entities.yaml` declares. Nothing on this path used to stand in its way:
+/// the sidecar checks that the socket's agent is the record's agent and that the contract's own
+/// rules hold, and neither of those knows which classes a store writes. The pipeline then replaces
+/// whatever subjects the record declared with the resolver's answer and seals — so a caller needed
+/// no key, no pseudonym and no permission beyond its own socket to make a store mint its first
+/// permanent one.
+///
+/// It is refused now, and the caller is told enough to act on: what was refused, that nothing was
+/// written, and the file to change. The reason has to survive the sidecar's bounded quote of the
+/// service's answer, which is why the message leads with it.
+#[tokio::test]
+async fn a_subject_derived_record_on_a_socket_is_refused_by_a_store_that_never_enabled_the_class() {
+    let (secret, public) = envelope::generate_keypair();
+    // `Tree::new` is the shipped state: the repository's own spec, and no subject-writes
+    // declaration on top of it.
+    let (tree, base_url) = service(&secret).await;
+    let state = tempfile::tempdir().expect("state dir");
+    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+
+    let doc = support::subject_record("agent_a", "2026-08-20T09:00:00Z", &support::subject('a'));
+    let id = doc.record_id.clone();
+    let line = format!("{}\n", serde_json::to_string(&doc).expect("serialise"));
+
+    let answer = submit(&socket, &line).await;
+    assert!(
+        answer.contains(r#""status":"rejected""#),
+        "a refusal, not a spool: no retry can make this land. Got {answer}"
+    );
+    for expected in [
+        "subject-derived records are refused by this store",
+        "nothing was written",
+        "writes: enabled",
+        "subject-writes.yaml",
+    ] {
+        assert!(
+            answer.contains(expected),
+            "the caller is told `{expected}`, not merely that it was rejected: {answer}"
+        );
+    }
+    assert!(!tree.holds(&id), "nothing landed in the service's tree");
+    assert!(
+        support::walk(&tree.root().join("keystore")).is_empty(),
+        "no key was minted, so there is no pseudonym this store cannot take back"
+    );
+
+    // The same line, on a store whose operator declared the class, lands. The refusal is the
+    // declaration's absence and nothing else about the record.
+    let (secret, public) = envelope::generate_keypair();
+    let enabled = Tree::writing_subjects();
+    let app = router(
+        AppState::new(
+            Arc::new(keyring()),
+            Arc::clone(&enabled.service) as Arc<dyn Service>,
+        )
+        .unsealing_with(secret.to_vec()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    let state = tempfile::tempdir().expect("state dir");
+    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+    assert_eq!(submit(&socket, &line).await, r#"{"status":"accepted"}"#);
+    assert!(enabled.holds(&id));
+}
+
+/// The socket is still the evidence of who is writing, and this refusal did not become a way past
+/// that: a record naming another agent is turned away before its class is ever considered.
+#[tokio::test]
+async fn a_record_claiming_another_agent_is_still_refused_whatever_class_it_declares() {
+    let (secret, public) = envelope::generate_keypair();
+    let (tree, base_url) = service(&secret).await;
+    let state = tempfile::tempdir().expect("state dir");
+    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+
+    let doc = support::subject_record("agent_b", "2026-08-20T09:00:00Z", &support::subject('a'));
+    let id = doc.record_id.clone();
+    let line = format!("{}\n", serde_json::to_string(&doc).expect("serialise"));
+
+    let answer = submit(&socket, &line).await;
+    assert!(
+        answer.contains("socket belongs to `agent_a`"),
+        "attribution is checked at the socket, ahead of anything the store decides: {answer}"
+    );
+    assert!(!tree.holds(&id));
+}
+
 #[tokio::test]
 async fn a_sidecar_signing_with_the_wrong_key_is_refused_rather_than_stored() {
     let (secret, public) = envelope::generate_keypair();

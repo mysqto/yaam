@@ -19,6 +19,7 @@ use yaam_contract::{
 
 use crate::layout;
 use crate::pipeline::Pipeline;
+use crate::subject_writes::SubjectWrites;
 
 /// Entity kinds this deployment configures.
 const SPEC_ENTITIES: &str = concat!(
@@ -65,6 +66,20 @@ const SPEC_REDACTION: &str = concat!(
     "    action: mask\n",
 );
 
+/// This deployment's decision about writing subject-derived records.
+///
+/// Spelled out rather than left to a default, because the default is the opposite: a store refuses
+/// them until `writes: enabled` is on the page. Most of this crate's tests are about what happens
+/// *after* such a record is accepted, so the fixture is a store whose operator took that decision —
+/// and it has to say so, in the same file a real one would.
+pub(crate) const SPEC_WRITES_ENABLED: &str = "version: 1\nwrites: enabled\n";
+
+/// The same decision, taken back.
+///
+/// A store that enabled the class, wrote under it, and then stopped. Everything it already holds
+/// must still rebuild, verify and erase; only new writes are refused.
+pub(crate) const SPEC_WRITES_REFUSED: &str = "version: 1\nwrites: refused\n";
+
 /// The policy name records must declare.
 pub(crate) const POLICY: &str = "default-v1";
 
@@ -87,6 +102,8 @@ impl Harness {
         fs::write(spec.join("entities.yaml"), SPEC_ENTITIES).expect("entities spec");
         fs::write(spec.join("attrs-schema.yaml"), SPEC_ATTRS).expect("attrs spec");
         fs::write(spec.join("redaction/default.yaml"), SPEC_REDACTION).expect("redaction spec");
+        fs::write(spec.join(SubjectWrites::SPEC_FILE), SPEC_WRITES_ENABLED)
+            .expect("subject-writes spec");
         let pipeline = Pipeline::new(dir.path()).expect("pipeline");
         Self { dir, pipeline }
     }
@@ -94,6 +111,26 @@ impl Harness {
     /// Root of the memory tree.
     pub(crate) fn root(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// Rewrites the subject-writes declaration and reopens the pipeline over the same tree.
+    ///
+    /// `None` removes the file, which is the shipped state. The posture is read at open, as every
+    /// `spec/` answer is, so a test that changes it has to reopen — which is also what a deployment
+    /// does. Destructured so the temporary root outlives the pipeline being replaced.
+    pub(crate) fn declaring(self, writes_yaml: Option<&str>) -> Self {
+        let Self { dir, pipeline } = self;
+        drop(pipeline);
+        let path = dir
+            .path()
+            .join(layout::SPEC_DIR)
+            .join(SubjectWrites::SPEC_FILE);
+        match writes_yaml {
+            Some(text) => fs::write(&path, text).expect("subject-writes spec"),
+            None => crate::fsutil::remove_if_present(&path).expect("removed"),
+        }
+        let pipeline = Pipeline::new(dir.path()).expect("pipeline");
+        Self { dir, pipeline }
     }
 
     /// Deletes the index, connection and all, and reopens over the same tree.

@@ -303,6 +303,14 @@ paths:
             that cannot be read, a `subject_derived` record naming no subject, an `internal` record
             naming one, a `team` visibility with no team, or an entity confidence outside `0.0..=1.0`.
             Do not retry these bytes.
+
+            Also permanent, and not about the record at all: a `subject_derived` record sent to a
+            deployment that does not write that class. Whether it does is the deployment's own
+            declaration, refused unless it has been made, because the first such record a store
+            writes is sealed under a key that cannot be rotated and there is no re-key, no re-seal
+            and no delete. The same record classified `internal` is accepted; nothing else about it
+            has to change. Retrying it unchanged cannot help, and only an operator can change the
+            answer.
           content:
             application/json:
               schema:
@@ -1639,6 +1647,11 @@ components:
         `subject_derived` bodies are sealed under a key derived from *all* the record's subjects, and
         must name at least one — a subject-derived record with no subjects would be sealed under a
         key nobody can destroy, which is unerasable by construction.
+
+        A deployment need not accept `subject_derived` at all, and by default does not: writing one
+        is a decision it declares, separately from declaring what an erasure unit is, and every such
+        record is `422` until it has. A writer that cannot assume the deployment made that decision
+        should send `internal`.
 
     SubjectRole:
       type: string

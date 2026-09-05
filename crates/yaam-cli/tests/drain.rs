@@ -159,7 +159,7 @@ fn a_restore_leaves_the_timelines_the_backup_left_behind() {
 /// says an erasure *retains*.
 #[test]
 fn an_erasure_leaves_the_timelines_re_materialised() {
-    let deployment = Deployment::new();
+    let deployment = Deployment::new().writing_subjects();
     let erased = subject('a');
     let record = subject_derived(std::slice::from_ref(&erased));
     let id = record.record_id.clone();
@@ -211,7 +211,7 @@ fn an_erasure_leaves_the_timelines_re_materialised() {
 
 #[test]
 fn a_drain_that_hits_its_bound_reports_the_remainder() {
-    let deployment = Deployment::new();
+    let deployment = Deployment::new().writing_subjects();
     let root = deployment.root_str();
     {
         let mut pipeline = Pipeline::new(deployment.root()).expect("pipeline");
@@ -255,7 +255,7 @@ fn a_drain_that_hits_its_bound_reports_the_remainder() {
 /// Erasure is the irreversible half, and a fan-out job that cannot run is not it.
 #[test]
 fn a_fan_out_job_that_cannot_run_does_not_fail_an_erasure() {
-    let deployment = Deployment::new();
+    let deployment = Deployment::new().writing_subjects();
     let erased = subject('c');
     {
         let mut pipeline = Pipeline::new(deployment.root()).expect("pipeline");

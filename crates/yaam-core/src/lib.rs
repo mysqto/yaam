@@ -10,7 +10,8 @@
 //! moved by moving a directory:
 //!
 //! ```text
-//! spec/                        configuration: entity kinds, attrs, redaction, erasure units
+//! spec/                        configuration: entity kinds, attrs, redaction, erasure units,
+//!                              and whether this store writes subject-derived records at all
 //! records/YYYY/MM/DD/<id>.md   the authoritative record tree
 //! records/owner/<agent>/...    owner-visible records, one private subtree per owner
 //! entities/<kind>/<id>/        entity timelines, materialised by fan-out
@@ -55,6 +56,7 @@ pub mod reindex;
 pub mod resolve;
 pub mod restore;
 pub mod retain;
+pub mod subject_writes;
 pub mod sweeper;
 pub mod unseal;
 

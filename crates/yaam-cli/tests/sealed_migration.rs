@@ -36,7 +36,7 @@ const MIGRATED: SchemaVer = SchemaVer(2);
 
 #[test]
 fn a_sealed_body_still_opens_after_its_schema_version_is_bumped() {
-    let deployment = Deployment::new();
+    let deployment = Deployment::new().writing_subjects();
     let record = subject_derived(&[subject('a')]);
     let id = record.record_id.clone();
     accept(&deployment, record);
@@ -100,7 +100,7 @@ fn a_sealed_body_still_opens_after_its_schema_version_is_bumped() {
 
 #[test]
 fn two_records_sharing_a_subject_cannot_have_their_bodies_swapped() {
-    let deployment = Deployment::new();
+    let deployment = Deployment::new().writing_subjects();
     let shared = subject('b');
     let first = subject_derived(std::slice::from_ref(&shared));
     let second = subject_derived(&[shared]);
