@@ -159,7 +159,10 @@ CREATE TABLE entity_refs (
 CREATE INDEX entity_refs_recent
     ON entity_refs (kind, entity_id, received_ms, confidence, record_pk);
 
--- A record may name several subjects, each with its own role, key epoch and wrapped key share.
+-- One row per subject a record names, with its role, key epoch and wrapped key share. A record names
+-- at most one, and that is the contract's rule to keep on the way in rather than a constraint here:
+-- this table is derived from the tree, so a rule living only here would report a shared body as a
+-- constraint failure naming a table, after the record it is about had already been written.
 CREATE TABLE record_subjects (
     record_pk         INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
     subject_hash      TEXT    NOT NULL,

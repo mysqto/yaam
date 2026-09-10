@@ -517,35 +517,43 @@ mod tests {
     /// written here is searchable for ever.
     ///
     /// Two subjects, because one could pass by accident on a summary that happened to mention only
-    /// the other.
+    /// the other. Two records to carry them, one subject each: a record names at most one, so the
+    /// pair that makes the accident unlikely is now a pair of readings rather than a pair of shares
+    /// on one body. Every line the trail wrote is checked against both.
     #[test]
     fn no_subject_pseudonym_appears_in_what_the_unseal_trail_publishes() {
         let mut harness = Harness::new();
         let subjects = [testkit::subject('a'), testkit::subject('b')];
-        let record = testkit::subject_derived(T11, &subjects);
-        harness
-            .pipeline
-            .accept(record.clone(), BODY)
-            .expect("accepted");
+        for (n, subject) in subjects.iter().enumerate() {
+            let record = testkit::subject_derived(
+                if n == 0 { T11 } else { "2026-08-23T10:00:00Z" },
+                std::slice::from_ref(subject),
+            );
+            harness
+                .pipeline
+                .accept(record.clone(), BODY)
+                .expect("accepted");
 
-        let read = read_body(
-            &mut harness.pipeline,
-            &record.record_id,
-            "operator_a",
-            "regulator asked what is retained",
-        )
-        .expect("read");
-        assert!(matches!(read, Read::Revealed { .. }), "{read:?}");
+            let read = read_body(
+                &mut harness.pipeline,
+                &record.record_id,
+                "operator_a",
+                "regulator asked what is retained",
+            )
+            .expect("read");
+            assert!(matches!(read, Read::Revealed { .. }), "{read:?}");
+        }
 
         let files = audit_files(&harness);
-        assert_eq!(files.len(), 1, "one reading, one line");
-        for subject in &subjects {
-            assert!(
-                !files[0].contains(subject.as_str()),
-                "the trail names subject `{}`, which erasure can never reach:\n{}",
-                subject.as_str(),
-                files[0]
-            );
+        assert_eq!(files.len(), 2, "two readings, two lines");
+        for text in &files {
+            for subject in &subjects {
+                assert!(
+                    !text.contains(subject.as_str()),
+                    "the trail names subject `{}`, which erasure can never reach:\n{text}",
+                    subject.as_str(),
+                );
+            }
         }
     }
 

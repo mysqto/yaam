@@ -21,19 +21,28 @@ use yaam_agent::listener::{self, CallerSocket, Limits};
 use yaam_agent::upstream::{Credentials, Upstream};
 use yaam_contract::request::{AGENT_HEADER, SIGNATURE_HEADER, SigningKeys};
 use yaam_crypto::envelope;
-use yaam_server::auth::Role;
+use yaam_server::auth::{Keyring, Role};
 use yaam_server::routes::{AppState, router};
 use yaam_server::service::Service;
 use yaam_store::query::Filter;
 
-use support::{KEY, Tree, caller, keyring, record};
+use support::{KEY, Tree, caller, keyring, keyring_filing, record};
 
 /// A service listening on an ephemeral port, and the tree behind it.
 async fn service(secret: &[u8]) -> (Tree, String) {
-    let tree = Tree::new();
+    serving(Tree::new(), keyring(), secret).await
+}
+
+/// A service over `tree`, authenticating against `ring`.
+///
+/// Both are parameters because the class refusal has three independent answers behind it — the
+/// socket's grant, the credential's grant, and the store's declaration — and a test that pins one
+/// has to be able to grant the other two. A helper that only ever built the ungranted pair would
+/// make every such test pass on the first refusal it met.
+async fn serving(tree: Tree, ring: Keyring, secret: &[u8]) -> (Tree, String) {
     let app = router(
         AppState::new(
-            Arc::new(keyring()),
+            Arc::new(ring),
             Arc::clone(&tree.service) as Arc<dyn Service>,
         )
         .unsealing_with(secret.to_vec()),
@@ -51,6 +60,16 @@ async fn sidecar(agent: &str, base_url: &str, public: &[u8], state: &Path) -> st
     sidecar_masking(agent, base_url, public, state, None).await
 }
 
+/// As [`sidecar`], with this caller's socket granted the subject-derived class.
+async fn sidecar_filing(
+    agent: &str,
+    base_url: &str,
+    public: &[u8],
+    state: &Path,
+) -> std::path::PathBuf {
+    sidecar_with(agent, base_url, public, state, None, true).await
+}
+
 /// As [`sidecar`], with a redaction policy fitted.
 async fn sidecar_masking(
     agent: &str,
@@ -58,6 +77,18 @@ async fn sidecar_masking(
     public: &[u8],
     state: &Path,
     redaction: Option<yaam_contract::mask::Policy>,
+) -> std::path::PathBuf {
+    sidecar_with(agent, base_url, public, state, redaction, false).await
+}
+
+/// One sidecar, with the redaction policy and the class grant both spelled out.
+async fn sidecar_with(
+    agent: &str,
+    base_url: &str,
+    public: &[u8],
+    state: &Path,
+    redaction: Option<yaam_contract::mask::Policy>,
+    files_subject_derived: bool,
 ) -> std::path::PathBuf {
     let path = state.join(format!("{agent}.sock"));
     let upstream = Upstream {
@@ -68,6 +99,7 @@ async fn sidecar_masking(
     let sockets = vec![CallerSocket {
         agent: agent.to_owned(),
         path: path.clone(),
+        files_subject_derived,
     }];
     let state = state.to_path_buf();
     tokio::spawn(async move {
@@ -94,6 +126,7 @@ fn read_socket(agent: &str, record: &Path) -> PathBuf {
     CallerSocket {
         agent: agent.to_owned(),
         path: record.to_path_buf(),
+        files_subject_derived: false,
     }
     .read_path()
 }
@@ -279,14 +312,20 @@ async fn an_unredacted_body_is_still_refused_when_no_policy_is_fitted() {
 /// It is refused now, and the caller is told enough to act on: what was refused, that nothing was
 /// written, and the file to change. The reason has to survive the sidecar's bounded quote of the
 /// service's answer, which is why the message leads with it.
+///
+/// Both caller-side grants are given, and that is the whole reason this test still means what it
+/// says. There are now three independent refusals on this path — the socket's
+/// `files_subject_derived`, the credential's, and the store's declaration — and the first two are
+/// permissions about *who is asking*. Left ungranted, this line is turned away at the sidecar and
+/// the store is never asked, so the test would pass while proving nothing about the store at all.
 #[tokio::test]
 async fn a_subject_derived_record_on_a_socket_is_refused_by_a_store_that_never_enabled_the_class() {
     let (secret, public) = envelope::generate_keypair();
     // `Tree::new` is the shipped state: the repository's own spec, and no subject-writes
-    // declaration on top of it.
-    let (tree, base_url) = service(&secret).await;
+    // declaration on top of it. The keyring, unlike the store, does grant the class.
+    let (tree, base_url) = serving(Tree::new(), keyring_filing(), &secret).await;
     let state = tempfile::tempdir().expect("state dir");
-    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+    let socket = sidecar_filing("agent_a", &base_url, &public, state.path()).await;
 
     let doc = support::subject_record("agent_a", "2026-08-20T09:00:00Z", &support::subject('a'));
     let id = doc.record_id.clone();
@@ -296,6 +335,10 @@ async fn a_subject_derived_record_on_a_socket_is_refused_by_a_store_that_never_e
     assert!(
         answer.contains(r#""status":"rejected""#),
         "a refusal, not a spool: no retry can make this land. Got {answer}"
+    );
+    assert!(
+        !answer.contains("may not file"),
+        "the refusal has to be the store's, not either caller-side grant's: {answer}"
     );
     for expected in [
         "subject-derived records are refused by this store",
@@ -317,21 +360,25 @@ async fn a_subject_derived_record_on_a_socket_is_refused_by_a_store_that_never_e
     // The same line, on a store whose operator declared the class, lands. The refusal is the
     // declaration's absence and nothing else about the record.
     let (secret, public) = envelope::generate_keypair();
-    let enabled = Tree::writing_subjects();
-    let app = router(
-        AppState::new(
-            Arc::new(keyring()),
-            Arc::clone(&enabled.service) as Arc<dyn Service>,
-        )
-        .unsealing_with(secret.to_vec()),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
-    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    let (enabled, base_url) = serving(Tree::writing_subjects(), keyring_filing(), &secret).await;
     let state = tempfile::tempdir().expect("state dir");
-    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+    let socket = sidecar_filing("agent_a", &base_url, &public, state.path()).await;
     assert_eq!(submit(&socket, &line).await, r#"{"status":"accepted"}"#);
     assert!(enabled.holds(&id));
+
+    // And with the store declaring the class, the caller-side grants are what refuse it: the same
+    // line on an ungranted socket does not reach the store either. Three answers, each sufficient,
+    // which is what a merge of these two features had to leave standing.
+    let (secret, public) = envelope::generate_keypair();
+    let (ungranted, base_url) = serving(Tree::writing_subjects(), keyring(), &secret).await;
+    let state = tempfile::tempdir().expect("state dir");
+    let socket = sidecar("agent_a", &base_url, &public, state.path()).await;
+    let answer = submit(&socket, &line).await;
+    assert!(
+        answer.contains("may not file") && answer.contains("files_subject_derived"),
+        "an ungranted socket is refused where it arrived: {answer}"
+    );
+    assert!(!ungranted.holds(&id));
 }
 
 /// The socket is still the evidence of who is writing, and this refusal did not become a way past
@@ -371,6 +418,7 @@ async fn a_sidecar_signing_with_the_wrong_key_is_refused_rather_than_stored() {
     let sockets = vec![CallerSocket {
         agent: "agent_a".to_owned(),
         path: path.clone(),
+        files_subject_derived: false,
     }];
     let dir = state.path().to_path_buf();
     tokio::spawn(async move {

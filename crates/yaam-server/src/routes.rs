@@ -819,6 +819,10 @@ async fn write_record(
 ) -> Result<(StatusCode, Json<WriteResponse>)> {
     let request: WriteRequest = decode(&state.opened(&headers, &body)?)?;
     auth::authorise_write(&caller, &request.record.agent)?;
+    // Before `validate`, so a caller that may not seal a body is told that and not told which of the
+    // seventeen fields it also got wrong. Both are `403`s about who is asking rather than `422`s
+    // about what was asked, and they belong together.
+    auth::authorise_class(&caller, request.record.data_class)?;
     // Validated before the record reaches the pipeline, so the caller is told what is wrong with
     // its record rather than which layer noticed.
     request

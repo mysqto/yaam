@@ -103,12 +103,29 @@ pub fn keyring() -> Keyring {
         .with(Credential::new("agent_ops", Role::Operator, KEY).in_teams(["platform"]))
 }
 
+/// The same keyring, with `agent_a` granted the subject-derived class.
+///
+/// A permission about the caller, and nothing to do with whether the store writes the class. A test
+/// that wants to reach the store's own refusal has to grant this first, or it passes on a `403`
+/// from the route and never asks the store anything.
+pub fn keyring_filing() -> Keyring {
+    Keyring::new()
+        .with(
+            Credential::new("agent_a", Role::Writer, KEY)
+                .in_teams(["platform"])
+                .filing_subject_derived(),
+        )
+        .with(Credential::new("agent_b", Role::Reader, KEY).in_teams(["support"]))
+        .with(Credential::new("agent_ops", Role::Operator, KEY).in_teams(["platform"]))
+}
+
 /// A caller as the keyring would have resolved it.
 pub fn caller(agent: &str, role: Role, teams: &[&str]) -> Caller {
     Caller {
         agent: agent.to_owned(),
         role,
         teams: teams.iter().map(|team| (*team).to_owned()).collect(),
+        files_subject_derived: false,
     }
 }
 

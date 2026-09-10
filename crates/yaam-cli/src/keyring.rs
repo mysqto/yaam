@@ -44,6 +44,18 @@ struct Entry {
     /// Teams whose team-visible records this caller may read.
     #[serde(default)]
     teams: Vec<String>,
+    /// Whether this caller may file records classified `subject_derived`. Absent means no.
+    ///
+    /// Default-off, and it stays that way for a keyring written before this field existed: the
+    /// grant is what makes a body sealed and a subject linkage permanent, and a store with no
+    /// re-key and no delete cannot take either back, so it is the one setting that must never be
+    /// acquired by upgrading.
+    ///
+    /// The same fact is stated on the caller's own host, in the sidecar's `files_subject_derived`
+    /// list, and both are checked. This is the one that binds -- a sidecar's configuration is
+    /// edited by whoever runs the caller, and this file is not.
+    #[serde(default)]
+    files_subject_derived: bool,
 }
 
 /// Reads the keyring, refusing anything it cannot use.
@@ -72,6 +84,9 @@ pub fn load(path: &Path) -> Result<Keyring> {
         let current = key(&entry.key, agent, "key")?;
         let mut credential =
             Credential::new(agent.clone(), role, current).in_teams(entry.teams.clone());
+        if entry.files_subject_derived {
+            credential = credential.filing_subject_derived();
+        }
         if let Some(previous) = &entry.previous_key {
             credential = credential.rolled_from(key(previous, agent, "previous_key")?);
         }
@@ -175,6 +190,37 @@ mod tests {
             Some(vec![0xee, 0xff]),
             "a roll has to keep working across a restart"
         );
+        // Nobody in a keyring written before this field existed gains the ability to seal a body by
+        // being read on a newer build. That is the one setting that must never arrive with an
+        // upgrade: a sealed body and its subject linkage cannot be taken back.
+        assert!(!writer.files_subject_derived);
+        assert!(!operator.files_subject_derived);
+    }
+
+    /// The grant a deployment makes on purpose, and the one thing it changes about the credential.
+    #[test]
+    fn a_caller_the_keyring_grants_may_file_subject_derived_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = written(
+            dir.path(),
+            r#"{"callers":{
+                 "agent_a":{"role":"writer","key":"aabb"},
+                 "agent_filer":{"role":"writer","key":"ccdd","files_subject_derived":true}
+               }}"#,
+        );
+
+        let keyring = load(&path).expect("loaded");
+        assert!(
+            !keyring
+                .credential("agent_a")
+                .expect("agent_a")
+                .files_subject_derived
+        );
+        let filer = keyring.credential("agent_filer").expect("agent_filer");
+        assert!(filer.files_subject_derived);
+        // The grant is orthogonal to the role: this is an ordinary writer that may also seal.
+        assert_eq!(filer.role, Role::Writer);
+        assert_eq!(keyring.subject_filers(), vec!["agent_filer"]);
     }
 
     /// Every refusal names the caller, and none of them quotes the key.

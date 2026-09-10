@@ -1,6 +1,6 @@
 [package]
 name = "yaam-cli"
-description = "The three entry points: the service, the sidecar, and the operator command line."
+description = "The store-facing entry points: the service, the sidecar, the operator command line, and the two writers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -32,6 +32,14 @@ path = "src/bin/yaam-agent.rs"
 [[bin]]
 name = "yaam-emit"
 path = "src/bin/yaam-emit.rs"
+
+# A separate binary rather than a flag on `yaam-emit`, and the separation is the permission: this one
+# classifies records `subject_derived`, which is what makes a body sealed and a subject linkage
+# permanent, and a store with no re-key and no delete cannot take either back. Which of the two is
+# installed on a host is a thing an operator decides once, not a thing a caller decides per record.
+[[bin]]
+name = "yaam-file"
+path = "src/bin/yaam-file.rs"
 
 [[bin]]
 name = "yaam-read"

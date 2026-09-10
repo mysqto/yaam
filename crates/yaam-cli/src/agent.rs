@@ -65,6 +65,10 @@ pub fn plan(settings: &AgentSettings) -> Result<Plan> {
             .map(|(agent, path)| CallerSocket {
                 agent: agent.clone(),
                 path: path.clone(),
+                // From the configuration whichever way the socket was named. `--socket` says where a
+                // caller's socket goes and nothing about what it may write, so a flag could not
+                // grant this and does not: one file answers it for every socket this sidecar serves.
+                files_subject_derived: files_subject_derived(&configured, agent),
             })
             .collect()
     };
@@ -135,14 +139,33 @@ fn default_sockets(state_dir: &Path, configured: &Config) -> Result<Vec<CallerSo
             listener::CONFIG_FILE
         )));
     }
+    for agent in &configured.files_subject_derived {
+        if !configured.signing_keys.contains_key(agent) {
+            return Err(config(format!(
+                "{} lists `{agent}` under files_subject_derived and holds no signing key for it, \
+                 so this sidecar serves no such caller. A grant naming nobody is a grant an \
+                 operator believes they have made",
+                listener::CONFIG_FILE
+            )));
+        }
+    }
     Ok(configured
         .signing_keys
         .keys()
         .map(|agent| CallerSocket {
             agent: agent.clone(),
             path: state_dir.join(SOCKET_DIR).join(format!("{agent}.sock")),
+            files_subject_derived: files_subject_derived(configured, agent),
         })
         .collect())
+}
+
+/// Whether this configuration lets `agent` file `subject_derived` records.
+fn files_subject_derived(configured: &Config, agent: &str) -> bool {
+    configured
+        .files_subject_derived
+        .iter()
+        .any(|named| named == agent)
 }
 
 /// Logs the effective configuration, once, at startup.
@@ -177,6 +200,18 @@ fn announce(
             value = %socket.read_path().display(),
             "configuration"
         );
+        // Only when it is granted. A line per caller saying "no" on every ordinary host would be
+        // noise that trains an operator to skim exactly the line that matters on the one host where
+        // it says something else.
+        if socket.files_subject_derived {
+            tracing::info!(
+                setting = "files-subject-derived",
+                agent = %socket.agent,
+                value = true,
+                "records from this caller may be sealed, and the subject linkage they file cannot \
+                 be corrected afterwards"
+            );
+        }
     }
     tracing::info!(
         setting = "spool-capacity",
@@ -250,6 +285,81 @@ mod tests {
             planned.sockets[0].path,
             dir.path().join(SOCKET_DIR).join("agent_a.sock")
         );
+    }
+
+    /// No socket may file a sealed record unless the configuration named its caller.
+    #[test]
+    fn the_grant_comes_from_the_configuration_and_defaults_to_nobody() {
+        let dir = state(&upstream_json());
+        let planned = plan(&settings(dir.path(), Vec::new())).expect("planned");
+        assert!(
+            planned
+                .sockets
+                .iter()
+                .all(|socket| !socket.files_subject_derived),
+            "an upgrade must not hand a caller the ability to seal a body"
+        );
+    }
+
+    /// And a named caller gets it, on the socket it is served on.
+    #[test]
+    fn a_named_caller_may_file_subject_derived_records() {
+        crate::logging(&Env::default());
+        let (_, public) = yaam_crypto::envelope::generate_keypair();
+        let dir = state(&format!(
+            r#"{{"base_url":"http://127.0.0.1:8787","service_public_key":"{}",
+                 "signing_keys":{{"agent_b":"bbbb","agent_a":"aaaa"}},
+                 "files_subject_derived":["agent_b"]}}"#,
+            hex::encode(public)
+        ));
+        let planned = plan(&settings(dir.path(), Vec::new())).expect("planned");
+
+        let granted: Vec<&str> = planned
+            .sockets
+            .iter()
+            .filter(|socket| socket.files_subject_derived)
+            .map(|socket| socket.agent.as_str())
+            .collect();
+        assert_eq!(granted, ["agent_b"]);
+    }
+
+    /// The grant follows the caller, not the flag: `--socket` says where a socket goes and nothing
+    /// about what may be written to it, so naming one by hand cannot pick up or drop the grant.
+    #[test]
+    fn a_named_socket_carries_the_grant_the_configuration_gives_its_caller() {
+        crate::logging(&Env::default());
+        let (_, public) = yaam_crypto::envelope::generate_keypair();
+        let dir = state(&format!(
+            r#"{{"base_url":"http://127.0.0.1:8787","service_public_key":"{}",
+                 "signing_keys":{{"agent_a":"aaaa"}},
+                 "files_subject_derived":["agent_a"]}}"#,
+            hex::encode(public)
+        ));
+        let elsewhere = dir.path().join("elsewhere.sock");
+        let planned = plan(&settings(
+            dir.path(),
+            vec![("agent_a".to_owned(), elsewhere.clone())],
+        ))
+        .expect("planned");
+
+        assert_eq!(planned.sockets[0].path, elsewhere);
+        assert!(planned.sockets[0].files_subject_derived);
+    }
+
+    /// A grant naming a caller this sidecar does not serve is a grant an operator believes they
+    /// made, so it is refused at startup rather than discovered as a socket that is never granted.
+    #[test]
+    fn a_grant_for_a_caller_with_no_key_is_refused_before_anything_binds() {
+        let (_, public) = yaam_crypto::envelope::generate_keypair();
+        let dir = state(&format!(
+            r#"{{"base_url":"http://127.0.0.1:8787","service_public_key":"{}",
+                 "signing_keys":{{"agent_a":"aaaa"}},
+                 "files_subject_derived":["agent_typo"]}}"#,
+            hex::encode(public)
+        ));
+        let error = plan(&settings(dir.path(), Vec::new())).expect_err("refused");
+        assert_eq!(error.exit(), Exit::Config);
+        assert!(error.to_string().contains("agent_typo"), "{error}");
     }
 
     #[test]

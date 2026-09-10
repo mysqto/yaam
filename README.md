@@ -21,6 +21,7 @@ index that makes it queryable in single-digit milliseconds.
 | **Derived index** | SQLite + FTS5, rebuildable from the tree. Delete it and run `yaam reindex`. |
 | **Crash-recoverable** | Write-ahead staging, atomic publish, a sweeper that converges. No claim of distributed atomicity. |
 | **Erasable bodies** | Per-record keys, per-subject key encryption. Deleting a subject's keys makes their record bodies permanently unreadable in every copy, including backups. |
+| **One erasure reaches one body** | A record names at most one data subject. A body sealed under two subject shares would end for both the moment either one was erased, and the survivor would keep a right of access to it that no re-key, re-seal or delete here can answer — so it is refused on the way in rather than written. An event about two subjects is two records, related by `correlation_id` and by the entity references both carry, which are plaintext and survive either erasure. |
 | **Reads return structure, never a body** | A read answers with each matching record's frontmatter — action, outcome, declared attributes, entity references, subject pseudonyms, timestamps — and never its prose. The rule does not branch on data class: a sealed body is withheld because it is a body, and a plaintext one for the same reason. A plaintext body is read from the tree; a sealed one only through `yaam unseal`, which records the reading before it performs it. |
 | **One audited way back to a sealed body** | `yaam unseal` publishes an operator-visible record naming who read the body and why, and only then fetches a key. A store that cannot record the read cannot answer it, so there is no path that returns a sealed body without a line saying it did. |
 | **Derived knowledge** | One note per entity under `knowledge/`, rebuilt wholesale from the record tree by `yaam knowledge build`. Every line restates a structured field some record declared and names the records it came from. Nothing is derived from a record whose body is erasable, so a key destruction has no aggregate to chase. |
@@ -43,7 +44,7 @@ crates/
   yaam-knowledge  facts derived from record structure, rebuilt wholesale from the record tree
   yaam-server     HTTP service
   yaam-agent      local sidecar: two sockets per caller, seals and signs on their behalf
-  yaam-cli        the five entry points: `yaam-server`, `yaam-agent`, `yaam`, `yaam-emit`, `yaam-read`
+  yaam-cli        the six entry points: `yaam-server`, `yaam-agent`, `yaam`, `yaam-emit`, `yaam-file`, `yaam-read`
 hooks/            the pre-commit guard for a repository holding a backup, and its installer
 xtask/            repository chores: generates spec/schemas, checks the shapes behind it
 spec/             the contract bundle other implementations vendor
@@ -59,20 +60,20 @@ spec/             the contract bundle other implementations vendor
 
 ## Running it
 
-Five binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
+Six binaries, one crate, one configuration type. `--root` names the memory tree; `--index` and
 `--key-store` default to sitting under it, and every setting is also read from the environment
 (`YAAM_ROOT`, `YAAM_INDEX`, `YAAM_KEY_STORE`, `YAAM_KEY_PASSPHRASE_FILE`,
 `YAAM_SUBJECT_KEY_FILE`, `YAAM_LISTEN`, `YAAM_KEYRING`, `YAAM_UNSEAL_KEY_FILE`,
 `YAAM_MAINTENANCE_MS`, `YAAM_AGENT_STATE`, `YAAM_SOCKET`, `YAAM_AGENT`, `YAAM_READ_SOCKET`,
 `YAAM_LOG`). A flag beats the environment.
 
-Two of the five open a store and three never do. `yaam-agent`, `yaam-emit` and `yaam-read` run on the
-caller's host and have no `--root` to give them: that is what lets a caller record what it did, and
-read what it remembers, while holding no key material and no path into anyone's memory tree. The one
-directory a caller-side binary will read is the one `--infer-entities` names — `yaam-emit` to lift
-references onto a record, `yaam-read bundle` to turn a request's own prose into lookup keys — and
-each reads two configuration files out of it. A spec directory is not a store, and nothing in either
-binary could open one.
+Two of the six open a store and four never do. `yaam-agent`, `yaam-emit`, `yaam-file` and
+`yaam-read` run on the caller's host and have no `--root` to give them: that is what lets a caller
+record what it did, and read what it remembers, while holding no key material and no path into
+anyone's memory tree. The one directory a caller-side binary will read is the one `--infer-entities`
+names — the emitters to lift references onto a record, `yaam-read bundle` to turn a request's own
+prose into lookup keys — and each reads two configuration files out of it. A spec directory is not a
+store, and nothing in any of them could open one.
 
 The service drains fan-out and sweeps every `--maintenance-ms` (30 s by default) *and* once at
 startup, so a process that comes up over an interrupted write converges without waiting an interval
@@ -325,9 +326,52 @@ memory tree.
 declaring a policy that was never run gives a false account of its own redaction; the emitter turns
 that refusal into the flag to change rather than a status code.
 
-Subjects stay empty and the data class stays `internal`. What a subject *is* — how a person becomes a
-pseudonym, and under whose canonicalisation — is still an open decision, so there is deliberately no
-flag: one would let a caller declare a record erasable that the deployment cannot erase.
+Subjects stay empty and the data class stays `internal`, and no flag on this binary changes either.
+A subject named here could only be invented — the secret a pseudonym is derived under lives with the
+service — and a data-class flag on the binary every agent runs would be an invitation to decide by
+judgement the one field that must be decided by rule. Filing a record the store will seal is
+`yaam-file`'s, below.
+
+### Filing a record about a transaction
+
+`yaam-file` is `yaam-emit` with one thing changed: it classifies the record `subject_derived`, so the
+store seals the body under a key that can be destroyed. Same arguments, same protocol, same exit
+codes, plus one that is required:
+
+```bash
+yaam-file --erasure-unit order_ref:ord10014733 \
+          --action refund --outcome success --summary "…"
+```
+
+**A record is subject-derived if and only if it names the transaction it is about.** That is the
+whole rule, and it is one argument rather than two on purpose: there is no way to invoke this binary
+and leave a body in the clear, and no way to claim a record erasable without stating the reference
+that makes it so. The reference is recorded as an ordinary stated entity at confidence `1.0`, which
+is what the service's resolver requires — a reference lifted from prose is a guess, and a guess may
+not decide whether a body is sealed.
+
+`subjects` stays empty here too. This binary holds no keying secret and cannot derive a pseudonym;
+the service does that, from this reference, under the entity kinds the store's own
+`spec/subjects.yaml` declares as erasure units. A kind it does not declare is a refused record, not a
+plaintext one.
+
+A separate binary rather than a flag, because `data_class` decides whether a body is sealed and a
+subject linkage becomes permanent, and the store has no re-key, no re-seal and no delete. Installing
+it is a decision an operator makes about a host; a flag would be one a caller makes about a record.
+Three answers stand behind it, in three files, none of them on its command line:
+
+| where | what it says |
+|---|---|
+| the sidecar's `upstream.json`, `files_subject_derived: [agent]` | which callers may send the class on their own socket. An unlisted caller is refused there, before anything is masked, sealed or spooled — whether the record came from this binary or from a line of JSON somebody wrote by hand |
+| the service's keyring, `"files_subject_derived": true` per caller | which credentials may send it at all. `403`, and nothing is written. This is the one that binds of the two grants: a sidecar's configuration is edited by whoever runs the caller, and the keyring is not |
+| the store's `spec/subject-writes.yaml`, `writes: enabled` | whether this store writes the class *at all*, whoever is asking. `422`, and nothing is written. The two rows above are permissions about a caller; this one is the deployment's own posture, and it is the one that refuses by default |
+
+The two grants default to nobody, and stay that way for a configuration written before they existed.
+The declaration is absent in every store that has not written it, which is what makes installing this
+binary do nothing on its own: a fully granted caller on an undeclared store is still refused, and
+told which file to change. A store that declares no erasure units refuses the class regardless too,
+so all three — the writer, the posture and the resolver — can be turned on in any order without a
+record being written wrong.
 
 ### Reading it back
 
@@ -724,6 +768,11 @@ because that one function is what every writer crosses. The refusal names the re
 was written, names the file to change, and says what accepting it would have done; a caller that
 gets a bare rejection assumes a bug and retries.
 
+It stands behind the contract's own rules rather than in front of them. A record that breaks one of
+those — naming two subjects, say — is told *that*, because it is refused in every deployment whether
+the class is declared or not, and answering it with `writes: enabled` would point an operator at an
+irreversible decision that would not have admitted the record anyway.
+
 The default is refusal and cannot be anything else. Everything else in a store is recoverable by a
 rebuild; this is not. The first subject-derived record a store writes is sealed under a pseudonym
 that is an HMAC of a key that can never be rotated, and there is no re-key, no re-seal and no
@@ -761,6 +810,25 @@ transaction's erasure destroy the other's body, and picking one would be a coin 
 fact. Only references a caller *stated* count — one inferred from prose is a guess, and a guess may
 not decide whether a body becomes permanently unerasable. A refused record is one that was never
 written, which is the only failure here that can still be fixed.
+
+**One record, one subject, one body, one erasure.** The rule above is the shipped resolver's; the
+rule beneath it is the contract's, and binds every writer. A body is sealed under a key derived from
+every share it has, so a record naming two subjects would be one body either of them could end for
+the other — and the survivor would keep a right of access to what it said about them that nothing
+here can answer, there being no re-key, no re-seal and no delete. So the record is refused rather
+than written, wherever it is read and again once a deployment's resolver has answered.
+
+Refused rather than split, and the reason is that a write carries one body. Copying it into a body
+per subject would leave everything the record said about the erased subject readable in the
+surviving copy — the erasure defeated rather than narrowed, permanently. Dividing the prose instead
+would put a reading of it in the erasability path, which is the one decision no judgement may make.
+An event about two subjects is therefore two records, related by `correlation_id` and by the entity
+references both carry. That relation is plaintext frontmatter and an erasure takes bodies and keys,
+not structure, so it survives either erasure: after one subject's half is unreadable a reader can
+still tell the two records were one event. `correlate` and `linked` need nothing new for this — they
+join on shape, time and entity references and never read a body — and erasure verification means
+what it says for the first time: it asserts the absence of the keys it was asked about, which with
+one subject per body is the same statement as "that subject's bodies are gone".
 
 Changing the canonicalisation is a version, never an edit: the version number is an input to the
 HMAC, so a bump makes every subject hash differently and uniformly, and the old rules stay registered

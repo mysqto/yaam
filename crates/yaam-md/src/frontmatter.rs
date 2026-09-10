@@ -599,23 +599,23 @@ pub(crate) mod fixture {
         }
     }
 
-    /// The same record as an erasable one: two subjects with different roles and canonicalisation
-    /// versions, and no prose, because for a sealed record the prose is inside the ciphertext.
-    pub fn subject_derived() -> ActionRecord {
+    /// The same record as an erasable one: one subject in `role`, and no prose, because for a
+    /// sealed record the prose is inside the ciphertext.
+    ///
+    /// The role is a parameter because it used to be covered by naming two subjects at once, which
+    /// the contract now refuses — a body sealed under two shares ends for both subjects the moment
+    /// either one is erased. Both roles still round-trip; it takes two records instead of one.
+    ///
+    /// `canon_ver` is deliberately not the first version, so a projection that dropped the field
+    /// would show rather than compare equal by luck.
+    pub fn subject_derived(role: SubjectRole) -> ActionRecord {
         ActionRecord {
             data_class: DataClass::SubjectDerived,
-            subjects: vec![
-                SubjectRef {
-                    hash: subject_hash('a'),
-                    role: SubjectRole::Principal,
-                    canon_ver: CanonVer(1),
-                },
-                SubjectRef {
-                    hash: subject_hash('b'),
-                    role: SubjectRole::Party,
-                    canon_ver: CanonVer(2),
-                },
-            ],
+            subjects: vec![SubjectRef {
+                hash: subject_hash('a'),
+                role,
+                canon_ver: CanonVer(2),
+            }],
             summary: String::new(),
             ..record()
         }
@@ -676,9 +676,9 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::{assert_same_record, record, subject_derived};
     use super::{
-        AttrValue, DataClass, EntityRef, EntityRole, Error, Json, KEYS, Outcome, Value, Visibility,
-        data_class_name, emit, outcome_name, parse, plain_safe, project, render, to_canonical_json,
-        to_json, visibility_name,
+        AttrValue, DataClass, EntityRef, EntityRole, Error, Json, KEYS, Outcome, SubjectRole,
+        Value, Visibility, data_class_name, emit, outcome_name, parse, plain_safe, project, render,
+        to_canonical_json, to_json, visibility_name,
     };
 
     use saphyr::{LoadableYamlNode, Yaml};
@@ -691,7 +691,11 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_every_field() {
-        for original in [record(), subject_derived()] {
+        for original in [
+            record(),
+            subject_derived(SubjectRole::Principal),
+            subject_derived(SubjectRole::Party),
+        ] {
             let parsed = parse(&render(&original)).expect("rendered frontmatter parses");
             assert_same_record(&original, &parsed);
             assert_eq!(original, parsed);
@@ -805,18 +809,20 @@ mod tests {
             Visibility::Org,
             Visibility::Operator,
         ];
+        // The subject set has to follow the class, or the record is one `validate` rejects rather
+        // than one this test can round-trip — and since a record names at most one subject, both
+        // `SubjectRole` variants take a record each.
+        let classes = [
+            record(),
+            subject_derived(SubjectRole::Principal),
+            subject_derived(SubjectRole::Party),
+        ];
         for outcome in outcomes {
             for visibility in visibilities {
-                for data_class in [DataClass::Internal, DataClass::SubjectDerived] {
-                    // The subject set has to follow the class, or the record is one `validate`
-                    // rejects rather than one this test can round-trip.
-                    let mut original = match data_class {
-                        DataClass::Internal => record(),
-                        DataClass::SubjectDerived => subject_derived(),
-                    };
+                for shape in &classes {
+                    let mut original = shape.clone();
                     original.outcome = outcome;
                     original.visibility = visibility;
-                    original.data_class = data_class;
 
                     let text = render(&original);
                     assert_eq!(original, parse(&text).expect("parses"));
@@ -980,14 +986,23 @@ mod tests {
     fn a_hand_edited_file_that_breaks_the_contract_fails_on_read() {
         // Each of these parses as YAML and types cleanly; only `validate` catches them, and it must
         // catch them here rather than at the first query that joins on the row.
-        let internal_with_subjects = render(&subject_derived())
+        let internal_with_subjects = render(&subject_derived(SubjectRole::Principal))
             .replace("data_class: subject_derived", "data_class: internal");
+        // A second subject added to a file by hand: the shape that would seal one body under two
+        // shares, so erasing either subject would end the body for the other. The read path has to
+        // refuse it too, or a hand edit and a reindex would put one back into a store. Rendered
+        // from a record rather than spliced into the YAML, because only `parse` validates.
+        let mut both = subject_derived(SubjectRole::Principal);
+        both.subjects
+            .push(subject_derived(SubjectRole::Party).subjects.remove(0));
+        let two_subjects = render(&both);
         let no_action = render(&record()).replace("action: deploy", r#"action: "  ""#);
         let impossible_confidence = render(&record()).replace("confidence: 1.0", "confidence: 1.5");
         let team_without_name = render(&record()).replace("team: team_blue", "team: null");
 
         for (label, text) in [
             ("an internal record naming subjects", internal_with_subjects),
+            ("a record naming two subjects", two_subjects),
             ("an empty action", no_action),
             ("a confidence outside 0.0..=1.0", impossible_confidence),
             ("a team-scoped record with no team", team_without_name),

@@ -29,6 +29,8 @@ delivers *recoverability*. Every partial failure needs a defined winner and a sw
 - A nonce is constructible only from a CSPRNG; re-sealing takes a fresh key *and* nonce.
 - Associated data is recomputed from record identity, never read from the stored blob.
 - A record's key is derived from *all* subject shares, so an any-one-suffices misbuild cannot decrypt.
+- A record names **at most one** subject, so one erasure reaches one body. Refused in
+  `ActionRecord::validate` and again once a deployment's resolver has answered — never in one caller.
 - Changing a record's subject set re-encrypts under a fresh key. Never re-wrap the old one.
 
 ## 5. Idempotency is per-hop

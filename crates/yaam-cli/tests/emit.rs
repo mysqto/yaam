@@ -15,7 +15,10 @@ use std::path::Path;
 
 mod support;
 
-use support::{Deployment, Service, read_socket, sidecar, terminate, yaam, yaam_emit, yaam_read};
+use support::{
+    Deployment, Service, read_socket, sidecar, sidecar_filing, terminate, yaam, yaam_emit,
+    yaam_file, yaam_read,
+};
 
 /// The arguments a shell hook passes, over a socket named by the environment.
 fn hook_env(socket: &Path) -> Vec<(String, String)> {
@@ -662,4 +665,144 @@ fn a_dry_run_prints_a_record_nothing_has_to_be_running_to_see() {
     }
     assert_eq!(fields["subjects"].as_array().map(Vec::len), Some(0));
     assert_eq!(fields["data_class"], "internal");
+}
+
+/// The store refuses the class through the one path that can now claim it, with every other
+/// permission already granted.
+///
+/// `yaam-file` is the binary the branch added, and it is the only one that classifies a record
+/// `subject_derived`. It reaches the store through a real sidecar and a real service, so the
+/// refusal has three places it could come from, and two of them are permissions about the *caller*:
+/// the socket's `files_subject_derived`, and the credential's. Both are granted here. That is the
+/// whole point of granting them — a test that left either off would pass on a `403` and prove
+/// nothing about the store, which is exactly the reading a clean textual merge invites.
+///
+/// What is left is the store's own posture, and `spec/subject-writes.yaml` is absent, which is the
+/// shipped state of every deployment. The refusal has to arrive before a pseudonym exists, so the
+/// key store is asserted empty rather than the record merely absent: a key minted here is an HMAC
+/// under a subject key that cannot be rotated, and there is no re-key, no re-seal and no delete.
+#[test]
+fn the_store_refuses_a_filed_record_though_the_socket_and_the_credential_both_allow_it() {
+    let deployment = Deployment::new().filing_subject_derived();
+    let mut service = Service::start(&deployment);
+    let (socket, mut agent) = sidecar_filing(
+        &deployment,
+        "agent",
+        &format!("http://{}", service.address),
+        &service.sealing_public_key,
+    );
+    let env = hook_env(&socket);
+
+    let filed = yaam_file(
+        &[
+            "--erasure-unit",
+            "order_ref:a1b2c3d4e5f6",
+            "--action",
+            "refund",
+            "--outcome",
+            "success",
+            "--summary",
+            "settled the refund at the gateway",
+        ],
+        &as_pairs(&env),
+    );
+
+    // Rejected, not spooled: no retry can make this land, and a sidecar that spooled it would keep
+    // trying against a store whose answer only an operator can change.
+    assert_eq!(
+        filed.status.code(),
+        Some(8),
+        "a permanent refusal:\nstdout {}\nstderr {}",
+        String::from_utf8_lossy(&filed.stdout),
+        String::from_utf8_lossy(&filed.stderr)
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&filed.stdout),
+        String::from_utf8_lossy(&filed.stderr)
+    );
+    for expected in [
+        "subject-derived records are refused by this store",
+        "nothing was written",
+        "writes: enabled",
+        "subject-writes.yaml",
+    ] {
+        assert!(
+            said.contains(expected),
+            "the caller is told `{expected}`, not merely that it was rejected: {said}"
+        );
+    }
+
+    // Nothing landed, and — the assertion that matters — no key was minted, so this store has no
+    // pseudonym it cannot take back.
+    assert!(
+        support::record_files(deployment.root()).is_empty(),
+        "nothing may reach the tree"
+    );
+    let keys = support::walk_files(&deployment.root().join("keystore"));
+    assert!(
+        keys.is_empty(),
+        "a key here is the irreversible half, and the refusal is ahead of it: {keys:?}"
+    );
+
+    terminate(&mut agent, "yaam-agent");
+    service.stop();
+}
+
+/// The same command, on a store whose operator declared the class, is no longer refused *for that*.
+///
+/// The companion to the case above, and what stops it passing for the wrong reason. This
+/// deployment's `spec/` declares no erasure unit, so the record is still refused — by subject
+/// resolution, which is a different refusal in a different layer, and one that names the subject
+/// rather than the class. Reaching it is the proof that the declaration was the only thing standing
+/// between `yaam-file` and the store, and that nothing else about the new path is broken.
+///
+/// Still nothing written, and still no key: resolution refuses before it derives one.
+#[test]
+fn the_declaration_is_the_only_thing_the_store_was_refusing_a_filed_record_for() {
+    let deployment = Deployment::new()
+        .filing_subject_derived()
+        .writing_subjects();
+    let mut service = Service::start(&deployment);
+    let (socket, mut agent) = sidecar_filing(
+        &deployment,
+        "agent",
+        &format!("http://{}", service.address),
+        &service.sealing_public_key,
+    );
+    let env = hook_env(&socket);
+
+    let filed = yaam_file(
+        &[
+            "--erasure-unit",
+            "order_ref:a1b2c3d4e5f6",
+            "--action",
+            "refund",
+            "--outcome",
+            "success",
+            "--summary",
+            "settled the refund at the gateway",
+        ],
+        &as_pairs(&env),
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&filed.stdout),
+        String::from_utf8_lossy(&filed.stderr)
+    );
+    assert!(
+        !said.contains("refused by this store"),
+        "the class is declared, so the class is not what refuses it now: {said}"
+    );
+    assert!(
+        said.contains("subject"),
+        "the refusal that is left is about resolving a subject: {said}"
+    );
+    assert!(
+        support::record_files(deployment.root()).is_empty(),
+        "and it is still refused, so nothing landed"
+    );
+
+    terminate(&mut agent, "yaam-agent");
+    service.stop();
 }

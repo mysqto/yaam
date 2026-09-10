@@ -406,6 +406,7 @@ mod tests {
             agent: "agent-reader".to_owned(),
             role: Role::Reader,
             teams: Vec::new(),
+            files_subject_derived: false,
         };
 
         let error = service

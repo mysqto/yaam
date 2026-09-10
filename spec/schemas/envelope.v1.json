@@ -81,10 +81,11 @@
           "description": "Schema version this record was written under."
         },
         "subjects": {
-          "description": "Data subjects named by this record. Empty for `DataClass::Internal`.",
+          "description": "The data subject this record is about — at most one.\n\nEmpty for `DataClass::Internal`, and empty on arrival for a `DataClass::SubjectDerived`\nrecord whose pseudonym the store resolves. Never more than one, for the reason\n`ActionRecord::validate` gives: one body cannot be two erasures.",
           "items": {
             "$ref": "#/$defs/SubjectRef"
           },
+          "maxItems": 1,
           "type": "array"
         },
         "summary": {

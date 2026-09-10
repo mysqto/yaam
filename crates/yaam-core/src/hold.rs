@@ -537,11 +537,16 @@ mod tests {
     ///
     /// The vocabulary a preservation order arrives in, reduced at placement to the thing that can be
     /// enforced. Holding the record alone would preserve a file nothing can read.
+    ///
+    /// One subject, and therefore one hold, because that is now the most a record can name — the
+    /// contract refuses a body belonging to two. The placement still returns a collection and still
+    /// iterates what the record names: a hold is per subject rather than per record, which is what
+    /// lets one be lifted without lifting the others over the same subject.
     #[test]
     fn a_hold_over_a_record_holds_every_subject_that_record_names() {
         let mut harness = Harness::new();
-        let subjects = [testkit::subject('a'), testkit::subject('b')];
-        let record = testkit::subject_derived(T11, &subjects);
+        let subject = testkit::subject('a');
+        let record = testkit::subject_derived(T11, std::slice::from_ref(&subject));
         let id = record.record_id.clone();
         harness.pipeline.accept(record, BODY).expect("accepted");
 
@@ -549,9 +554,10 @@ mod tests {
             .expect("placed");
         assert_eq!(
             placed.len(),
-            2,
-            "one hold per subject, so one can be lifted"
+            1,
+            "one hold per subject the record names, and it names one"
         );
+        assert_eq!(placed[0].subject, subject);
         for hold in &placed {
             assert_eq!(hold.records, vec![id.as_str().to_owned()]);
             assert!(refuse_if_held(&harness.pipeline, &hold.subject).is_err());

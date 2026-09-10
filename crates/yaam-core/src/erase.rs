@@ -9,10 +9,12 @@
 //! time, with this outcome, about these entities". What no copy anywhere can answer is what the
 //! record *said*. A caller that owes a data subject more than that owes them a different design.
 //!
-//! Two further consequences worth stating plainly. A record naming several subjects has one body
-//! and one key set: destroying any one subject's key ends that body for all of them, because the
-//! key is derived from every share. And the live tree is rewritten to drop the ciphertext it can no
-//! longer decrypt — belt and braces, not the mechanism; the mechanism is that the key is gone.
+//! Two further consequences worth stating plainly. An erasure reaches one subject's bodies and
+//! nobody else's, and that is a property of the write path rather than of anything here: a body is
+//! sealed under a key derived from every share it has, so a record naming two subjects would end for
+//! both the moment either one was erased — which is why the contract refuses to write one. And the
+//! live tree is rewritten to drop the ciphertext it can no longer decrypt — belt and braces, not the
+//! mechanism; the mechanism is that the key is gone.
 //!
 //! A third, about what an erasure *writes*. The tombstone line it appends carries the records it
 //! reached and the roles the subject held on them, permanently and in the clear. That is deliberate
@@ -608,6 +610,7 @@ mod tests {
     };
     use crate::fsutil;
     use crate::testkit::{self, BODY, Harness};
+    use crate::unseal::{Read, read_body};
 
     /// A server time inside the epoch the fixtures use.
     const T11: &str = "2026-08-22T11:00:00Z";
@@ -755,6 +758,87 @@ mod tests {
         verify_live(&harness.pipeline, &subject).expect("verified");
     }
 
+    /// The point of refusing a shared body: one subject's erasure leaves the other's account intact.
+    ///
+    /// This is the §10.4 case. One record naming subjects A and B is sealed under a key derived from
+    /// both shares, so destroying A's keys ends that body for B as well — and B still has a right of
+    /// access to what it said about them, which nothing here can answer once the key is gone. The
+    /// contract now refuses that record, and this test asserts both halves of what the refusal buys:
+    /// the shared body cannot be written, and the two records it forces instead are separately
+    /// erasable.
+    ///
+    /// The two also still read as one event after the erasure, which is the other thing that had to
+    /// survive. `correlation_id` and the shared entity reference are plaintext frontmatter; an
+    /// erasure takes bodies and keys, not structure. So B's record still says which interaction it
+    /// belonged to, and a reader can tell the two were one event without being able to read A's
+    /// half — which is the shape that was wanted, rather than an accident of what erasure skips.
+    #[test]
+    fn erasing_one_subject_leaves_another_subjects_body_readable() {
+        let mut harness = Harness::new();
+        let (a, b) = (testkit::subject('a'), testkit::subject('b'));
+
+        // The shared body itself, first: it must not be writable, or nothing below matters.
+        let shared = testkit::subject_derived(T11, &[a.clone(), b.clone()]);
+        let shared_path = harness.path_of(&shared);
+        harness
+            .pipeline
+            .accept(shared, BODY)
+            .expect_err("one body about two subjects");
+        assert!(!shared_path.exists());
+
+        // What the refusal forces: a record each, related by the correlation id and the entity
+        // reference both carry.
+        let about_a = testkit::subject_derived(T11, std::slice::from_ref(&a));
+        let about_b = testkit::subject_derived(T11, std::slice::from_ref(&b));
+        for record in [&about_a, &about_b] {
+            harness
+                .pipeline
+                .accept(record.clone(), BODY)
+                .expect("accepted");
+        }
+        assert_eq!(
+            about_a.correlation_id, about_b.correlation_id,
+            "the two records have to be relatable, or the split loses the event"
+        );
+
+        erase_subject(&mut harness.pipeline, &a).expect("erased");
+
+        // A's body is gone, and no copy of it will open again.
+        assert!(matches!(
+            read_body(
+                &mut harness.pipeline,
+                &about_a.record_id,
+                "operator_a",
+                "checking the erased half",
+            )
+            .expect("an answer"),
+            Read::Shredded { .. }
+        ));
+
+        // B's is not, which is the assertion the shared body could not satisfy.
+        let read = read_body(
+            &mut harness.pipeline,
+            &about_b.record_id,
+            "operator_a",
+            "answering an access request",
+        )
+        .expect("an answer");
+        let Read::Revealed { body, .. } = read else {
+            panic!("the other subject's body must still open: {read:?}");
+        };
+        assert_eq!(body, BODY);
+
+        // And the record that survived still says which event it belonged to.
+        let stored = Document::parse(&fs::read_to_string(harness.path_of(&about_b)).expect("read"))
+            .expect("parses");
+        assert_eq!(stored.record.correlation_id, about_b.correlation_id);
+        assert_eq!(stored.record.entities, about_b.entities);
+
+        // Verification still means what it says: it asserts the absence of the keys it was asked
+        // about, and with one subject per body that is the same statement as "A's bodies are gone".
+        verify_live(&harness.pipeline, &a).expect("verified");
+    }
+
     #[test]
     fn erasing_twice_is_the_same_erasure() {
         let (mut harness, subject, _) = with_sealed_record();
@@ -900,24 +984,31 @@ mod tests {
     fn a_tombstone_names_the_records_an_erasure_reached_and_the_roles_on_them() {
         let (harness, subject, record) = with_sealed_record();
 
-        // A second record naming the same subject as a party rather than as its principal.
+        // A second record naming the same subject as a party rather than as its principal. One
+        // share, because a record names one subject: the role is what varies between records here,
+        // not how many subjects a body belongs to.
         let mut second = testkit::subject_derived("2026-08-23T10:00:00Z", &[]);
-        second.subjects = vec![
-            SubjectRef {
-                hash: testkit::subject('c'),
-                role: Role::Principal,
-                canon_ver: CanonVer(1),
-            },
-            SubjectRef {
-                hash: subject.clone(),
-                role: Role::Party,
-                canon_ver: CanonVer(1),
-            },
-        ];
+        second.subjects = vec![SubjectRef {
+            hash: subject.clone(),
+            role: Role::Party,
+            canon_ver: CanonVer(1),
+        }];
         let mut harness = harness;
         harness
             .pipeline
             .accept(second.clone(), BODY)
+            .expect("accepted");
+
+        // Another subject's record, on its own body. It used to be a second share on the record
+        // above; a record names one subject, so it is a record of its own — which is the stronger
+        // arrangement anyway, because the exact-equality assertion below is what proves this
+        // erasure did not reach it.
+        harness
+            .pipeline
+            .accept(
+                testkit::subject_derived("2026-08-23T11:00:00Z", &[testkit::subject('c')]),
+                BODY,
+            )
             .expect("accepted");
 
         // And one held back by an outage, which the erasure reaches by publishing it.
@@ -992,20 +1083,14 @@ mod tests {
     fn the_tombstone_list_states_no_pairing_the_erased_tree_does_not() {
         let (harness, subject, _) = with_sealed_record();
 
-        // A second record naming the subject as a party, so the roles are not all one value.
+        // A second record naming the subject as a party, so the roles are not all one value. One
+        // share on it, because a record names one subject.
         let mut second = testkit::subject_derived("2026-08-23T10:00:00Z", &[]);
-        second.subjects = vec![
-            SubjectRef {
-                hash: testkit::subject('c'),
-                role: Role::Principal,
-                canon_ver: CanonVer(1),
-            },
-            SubjectRef {
-                hash: subject.clone(),
-                role: Role::Party,
-                canon_ver: CanonVer(1),
-            },
-        ];
+        second.subjects = vec![SubjectRef {
+            hash: subject.clone(),
+            role: Role::Party,
+            canon_ver: CanonVer(1),
+        }];
         let mut harness = harness;
         harness.pipeline.accept(second, BODY).expect("accepted");
 

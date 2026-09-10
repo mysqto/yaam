@@ -88,6 +88,24 @@ impl Deployment {
         self
     }
 
+    /// The same deployment, with the service's keyring granting [`AGENT`] the class.
+    ///
+    /// A permission, not a posture: it says which credential may *send* a subject-derived record,
+    /// and says nothing about whether the store writes one. The two are separate on purpose, and a
+    /// test that wants to reach the store's own refusal has to grant this first — otherwise the
+    /// `403` arrives before the store is ever asked.
+    pub fn filing_subject_derived(self) -> Self {
+        fs::write(
+            self.dir.path().join("keyring.json"),
+            format!(
+                r#"{{"callers":{{"{AGENT}":{{"role":"writer","key":"{SIGNING_KEY}",
+                     "files_subject_derived":true}}}}}}"#
+            ),
+        )
+        .expect("keyring");
+        self
+    }
+
     pub fn root(&self) -> &Path {
         self.dir.path()
     }
@@ -151,6 +169,22 @@ pub fn yaam_emit(args: &[&str], env: &[(&str, &str)]) -> Output {
     command.output().expect("run yaam-emit")
 }
 
+/// Runs `yaam-file` and returns what a script would see.
+///
+/// The other writer, and the only binary that can classify a record `subject_derived`. Nothing
+/// about the environment is inherited, for the reason [`yaam_emit`] inherits nothing.
+pub fn yaam_file(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yaam-file"));
+    command
+        .args(args)
+        .env_remove("YAAM_SOCKET")
+        .env_remove("YAAM_AGENT");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().expect("run yaam-file")
+}
+
 /// Runs `yaam-read` and returns what a script would see.
 ///
 /// Nothing about the environment is inherited beyond what the caller passes, for the reason
@@ -178,13 +212,43 @@ pub fn sidecar(
     base_url: &str,
     public_key: &str,
 ) -> (PathBuf, Child) {
+    sidecar_config(deployment, name, base_url, public_key, false)
+}
+
+/// As [`sidecar`], with [`AGENT`]'s own socket granted the subject-derived class.
+///
+/// The near half of the same grant the service's keyring states: an unlisted caller is refused on
+/// its own socket, before anything is masked, sealed or spooled. A test that wants to reach the
+/// store's refusal has to pass both, which is the point of there being two.
+pub fn sidecar_filing(
+    deployment: &Deployment,
+    name: &str,
+    base_url: &str,
+    public_key: &str,
+) -> (PathBuf, Child) {
+    sidecar_config(deployment, name, base_url, public_key, true)
+}
+
+/// Starts a sidecar whose caller socket carries `files_subject_derived`.
+fn sidecar_config(
+    deployment: &Deployment,
+    name: &str,
+    base_url: &str,
+    public_key: &str,
+    files_subject_derived: bool,
+) -> (PathBuf, Child) {
     let state = deployment.root().join(name);
     fs::create_dir_all(&state).expect("state dir");
+    let grant = if files_subject_derived {
+        format!(r#","files_subject_derived":["{AGENT}"]"#)
+    } else {
+        String::new()
+    };
     fs::write(
         state.join("upstream.json"),
         format!(
             r#"{{"base_url":"{base_url}","service_public_key":"{public_key}",
-                 "signing_keys":{{"{AGENT}":"{SIGNING_KEY}"}},"retry_interval_ms":200}}"#
+                 "signing_keys":{{"{AGENT}":"{SIGNING_KEY}"}},"retry_interval_ms":200{grant}}}"#
         ),
     )
     .expect("upstream");
@@ -578,6 +642,23 @@ pub fn copy_dir(from: &Path, to: &Path) {
             fs::copy(entry.path(), target).expect("copy");
         }
     }
+}
+
+/// Every file under `root`, recursively. Directories are not files, so an empty tree is empty.
+pub fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            found.extend(walk_files(&entry.path()));
+        } else {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    found
 }
 
 /// Every record file in the published tree.
